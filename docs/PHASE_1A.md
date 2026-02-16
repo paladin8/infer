@@ -101,15 +101,15 @@ Key details:
 Per-architecture functions that map HF checkpoint tensor names to our internal module names.
 
 ```python
-def llama_weight_map(num_layers: int, tie_word_embeddings: bool) -> dict[str, str]: ...
-def qwen3_weight_map(num_layers: int, tie_word_embeddings: bool) -> dict[str, str]: ...
-def gemma3_weight_map(num_layers: int, tie_word_embeddings: bool) -> dict[str, str]: ...
+def llama_weight_map(num_layers: int) -> dict[str, str]: ...
+def qwen3_weight_map(num_layers: int) -> dict[str, str]: ...
+def gemma3_weight_map(num_layers: int) -> dict[str, str]: ...
 ```
 
 Key differences between architectures:
 - Qwen 3 and Gemma 3 have additional `q_norm`/`k_norm` weight tensors per layer.
 - Gemma 3 has 4 norm weight tensors per layer (`input_layernorm`, `post_attention_layernorm`, `pre_feedforward_layernorm`, `post_feedforward_layernorm`) vs 2 for Llama/Qwen.
-- When `tie_word_embeddings=True` (all three dev models at the 1B scale), the checkpoint has no separate `lm_head.weight` — the embedding weight is reused. The weight map must exclude `lm_head.weight` in this case, or sharded loading validation will fail.
+- `lm_head.weight` is always included in the map. Real HF checkpoints are inconsistent about including it when `tie_word_embeddings=True` (e.g. Qwen3-1.7B includes it even when tied). Whether to reuse `embed_tokens.weight` as the LM head is a model construction concern.
 
 A dispatcher selects the right map based on `model_type`:
 
@@ -275,9 +275,13 @@ Sample configs in tests use values from real HF config.json files (Llama-3.2-1B-
 - **Mixed dtypes**: file with mixed fp32/fp16 tensors preserves original dtypes without `dtype` arg, converts all with `dtype` arg.
 - **Device propagation**: verify `device` argument is passed through to loaded tensors.
 
-### Weight map tests (`tests/unit/test_weight_map.py`)
+### Weight map tests (`tests/unit/test_weight_map.py`) — DONE
 
-- **Weight map**: verify each architecture's mapping produces the expected set of keys for a known layer count. Verify Gemma 3 map includes the extra norm and QK-norm weights.
+- **Per-architecture structure**: verify each architecture's mapping produces the expected per-layer weight count (Llama: 9, Qwen3: 11, Gemma3: 13) and total weight count. Verify Llama has no QK-norm, Qwen3/Gemma3 have q_norm/k_norm, Gemma3 has 4 sandwich norms.
+- **Global weights**: embed_tokens, norm, and lm_head always present. lm_head.weight always included regardless of tie_word_embeddings (real HF checkpoints are inconsistent about omitting it).
+- **Dispatcher**: get_weight_map routes correctly by model_type, uses num_hidden_layers from config.
+- **Dev model layer counts**: parametrized test at real layer counts (Llama 16, Qwen3 28, Gemma3 26).
+- **Consistency**: internal names equal HF names with `model.` prefix stripped (all architectures). Mappings are bijective (no collisions). Qwen3 is a strict superset of Llama (extra keys are only q_norm/k_norm).
 
 ### Tokenizer tests (`tests/unit/test_tokenizer.py`)
 
