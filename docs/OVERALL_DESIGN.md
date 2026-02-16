@@ -55,7 +55,7 @@ Guardrails:
 ### Baseline environment
 
 - OS: Linux (x86_64)
-- Python: 3.11+
+- Python: 3.14+
 - PyTorch: 2.4+ with CUDA-enabled build
 - CUDA runtime: 12.x
 - GPU: NVIDIA with bf16 support preferred (fp16 fallback allowed)
@@ -67,7 +67,8 @@ Guardrails:
 
 ### Model assumptions
 
-- Default dev model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+- Target architectures: Llama 3, Qwen 3, Gemma 3.
+- Dev models: `meta-llama/Llama-3.2-1B-Instruct`, `Qwen/Qwen3-1.7B`, `google/gemma-3-1b-it`.
 - Practical unquantized target range on dev hardware: 1B-3B class models.
 - Default speculative pair target: ~3B target with ~1B draft (or smaller), chosen based on fit and stability on 16 GB.
 - Larger models (for example 7B-8B class) are advanced and typically require quantization and/or reduced concurrency.
@@ -226,18 +227,20 @@ Each phase has explicit deliverables and exit criteria to reduce ambiguity.
 
 Goal:
 
-- Load HF weights and verify a single transformer layer produces correct activations.
+- Load HF weights and verify a single transformer layer produces correct activations for Llama 3, Qwen 3, and Gemma 3.
 
 Deliverables:
 
 - Safetensors loader with shard/index handling.
-- HF `config.json` reader and weight name mapping.
+- HF `config.json` reader and weight name mapping (per architecture).
 - `AutoTokenizer` wrapper (use HF `transformers` for tokenization).
-- Single transformer block implementation (RMSNorm, RoPE, GQA, SwiGLU).
+- Shared transformer components (RMSNorm, RoPE, GQA core, gated MLP).
+- Per-architecture `TransformerBlock` implementations: Llama 3 (pre-norm), Qwen 3 (pre-norm + QK-norm), Gemma 3 (sandwich norm + QK-norm + GeGLU).
 
 Exit criteria:
 
-- Single-layer activation parity test against `transformers` with max absolute error threshold documented by dtype.
+- Single-layer activation parity tests against `transformers` for all three dev models: `Llama-3.2-1B-Instruct`, `Qwen3-1.7B`, `gemma-3-1b-it`.
+- Max absolute error thresholds documented by dtype.
 - Unit tests for loader (single-file and sharded checkpoints) and tokenizer wrapper.
 
 ### Phase 1b: Full Model and Logits Parity
@@ -575,11 +578,14 @@ infer/
 ├── src/
 │   └── infer/
 │       ├── models/
-│       │   ├── registry.py
+│       │   ├── common.py
 │       │   ├── llama.py
-│       │   └── common.py
+│       │   ├── qwen3.py
+│       │   └── gemma3.py
 │       ├── loader/
+│       │   ├── config.py
 │       │   ├── weights.py
+│       │   ├── weight_map.py
 │       │   ├── tokenizer.py
 │       │   └── chat_template.py
 │       ├── engine/
@@ -616,6 +622,7 @@ infer/
 ## 14. Design Decisions Log
 
 - Primary dev hardware target is 16 GB VRAM; unquantized model work should stay mostly in the 1B-3B range.
+- Support three architectures from Phase 1a: Llama 3, Qwen 3, Gemma 3. Shared components (RMSNorm, RoPE, attention, gated MLP) with per-architecture transformer blocks and weight maps.
 - Start with custom model code, use `transformers` only for `AutoTokenizer` and parity checks.
 - Use `jinja2` for chat template rendering with our own template strings per model (no `transformers.apply_chat_template`, no custom parser).
 - Use SDPA as default fast path before Triton specialization.
