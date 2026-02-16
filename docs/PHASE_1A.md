@@ -53,8 +53,11 @@ class ModelConfig:
     # Sliding window attention
     sliding_window: int | None = None           # Gemma 3 1B: 512, 4B/12B: 1024
     sliding_window_pattern: int | None = None   # Gemma 3: 6 (5 local + 1 global every 6 layers)
-                                                # Note: newer transformers versions use `layer_types` list instead;
-                                                # config reader should handle both and resolve to a layer type list.
+
+    # Layer types (resolved from sliding_window_pattern or loaded directly from config)
+    layer_types: list[str] | None = None        # e.g. ["sliding_attention", ..., "full_attention", ...]
+                                                # Newer transformers versions provide this directly;
+                                                # older ones use sliding_window_pattern. Reader handles both.
 
     # Embeddings
     tie_word_embeddings: bool = False
@@ -70,11 +73,13 @@ def computed_head_dim(self) -> int:
     return self.head_dim if self.head_dim is not None else self.hidden_size // self.num_attention_heads
 ```
 
-The config reader normalizes HF field name differences:
-- Gemma 3 uses `hidden_activation` instead of `hidden_act` — reader maps it.
-- Gemma 3 multimodal configs (4B+) nest text config under `text_config` — reader extracts it. The 1B model (`gemma3_text`) has a flat config.
+The config reader normalizes HF config quirks:
+- **`hidden_activation` → `hidden_act`**: Gemma 3 uses a different field name — reader maps it.
+- **Nested `text_config` extraction**: Gemma 3 multimodal configs (4B+) nest text config under `text_config` with its own `model_type` — reader extracts it. The 1B model (`gemma3_text`) has a flat config.
+- **JSON `null` handling**: real HF configs sometimes have `null` for fields like `mlp_bias`. The reader drops `None` values so non-nullable fields (e.g. `bool`, `float`) fall back to their dataclass defaults rather than storing `None`.
+- **`layer_types` resolution**: if the config has `sliding_window_pattern` but no `layer_types`, the reader generates the list: every `pattern`-th layer (1-indexed) is `"full_attention"`, the rest are `"sliding_attention"`. For Gemma 3 with pattern=6 and 26 layers, this gives global layers at indices 5, 11, 17, 23. If `layer_types` is already present (newer transformers configs), it is used as-is.
 
-Reads from a local path. Fails fast if `model_type` is not in the supported set (`"llama"`, `"qwen3"`, `"gemma3_text"`).
+Reads from a local path (`str` or `Path`). Fails fast if `model_type` is not in the supported set (`"llama"`, `"qwen3"`, `"gemma3_text"`). Unknown fields are silently ignored.
 
 ### 2. Safetensors weight loader (`src/infer/loader/weights.py`)
 
@@ -210,7 +215,7 @@ x = residual + x
 
 **Gemma 3** (`src/infer/models/gemma3.py`) — sandwich norm, 4 block norms, with QK-norm:
 
-Structurally different: post-sub-layer norms applied *before* the residual add (sandwich pattern). Takes a `layer_type` parameter (`"sliding_attention"` or `"full_attention"`) to select the right attention mask and RoPE frequencies.
+Structurally different: post-sub-layer norms applied *before* the residual add (sandwich pattern). Takes a `layer_type` parameter (`"sliding_attention"` or `"full_attention"`, from `config.layer_types[i]`) to select the right attention mask and RoPE frequencies.
 
 ```
 residual = x
@@ -252,12 +257,23 @@ src/infer/
 
 ## Testing Plan
 
-### Loader tests (`tests/unit/test_loader.py`)
+### Config tests (`tests/unit/test_config.py`) — DONE
 
-- **Config reader**: parse a sample config dict for each of the three architectures, verify all fields populate correctly. Test that unsupported `model_type` raises a clear error.
-- **Config normalization**: verify `hidden_activation` is mapped to `hidden_act`, `text_config` extraction works for nested Gemma 3 multimodal configs, and `computed_head_dim` returns `hidden_size // num_attention_heads` when `head_dim` is `None`.
+Sample configs in tests use values from real HF config.json files (Llama-3.2-1B-Instruct, Qwen3-1.7B, gemma-3-1b-it).
+
+- **Config reader**: parse each architecture, verify all fields populate correctly. Test `str` and `Path` inputs.
+- **Error handling**: unsupported `model_type`, missing `model_type`, missing required fields.
+- **Config normalization**: `hidden_activation` → `hidden_act`, `text_config` extraction (with and without `model_type`), extra fields ignored, JSON `null` → defaults, no input mutation.
+- **`computed_head_dim`**: explicit, inferred (hidden_size // num_heads), and decoupled (Gemma 3: head_dim=256 ≠ hidden_size/num_heads=288).
+- **`layer_types`**: resolution from `sliding_window_pattern`, no resolution without pattern, explicit `layer_types` preserved.
+
+### Weight loader tests (`tests/unit/test_weights.py`)
+
 - **Single-file loading**: create a small safetensors file with known tensors, load it, verify tensor names/shapes/dtypes. Verify dtype conversion works.
 - **Sharded loading**: create two small safetensors shards + an index JSON, load, verify all tensors are present and correct.
+
+### Weight map tests (`tests/unit/test_weight_map.py`)
+
 - **Weight map**: verify each architecture's mapping produces the expected set of keys for a known layer count. Verify Gemma 3 map includes the extra norm and QK-norm weights.
 
 ### Tokenizer tests (`tests/unit/test_tokenizer.py`)
