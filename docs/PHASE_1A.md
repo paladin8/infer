@@ -267,10 +267,13 @@ Sample configs in tests use values from real HF config.json files (Llama-3.2-1B-
 - **`computed_head_dim`**: explicit, inferred (hidden_size // num_heads), and decoupled (Gemma 3: head_dim=256 ≠ hidden_size/num_heads=288).
 - **`layer_types`**: resolution from `sliding_window_pattern`, no resolution without pattern, explicit `layer_types` preserved.
 
-### Weight loader tests (`tests/unit/test_weights.py`)
+### Weight loader tests (`tests/unit/test_weights.py`) — DONE
 
-- **Single-file loading**: create a small safetensors file with known tensors, load it, verify tensor names/shapes/dtypes. Verify dtype conversion works.
-- **Sharded loading**: create two small safetensors shards + an index JSON, load, verify all tensors are present and correct.
+- **Single-file loading**: create a small safetensors file with known tensors, load it, verify tensor names/shapes/values. Verify dtype conversion preserves values. Verify `str` path and `torch.device` object inputs work.
+- **Sharded loading**: create two small shards + index JSON, load, verify all tensors present and correct. Verify dtype conversion preserves values. Verify index takes precedence when both layouts exist.
+- **Validation**: missing tensors (in index but not in shards) and unexpected tensors (in shards but not in index) both raise `ValueError`. Missing shard file raises `FileNotFoundError` with a helpful message naming the missing shard.
+- **Mixed dtypes**: file with mixed fp32/fp16 tensors preserves original dtypes without `dtype` arg, converts all with `dtype` arg.
+- **Device propagation**: verify `device` argument is passed through to loaded tensors.
 
 ### Weight map tests (`tests/unit/test_weight_map.py`)
 
