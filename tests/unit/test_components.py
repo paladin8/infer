@@ -6,7 +6,15 @@ import math
 
 import torch
 
-from infer.models.common import RMSNorm, apply_rope, build_rope_cos_sin
+from infer.models.common import (
+    Attention,
+    GatedMLP,
+    RMSNorm,
+    apply_rope,
+    build_rope_cos_sin,
+    causal_mask,
+    sliding_window_causal_mask,
+)
 
 
 class TestRMSNorm:
@@ -286,3 +294,257 @@ class TestApplyRope:
         q_rot, k_rot = apply_rope(q, k, cos, sin)
         assert q_rot.dtype == torch.bfloat16
         assert k_rot.dtype == torch.bfloat16
+
+
+class TestAttention:
+    """Test the multi-head attention module."""
+
+    # Shared small dimensions for most tests.
+    HIDDEN = 32
+    NUM_HEADS = 4
+    NUM_KV_HEADS = 2
+    HEAD_DIM = 8
+
+    def _make_attn(self, **overrides: object) -> Attention:
+        kwargs: dict[str, object] = {
+            "hidden_size": self.HIDDEN,
+            "num_heads": self.NUM_HEADS,
+            "num_kv_heads": self.NUM_KV_HEADS,
+            "head_dim": self.HEAD_DIM,
+        }
+        kwargs.update(overrides)
+        return Attention(**kwargs)  # type: ignore[arg-type]
+
+    def _forward(
+        self, attn: Attention, batch: int = 1, seq_len: int = 4, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        x = torch.randn(batch, seq_len, self.HIDDEN)
+        cos, sin = build_rope_cos_sin(attn.head_dim, seq_len)
+        return attn(x, cos, sin, mask=mask)
+
+    def test_output_shape(self) -> None:
+        attn = self._make_attn()
+        out = self._forward(attn, batch=2, seq_len=6)
+        assert out.shape == (2, 6, self.HIDDEN)
+
+    def test_output_shape_no_gqa(self) -> None:
+        """When num_kv_heads == num_heads, no GQA expansion needed."""
+        attn = self._make_attn(num_kv_heads=self.NUM_HEADS)
+        out = self._forward(attn, batch=1, seq_len=4)
+        assert out.shape == (1, 4, self.HIDDEN)
+
+    def test_with_qk_norm(self) -> None:
+        attn = self._make_attn(qk_norm=True)
+        assert attn.q_norm is not None
+        assert attn.k_norm is not None
+        out = self._forward(attn)
+        assert out.shape == (1, 4, self.HIDDEN)
+
+    def test_without_qk_norm(self) -> None:
+        attn = self._make_attn(qk_norm=False)
+        assert attn.q_norm is None
+        assert attn.k_norm is None
+        out = self._forward(attn)
+        assert out.shape == (1, 4, self.HIDDEN)
+
+    def test_with_bias(self) -> None:
+        attn = self._make_attn(bias=True)
+        assert attn.q_proj.bias is not None
+        assert attn.o_proj.bias is not None
+        out = self._forward(attn)
+        assert out.shape == (1, 4, self.HIDDEN)
+
+    def test_without_bias(self) -> None:
+        attn = self._make_attn(bias=False)
+        assert attn.q_proj.bias is None
+        assert attn.o_proj.bias is None
+
+    def test_custom_scale(self) -> None:
+        """Custom query_pre_attn_scalar should override default scaling."""
+        scalar = 256.0
+        attn = self._make_attn(scale=scalar**-0.5)
+        assert attn.scale == scalar**-0.5
+        out = self._forward(attn)
+        assert out.shape == (1, 4, self.HIDDEN)
+
+    def test_default_scale(self) -> None:
+        attn = self._make_attn()
+        assert attn.scale == self.HEAD_DIM**-0.5
+
+    def test_with_causal_mask(self) -> None:
+        seq_len = 6
+        # Additive causal mask: 0.0 = attend, -inf = mask.
+        mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)
+        mask = mask[None, None, :, :]  # [1, 1, seq_len, seq_len]
+        attn = self._make_attn()
+        out = self._forward(attn, seq_len=seq_len, mask=mask)
+        assert out.shape == (1, seq_len, self.HIDDEN)
+
+    def test_decoupled_head_dim(self) -> None:
+        """head_dim can differ from hidden_size // num_heads (like Gemma 3 1B)."""
+        # Gemma 3 1B style: hidden=1152, heads=4, head_dim=256
+        attn = Attention(
+            hidden_size=64,
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=32,  # != 64 // 4 = 16
+        )
+        x = torch.randn(1, 4, 64)
+        cos, sin = build_rope_cos_sin(32, 4)
+        out = attn(x, cos, sin)
+        assert out.shape == (1, 4, 64)
+
+    def test_projection_dimensions(self) -> None:
+        """Verify projection sizes use num_heads * head_dim, not hidden_size."""
+        attn = self._make_attn()
+        assert attn.q_proj.out_features == self.NUM_HEADS * self.HEAD_DIM
+        assert attn.k_proj.out_features == self.NUM_KV_HEADS * self.HEAD_DIM
+        assert attn.v_proj.out_features == self.NUM_KV_HEADS * self.HEAD_DIM
+        assert attn.o_proj.in_features == self.NUM_HEADS * self.HEAD_DIM
+        assert attn.o_proj.out_features == self.HIDDEN
+
+    def test_indivisible_heads_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(ValueError, match="divisible"):
+            self._make_attn(num_heads=4, num_kv_heads=3)
+
+
+class TestGatedMLP:
+    """Test the gated MLP module."""
+
+    HIDDEN = 32
+    INTERMEDIATE = 64
+
+    def test_output_shape(self) -> None:
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE)
+        x = torch.randn(2, 8, self.HIDDEN)
+        assert mlp(x).shape == x.shape
+
+    def test_silu_matches_manual(self) -> None:
+        """Verify output matches down(silu(gate(x)) * up(x))."""
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="silu")
+        x = torch.randn(1, 4, self.HIDDEN)
+
+        expected = mlp.down_proj(torch.nn.functional.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
+        torch.testing.assert_close(mlp(x), expected)
+
+    def test_gelu_tanh_matches_manual(self) -> None:
+        """Verify output matches down(gelu_tanh(gate(x)) * up(x))."""
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="gelu_pytorch_tanh")
+        x = torch.randn(1, 4, self.HIDDEN)
+
+        gelu = torch.nn.GELU(approximate="tanh")
+        expected = mlp.down_proj(gelu(mlp.gate_proj(x)) * mlp.up_proj(x))
+        torch.testing.assert_close(mlp(x), expected)
+
+    def test_with_bias(self) -> None:
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, bias=True)
+        assert mlp.gate_proj.bias is not None
+        assert mlp.up_proj.bias is not None
+        assert mlp.down_proj.bias is not None
+        assert mlp(torch.randn(1, 4, self.HIDDEN)).shape == (1, 4, self.HIDDEN)
+
+    def test_without_bias(self) -> None:
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, bias=False)
+        assert mlp.gate_proj.bias is None
+        assert mlp.up_proj.bias is None
+        assert mlp.down_proj.bias is None
+
+    def test_projection_dimensions(self) -> None:
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE)
+        assert mlp.gate_proj.in_features == self.HIDDEN
+        assert mlp.gate_proj.out_features == self.INTERMEDIATE
+        assert mlp.up_proj.in_features == self.HIDDEN
+        assert mlp.up_proj.out_features == self.INTERMEDIATE
+        assert mlp.down_proj.in_features == self.INTERMEDIATE
+        assert mlp.down_proj.out_features == self.HIDDEN
+
+    def test_unknown_activation_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(ValueError, match="Unknown activation"):
+            GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="relu")
+
+
+class TestCausalMask:
+    """Test the causal mask helper."""
+
+    def test_shape(self) -> None:
+        mask = causal_mask(8)
+        assert mask.shape == (1, 1, 8, 8)
+
+    def test_diagonal_is_zero(self) -> None:
+        """Positions can attend to themselves."""
+        mask = causal_mask(4)
+        for i in range(4):
+            assert mask[0, 0, i, i].item() == 0.0
+
+    def test_lower_triangle_is_zero(self) -> None:
+        """Positions can attend to all earlier positions."""
+        mask = causal_mask(4)
+        for i in range(4):
+            for j in range(i + 1):
+                assert mask[0, 0, i, j].item() == 0.0
+
+    def test_upper_triangle_is_neginf(self) -> None:
+        """Positions cannot attend to future positions."""
+        mask = causal_mask(4)
+        for i in range(4):
+            for j in range(i + 1, 4):
+                assert mask[0, 0, i, j].item() == float("-inf")
+
+    def test_seq_len_one(self) -> None:
+        mask = causal_mask(1)
+        assert mask.shape == (1, 1, 1, 1)
+        assert mask[0, 0, 0, 0].item() == 0.0
+
+
+class TestSlidingWindowCausalMask:
+    """Test the sliding window causal mask helper."""
+
+    def test_shape(self) -> None:
+        mask = sliding_window_causal_mask(8, window_size=3)
+        assert mask.shape == (1, 1, 8, 8)
+
+    def test_future_is_masked(self) -> None:
+        """Positions cannot attend to future positions."""
+        mask = sliding_window_causal_mask(6, window_size=3)
+        for i in range(6):
+            for j in range(i + 1, 6):
+                assert mask[0, 0, i, j].item() == float("-inf")
+
+    def test_within_window_is_zero(self) -> None:
+        """Positions within the window can attend."""
+        mask = sliding_window_causal_mask(6, window_size=3)
+        # Position 3 should attend to positions 1, 2, 3 (window_size=3).
+        assert mask[0, 0, 3, 1].item() == 0.0
+        assert mask[0, 0, 3, 2].item() == 0.0
+        assert mask[0, 0, 3, 3].item() == 0.0
+
+    def test_beyond_window_is_masked(self) -> None:
+        """Positions beyond the window are masked."""
+        mask = sliding_window_causal_mask(6, window_size=3)
+        # Position 3 should NOT attend to position 0 (distance=3 >= window_size=3).
+        assert mask[0, 0, 3, 0].item() == float("-inf")
+        # Position 5 should NOT attend to positions 0, 1, 2.
+        assert mask[0, 0, 5, 0].item() == float("-inf")
+        assert mask[0, 0, 5, 1].item() == float("-inf")
+        assert mask[0, 0, 5, 2].item() == float("-inf")
+
+    def test_large_window_equals_causal(self) -> None:
+        """A window >= seq_len should produce the same mask as causal_mask."""
+        seq_len = 8
+        cm = causal_mask(seq_len)
+        sw = sliding_window_causal_mask(seq_len, window_size=seq_len)
+        torch.testing.assert_close(cm, sw)
+
+    def test_window_size_one(self) -> None:
+        """Window of 1 means each position only attends to itself."""
+        mask = sliding_window_causal_mask(4, window_size=1)
+        for i in range(4):
+            for j in range(4):
+                if i == j:
+                    assert mask[0, 0, i, j].item() == 0.0
+                else:
+                    assert mask[0, 0, i, j].item() == float("-inf")
