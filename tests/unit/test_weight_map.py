@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from infer.loader.config import ModelConfig
@@ -237,3 +239,70 @@ class TestMappingConsistency:
         for fn in (llama_weight_map, qwen3_weight_map, gemma3_weight_map):
             m = fn(NUM_LAYERS)
             assert "lm_head.weight" in m
+
+
+def _real_tensor_names(model_id: str) -> set[str]:
+    """Download just enough metadata to get the real tensor names from HF Hub."""
+    from huggingface_hub import hf_hub_download
+
+    # Try sharded layout first (index JSON is a few KB).
+    try:
+        index_path = hf_hub_download(model_id, "model.safetensors.index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+        return set(index["weight_map"].keys())
+    except Exception:
+        pass
+
+    # Fall back to single-file layout — read header only, no full download needed
+    # (safetensors stores tensor names in a small header at the start of the file).
+    from safetensors import safe_open
+
+    path = hf_hub_download(model_id, "model.safetensors")
+    with safe_open(path, framework="pt") as f:
+        return set(f.keys())
+
+
+@pytest.mark.slow
+class TestRealModelWeightNames:
+    """Validate our weight maps against real HF checkpoint tensor names.
+
+    Our maps always include ``lm_head.weight`` by design.  Some checkpoints
+    omit it when ``tie_word_embeddings=True`` (e.g. Gemma 3 1B), so we allow
+    that as the sole permitted difference.
+    """
+
+    def _assert_covers_real_tensors(self, weight_map: dict[str, str], real_names: set[str]) -> None:
+        our_hf_names = set(weight_map.keys())
+        # Every real tensor must be in our map.
+        missing = real_names - our_hf_names
+        assert not missing, f"Tensors in checkpoint but not in our map: {sorted(missing)[:10]}"
+        # Any extra keys in our map should only be lm_head.weight.
+        extra = our_hf_names - real_names
+        assert extra <= {"lm_head.weight"}, (
+            f"Unexpected extra keys in our map: {sorted(extra)[:10]}"
+        )
+
+    def test_qwen3(self) -> None:
+        try:
+            real = _real_tensor_names("Qwen/Qwen3-1.7B")
+        except Exception as exc:
+            pytest.skip(f"Qwen3 not available: {exc}")
+        m = qwen3_weight_map(28)
+        self._assert_covers_real_tensors(m, real)
+
+    def test_gemma3(self) -> None:
+        try:
+            real = _real_tensor_names("google/gemma-3-1b-it")
+        except Exception as exc:
+            pytest.skip(f"Gemma3 not available: {exc}")
+        m = gemma3_weight_map(26)
+        self._assert_covers_real_tensors(m, real)
+
+    def test_llama(self) -> None:
+        try:
+            real = _real_tensor_names("meta-llama/Llama-3.2-1B-Instruct")
+        except Exception as exc:
+            pytest.skip(f"Llama not available: {exc}")
+        m = llama_weight_map(16)
+        self._assert_covers_real_tensors(m, real)

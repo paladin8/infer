@@ -282,14 +282,16 @@ Sample configs in tests use values from real HF config.json files (Llama-3.2-1B-
 - **Dispatcher**: get_weight_map routes correctly by model_type, uses num_hidden_layers from config.
 - **Dev model layer counts**: parametrized test at real layer counts (Llama 16, Qwen3 28, Gemma3 26).
 - **Consistency**: internal names equal HF names with `model.` prefix stripped (all architectures). Mappings are bijective (no collisions). Qwen3 is a strict superset of Llama (extra keys are only q_norm/k_norm).
+- **Real model validation** (`@pytest.mark.slow`): download tensor name metadata from HF Hub for each dev model and verify our weight map covers every real tensor. Any extra keys in our map must only be `lm_head.weight` (omitted by checkpoints with tied embeddings, e.g. Gemma 3 1B).
 
-### Tokenizer tests (`tests/unit/test_tokenizer.py`)
+### Tokenizer tests (`tests/unit/test_tokenizer.py`) — DONE
 
-- Encode a known string, verify token IDs match `AutoTokenizer` directly.
-- Decode token IDs back, verify text.
-- Check `eos_token_id` (including list case), `bos_token_id`, `vocab_size` properties.
+Parametrized across all three dev models (`Llama-3.2-1B-Instruct`, `Qwen3-1.7B`, `gemma-3-1b-it`). Marked `@pytest.mark.slow`. Tests skip gracefully per-model if not accessible.
 
-These tests require a model to be available. Use `meta-llama/Llama-3.2-1B-Instruct`. Marked `@pytest.mark.slow`. Tests skip gracefully if the model is not accessible.
+- **Encode**: output matches `AutoTokenizer.encode` (with and without special tokens), returns `list[int]`, empty string produces empty list.
+- **Decode**: roundtrip encode→decode recovers original text, output matches `AutoTokenizer.decode` (with and without special tokens).
+- **Properties**: `eos_token_id`, `bos_token_id`, `vocab_size` all match HF directly.
+- **Model-specific properties**: Qwen3 has no BOS (`None`), Gemma3/Llama have BOS (`int`). Known vocab sizes verified (Qwen3: 151643, Gemma3: 262144, Llama: 128256).
 
 ### Component tests (`tests/unit/test_components.py`)
 
