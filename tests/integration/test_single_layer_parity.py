@@ -18,8 +18,12 @@ from typing import Any
 import pytest
 import torch
 from torch import Tensor
+from transformers import AutoModelForCausalLM
 
 from infer.models.common import causal_mask, sliding_window_causal_mask
+from infer.models.gemma3 import Gemma3TransformerBlock
+from infer.models.llama import LlamaTransformerBlock
+from infer.models.qwen3 import Qwen3TransformerBlock
 
 SEQ_LEN = 32
 
@@ -93,8 +97,6 @@ class TestLlamaLayerParity:
     """Llama-3.2-1B-Instruct layer 0: pre-norm, no QK-norm, head_dim=64."""
 
     def test_layer0_bf16(self) -> None:
-        from transformers import AutoModelForCausalLM
-
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 "meta-llama/Llama-3.2-1B-Instruct",
@@ -110,8 +112,6 @@ class TestLlamaLayerParity:
         cos, sin = _extract_rope(model, SEQ_LEN, torch.bfloat16)
 
         # Build our block with matching config.
-        from infer.models.llama import LlamaTransformerBlock
-
         head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
         our_block = LlamaTransformerBlock(
             hidden_size=cfg.hidden_size,
@@ -149,8 +149,6 @@ class TestQwen3LayerParity:
     """Qwen3-1.7B layer 0: QK-norm, head_dim=128, vanilla RoPE with theta=1M."""
 
     def test_layer0_bf16(self) -> None:
-        from transformers import AutoModelForCausalLM
-
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 "Qwen/Qwen3-1.7B",
@@ -166,8 +164,6 @@ class TestQwen3LayerParity:
         cos, sin = _extract_rope(model, SEQ_LEN, torch.bfloat16)
 
         # Build our block with matching config.
-        from infer.models.qwen3 import Qwen3TransformerBlock
-
         head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
         our_block = Qwen3TransformerBlock(
             hidden_size=cfg.hidden_size,
@@ -205,8 +201,6 @@ class TestGemma3LayerParity:
     """gemma-3-1b-it layer 0: sandwich norm, QK-norm, GeGLU, sliding window."""
 
     def test_layer0_bf16(self) -> None:
-        from transformers import AutoModelForCausalLM
-
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 "google/gemma-3-1b-it",
@@ -223,8 +217,6 @@ class TestGemma3LayerParity:
         cos, sin = _extract_rope(model, SEQ_LEN, torch.bfloat16, layer_type=layer_type)
 
         # Build our block with matching config.
-        from infer.models.gemma3 import Gemma3TransformerBlock
-
         head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
         sliding_window = getattr(cfg, "sliding_window", 512)
         our_block = Gemma3TransformerBlock(

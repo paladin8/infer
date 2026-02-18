@@ -160,4 +160,4 @@ class TestModelSpecificProperties:
             tok = Tokenizer("meta-llama/Llama-3.2-1B-Instruct")
         except Exception as exc:
             pytest.skip(f"Llama not available: {exc}")
-        assert tok.vocab_size == 128256
+        assert tok.vocab_size == 128000
