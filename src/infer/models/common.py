@@ -32,7 +32,8 @@ class RMSNorm(nn.Module):
         input_dtype = x.dtype
         x = x.to(torch.float32)
         normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight * normed).to(input_dtype)
+        # Cast normed back before weight multiply to match HF rounding convention.
+        return self.weight.to(input_dtype) * normed.to(input_dtype)
 
 
 # ---------------------------------------------------------------------------
