@@ -548,3 +548,37 @@ class TestSlidingWindowCausalMask:
                     assert mask[0, 0, i, j].item() == 0.0
                 else:
                     assert mask[0, 0, i, j].item() == float("-inf")
+
+
+class TestMaskDtypeDevice:
+    """Tests for dtype and device arguments on mask helpers."""
+
+    def test_causal_mask_default_dtype(self) -> None:
+        mask = causal_mask(4)
+        assert mask.dtype == torch.float32
+        assert mask.device == torch.device("cpu")
+
+    def test_causal_mask_bfloat16(self) -> None:
+        mask = causal_mask(4, dtype=torch.bfloat16)
+        assert mask.dtype == torch.bfloat16
+
+    def test_causal_mask_float16(self) -> None:
+        mask = causal_mask(4, dtype=torch.float16)
+        assert mask.dtype == torch.float16
+
+    def test_sliding_window_default_dtype(self) -> None:
+        mask = sliding_window_causal_mask(4, window_size=2)
+        assert mask.dtype == torch.float32
+        assert mask.device == torch.device("cpu")
+
+    def test_sliding_window_bfloat16(self) -> None:
+        mask = sliding_window_causal_mask(4, window_size=2, dtype=torch.bfloat16)
+        assert mask.dtype == torch.bfloat16
+
+    def test_causal_mask_values_preserved_in_bf16(self) -> None:
+        """Verify 0.0 and -inf values are correct in bfloat16."""
+        mask = causal_mask(3, dtype=torch.bfloat16)
+        # Diagonal should be 0.0 (attend to self).
+        assert mask[0, 0, 0, 0].item() == 0.0
+        # Upper triangle should be -inf.
+        assert mask[0, 0, 0, 1].item() == float("-inf")

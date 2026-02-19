@@ -1,4 +1,4 @@
-"""Qwen 3 transformer block.
+"""Qwen 3 model and transformer block.
 
 Pre-norm architecture with 2 block norms, QK-norm, SwiGLU MLP.
 Same block structure as Llama 3 — the only difference is QK-norm
@@ -18,7 +18,14 @@ from __future__ import annotations
 
 from torch import Tensor, nn
 
-from infer.models.common import Attention, GatedMLP, RMSNorm
+from infer.loader.config import ModelConfig
+from infer.models.common import (
+    Attention,
+    GatedMLP,
+    RMSNorm,
+    build_rope_cos_sin,
+    causal_mask,
+)
 
 
 class Qwen3TransformerBlock(nn.Module):
@@ -92,3 +99,63 @@ class Qwen3TransformerBlock(nn.Module):
         x = residual + x
 
         return x
+
+
+class Qwen3Model(nn.Module):
+    """Full Qwen 3 model: embedding, transformer blocks, final norm, LM head.
+
+    Args:
+        config: Model configuration.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                Qwen3TransformerBlock(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    num_heads=config.num_attention_heads,
+                    num_kv_heads=config.num_key_value_heads,
+                    head_dim=config.computed_head_dim,
+                    rms_norm_eps=config.rms_norm_eps,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Precompute RoPE tables as non-persistent buffers.
+        cos, sin = build_rope_cos_sin(
+            config.computed_head_dim,
+            config.max_position_embeddings,
+            theta=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.cos: Tensor
+        self.sin: Tensor
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            input_ids: Token IDs, shape ``[batch, seq_len]``.
+
+        Returns:
+            Logits, shape ``[batch, seq_len, vocab_size]``.
+        """
+        x = self.embed_tokens(input_ids)
+        seq_len = x.shape[1]
+        cos = self.cos[:seq_len]
+        sin = self.sin[:seq_len]
+        mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
+
+        for layer in self.layers:
+            x = layer(x, cos, sin, mask)
+
+        x = self.norm(x)
+        return self.lm_head(x)

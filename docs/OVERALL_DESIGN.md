@@ -247,18 +247,18 @@ Exit criteria:
 
 Goal:
 
-- Assemble the full Llama model and verify end-to-end logits match `transformers`.
+- Assemble full models for all three architectures (Llama 3, Qwen 3, Gemma 3) and verify end-to-end logits match `transformers`.
 
 Deliverables:
 
-- Complete Llama `nn.Module` (stack all layers, final norm, LM head).
+- Complete `nn.Module` for each architecture (stack all layers, final norm, LM head) and a `load_model` entry point.
 - Jinja2-based chat template renderer with custom templates per model (no `transformers.apply_chat_template`).
 - Layer-by-layer activation diff tooling for debugging mismatches.
 
 Exit criteria:
 
-- Full-model logits parity test against `transformers` with max absolute error threshold documented by dtype.
-- At least one end-to-end test: load model, tokenize prompt, forward pass, verify logits.
+- Full-model logits parity tests against `transformers` for all three dev models, with max absolute error thresholds documented by dtype.
+- At least one end-to-end test per model: load model, tokenize prompt, forward pass, verify logits.
 
 ### Phase 2: Autoregressive Generation
 
@@ -577,6 +577,7 @@ Milestone gates:
 infer/
 ├── src/
 │   └── infer/
+│       ├── debug.py
 │       ├── models/
 │       │   ├── common.py
 │       │   ├── llama.py
@@ -587,7 +588,8 @@ infer/
 │       │   ├── weights.py
 │       │   ├── weight_map.py
 │       │   ├── tokenizer.py
-│       │   └── chat_template.py
+│       │   ├── chat_template.py
+│       │   └── model_loader.py
 │       ├── engine/
 │       │   ├── config.py
 │       │   ├── engine.py
@@ -614,7 +616,8 @@ infer/
 │   ├── integration/
 │   └── stress/
 └── docs/
-    └── OVERALL_DESIGN.md
+    ├── OVERALL_DESIGN.md
+    └── PHASE_1B.md
 ```
 
 ---

@@ -48,6 +48,7 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
     "slow: tests that require model downloads or heavy computation",
+    "gpu: tests that require a CUDA GPU",
 ]
 
 [tool.ruff]

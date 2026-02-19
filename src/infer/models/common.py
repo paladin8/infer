@@ -101,7 +101,13 @@ def build_rope_cos_sin(
             ``None`` or ``"default"`` uses vanilla RoPE.
 
     Returns:
-        ``(cos, sin)`` each of shape ``[max_seq_len, head_dim]``.
+        ``(cos, sin)`` each of shape ``[max_seq_len, head_dim]``, in float32.
+
+    Note:
+        Tables are precomputed in float32 for precision during the
+        trigonometric computation.  ``load_model`` casts them to the
+        model dtype (e.g. bf16) once at load time, matching HF's
+        behavior.
     """
     if rope_scaling is None or rope_scaling.get("rope_type") in (None, "default"):
         inv_freq = _vanilla_inv_freq(head_dim, theta)
@@ -307,27 +313,54 @@ class GatedMLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def causal_mask(seq_len: int) -> Tensor:
+def causal_mask(
+    seq_len: int,
+    dtype: torch.dtype = torch.float32,
+    device: str | torch.device = "cpu",
+) -> Tensor:
     """Standard lower-triangular causal mask.
 
     Uses the float additive convention: ``0.0`` for attend, ``-inf`` for mask.
 
+    Args:
+        seq_len: Sequence length.
+        dtype: Output tensor dtype.
+        device: Output tensor device.
+
     Returns:
         Mask of shape ``[1, 1, seq_len, seq_len]``.
     """
-    return torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)[None, None, :, :]
+    return torch.triu(
+        torch.full((seq_len, seq_len), float("-inf"), dtype=dtype, device=device), diagonal=1
+    )[None, None, :, :]
 
 
-def sliding_window_causal_mask(seq_len: int, window_size: int) -> Tensor:
+def sliding_window_causal_mask(
+    seq_len: int,
+    window_size: int,
+    dtype: torch.dtype = torch.float32,
+    device: str | torch.device = "cpu",
+) -> Tensor:
     """Causal mask that also masks positions beyond the sliding window.
 
     Each query position can attend to at most ``window_size`` previous
     positions (including itself).  Uses the float additive convention.
 
+    Args:
+        seq_len: Sequence length.
+        window_size: Maximum attention window.
+        dtype: Output tensor dtype.
+        device: Output tensor device.
+
     Returns:
         Mask of shape ``[1, 1, seq_len, seq_len]``.
     """
-    causal = torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)
+    causal = torch.triu(
+        torch.full((seq_len, seq_len), float("-inf"), dtype=dtype, device=device), diagonal=1
+    )
     # Mask positions further than window_size below the diagonal.
-    window = torch.tril(torch.full((seq_len, seq_len), float("-inf")), diagonal=-(window_size))
+    window = torch.tril(
+        torch.full((seq_len, seq_len), float("-inf"), dtype=dtype, device=device),
+        diagonal=-(window_size),
+    )
     return (causal + window)[None, None, :, :]

@@ -1,4 +1,4 @@
-"""Gemma 3 transformer block.
+"""Gemma 3 model and transformer block.
 
 Sandwich-norm architecture with 4 block norms, QK-norm, GeGLU MLP.
 
@@ -24,10 +24,20 @@ Block structure::
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor, nn
 
-from infer.models.common import Attention, GatedMLP, RMSNorm
+from infer.loader.config import ModelConfig
+from infer.models.common import (
+    Attention,
+    GatedMLP,
+    RMSNorm,
+    build_rope_cos_sin,
+    causal_mask,
+    sliding_window_causal_mask,
+)
 
 
 class Gemma3RMSNorm(RMSNorm):
@@ -149,3 +159,105 @@ class Gemma3TransformerBlock(nn.Module):
         x = residual + x
 
         return x
+
+
+class Gemma3Model(nn.Module):
+    """Full Gemma 3 model: embedding (with scaling), transformer blocks, final norm, LM head.
+
+    Gemma 3 differences from Llama/Qwen:
+
+    - Embedding output is scaled by ``sqrt(hidden_size)``.
+    - Dual RoPE tables: local (``rope_local_base_freq``) for sliding-window
+      layers, global (``rope_theta``) for full-attention layers.
+    - Per-layer mask selection: sliding-window layers use a windowed causal
+      mask, full-attention layers use a standard causal mask.
+    - Final norm uses ``Gemma3RMSNorm`` (``1 + weight`` convention).
+
+    Args:
+        config: Model configuration.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                Gemma3TransformerBlock(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    num_heads=config.num_attention_heads,
+                    num_kv_heads=config.num_key_value_heads,
+                    head_dim=config.computed_head_dim,
+                    rms_norm_eps=config.rms_norm_eps,
+                    query_pre_attn_scalar=config.query_pre_attn_scalar or config.computed_head_dim,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Model-specific attributes.
+        self.embedding_normalizer = math.sqrt(config.hidden_size)
+        self.layer_types: list[str] = (
+            config.layer_types or ["full_attention"] * config.num_hidden_layers
+        )
+        self.sliding_window = config.sliding_window or 512
+
+        # Precompute local RoPE tables (rope_local_base_freq, used for sliding-window layers).
+        local_theta = config.rope_local_base_freq or config.rope_theta
+        local_cos, local_sin = build_rope_cos_sin(
+            config.computed_head_dim,
+            config.max_position_embeddings,
+            theta=local_theta,
+        )
+        self.local_cos: Tensor
+        self.local_sin: Tensor
+        self.register_buffer("local_cos", local_cos, persistent=False)
+        self.register_buffer("local_sin", local_sin, persistent=False)
+
+        # Precompute global RoPE tables (rope_theta, with optional rope_scaling).
+        global_cos, global_sin = build_rope_cos_sin(
+            config.computed_head_dim,
+            config.max_position_embeddings,
+            theta=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.global_cos: Tensor
+        self.global_sin: Tensor
+        self.register_buffer("global_cos", global_cos, persistent=False)
+        self.register_buffer("global_sin", global_sin, persistent=False)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            input_ids: Token IDs, shape ``[batch, seq_len]``.
+
+        Returns:
+            Logits, shape ``[batch, seq_len, vocab_size]``.
+        """
+        x = self.embed_tokens(input_ids)
+        x = x * self.embedding_normalizer
+        seq_len = x.shape[1]
+
+        # Precompute both mask types for this sequence length.
+        local_mask = sliding_window_causal_mask(
+            seq_len, self.sliding_window, dtype=x.dtype, device=x.device
+        )
+        global_mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
+
+        # Slice RoPE tables to actual sequence length.
+        local_cos = self.local_cos[:seq_len]
+        local_sin = self.local_sin[:seq_len]
+        global_cos = self.global_cos[:seq_len]
+        global_sin = self.global_sin[:seq_len]
+
+        for i, layer in enumerate(self.layers):
+            if self.layer_types[i] == "sliding_attention":
+                x = layer(x, local_cos, local_sin, local_mask)
+            else:
+                x = layer(x, global_cos, global_sin, global_mask)
+
+        x = self.norm(x)
+        return self.lm_head(x)
