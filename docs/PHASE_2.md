@@ -345,15 +345,15 @@ Three stop conditions, checked after each generated token in this priority order
 A standalone script that loads a model, runs generation with controlled inputs, and reports throughput and latency metrics.
 
 ```
-Usage:
+Ad-hoc single run:
     uv run python benchmarks/bench_generation.py \
         --model meta-llama/Llama-3.2-1B-Instruct \
-        --prompt-tokens 256 \
-        --max-new-tokens 256 \
-        --dtype bfloat16 \
-        --warmup-runs 2 \
-        --trials 3 \
-        --seed 42
+        --prompt-tokens 256 --max-new-tokens 256
+
+Canonical suite:
+    uv run python benchmarks/bench_generation.py --suite quick
+    uv run python benchmarks/bench_generation.py --suite standard
+    uv run python benchmarks/bench_generation.py --suite full
 ```
 
 **Workload construction**:
@@ -371,6 +371,8 @@ def make_synthetic_prompt(tokenizer: Tokenizer, target_tokens: int) -> list[int]
 Alternatively, for more realistic prompts, use a fixed passage of text and truncate the token sequence to the target length. The benchmark accepts both modes:
 - `--prompt-tokens N`: synthetic prompt of exactly N tokens (default).
 - `--prompt "text"`: user-provided prompt text (reports actual token count).
+
+The benchmark includes 7 canonical configs (short-greedy through medium-full-pipeline) with 3 suite tiers (quick, standard, full). See `benchmarks/log/GENERATION_LOG.md` for config details and results.
 
 **Benchmark flow**:
 
@@ -469,8 +471,10 @@ src/infer/
 
 benchmarks/
 ├── bench_generation.py         # NEW: Phase 2 benchmark script
-└── reports/                    # NEW: directory for JSON benchmark reports
-    └── .gitkeep
+├── reports/                    # NEW: directory for JSON benchmark reports
+│   └── .gitkeep
+└── log/
+    └── GENERATION_LOG.md       # NEW: cross-phase generation benchmark log
 
 tests/
 ├── unit/
