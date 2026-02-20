@@ -8,6 +8,15 @@ from __future__ import annotations
 
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+# Token names that signal end-of-generation across supported models.
+_EOS_TOKEN_NAMES: set[str] = {
+    "<|eot_id|>",  # Llama 3
+    "<|end_of_turn|>",  # Llama 3
+    "<end_of_turn>",  # Gemma 3
+    "<|im_end|>",  # Qwen 3
+    "<|endoftext|>",  # Qwen 3
+}
+
 
 class Tokenizer:
     """Wrapper around a HuggingFace tokenizer.
@@ -44,6 +53,24 @@ class Tokenizer:
         result = self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
         assert isinstance(result, str)  # single list always returns str
         return result
+
+    @property
+    def eos_token_ids(self) -> set[int]:
+        """All token IDs that should terminate generation.
+
+        Includes the primary ``eos_token_id`` plus any additional EOS tokens
+        defined in the tokenizer's added vocabulary (e.g. Llama 3's ``<|eot_id|>``
+        and ``<|end_of_turn|>`` tokens).
+        """
+        ids: set[int] = set()
+        eos = self._tokenizer.eos_token_id
+        if eos is not None:
+            ids.add(eos)
+        added: dict[str, int] = getattr(self._tokenizer, "added_tokens_encoder", {})
+        for token_str, token_id in added.items():
+            if token_str in _EOS_TOKEN_NAMES:
+                ids.add(token_id)
+        return ids
 
     @property
     def eos_token_id(self) -> int | list[int]:
