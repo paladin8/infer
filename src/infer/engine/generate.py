@@ -1,4 +1,4 @@
-"""Autoregressive generation loop (no KV cache)."""
+"""Autoregressive generation loop with optional KV cache."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor, nn
 
+from infer.cache.simple import KVCache
 from infer.engine.sampler import SamplingParams, sample_token
 from infer.loader.tokenizer import Tokenizer
 
@@ -96,20 +97,26 @@ def generate(
     params: SamplingParams,
     *,
     device: str | torch.device = "cuda",
+    use_kv_cache: bool = True,
 ) -> GenerationResult:
     """Generate tokens autoregressively from a prompt.
 
-    This is the naive (no KV cache) implementation: each decode step
-    runs a full forward pass over the entire sequence (prompt + all
-    generated tokens so far).  This gives O(n^2) compute for *n*
-    generated tokens.
+    When ``use_kv_cache=True`` (default), the KV cache eliminates
+    redundant computation: the prompt is processed once (prefill),
+    and each decode step processes only the new token.  This gives
+    O(n) compute for *n* generated tokens.
+
+    When ``use_kv_cache=False``, reverts to Phase 2 behavior
+    (full-sequence recomputation at each step, O(n^2) compute).
 
     Args:
         model: A loaded model (LlamaModel, Qwen3Model, or Gemma3Model).
+            Must have a ``.config`` attribute when ``use_kv_cache=True``.
         tokenizer: Tokenizer for the model.
         prompt_token_ids: Pre-tokenized prompt (list of token IDs).
         params: Sampling parameters.
         device: Device to run on.
+        use_kv_cache: Whether to use the KV cache.
 
     Returns:
         A ``GenerationResult`` with the generated text, token IDs,
@@ -126,6 +133,23 @@ def generate(
         generator = torch.Generator(device=device)
         generator.manual_seed(params.seed)
 
+    # Allocate KV cache if requested.
+    kv_cache: KVCache | None = None
+    if use_kv_cache:
+        config = getattr(model, "config", None)
+        if config is None:
+            raise TypeError(
+                "model must have a .config attribute for KV cache allocation. "
+                "Set use_kv_cache=False to use Phase 2 behavior."
+            )
+        max_seq_len = len(prompt_token_ids) + params.max_new_tokens
+        kv_cache = KVCache.from_model_config(
+            config,
+            max_seq_len=max_seq_len,
+            dtype=next(model.parameters()).dtype,
+            device=device,
+        )
+
     # Resolve EOS token IDs.
     eos_ids: set[int] = tokenizer.eos_token_ids
 
@@ -139,7 +163,7 @@ def generate(
     t0 = time.perf_counter()
 
     input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
-    logits: Tensor = model(input_ids)
+    logits: Tensor = model(input_ids) if kv_cache is None else model(input_ids, kv_cache=kv_cache)
     next_logits = logits[0, -1, :]
     token = sample_token(next_logits, tokens, params, generator)
 
@@ -161,8 +185,11 @@ def generate(
             _sync_device(device)
             t0 = time.perf_counter()
 
-            input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
-            logits = model(input_ids)
+            if kv_cache is not None:
+                input_ids = torch.tensor([[tokens[-1]]], dtype=torch.long, device=device)
+            else:
+                input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            logits = model(input_ids) if kv_cache is None else model(input_ids, kv_cache=kv_cache)
             next_logits = logits[0, -1, :]
 
             _sync_device(device)

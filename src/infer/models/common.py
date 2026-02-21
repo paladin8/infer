@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+if TYPE_CHECKING:
+    from infer.cache.simple import KVCache
 
 
 class RMSNorm(nn.Module):
@@ -225,6 +228,8 @@ class Attention(nn.Module):
         cos: Tensor,
         sin: Tensor,
         mask: Tensor | None = None,
+        kv_cache: KVCache | None = None,
+        layer_idx: int = 0,
     ) -> Tensor:
         """Forward pass.
 
@@ -232,7 +237,15 @@ class Attention(nn.Module):
             x: Input tensor ``[batch, seq_len, hidden_size]``.
             cos: RoPE cosine table ``[seq_len, head_dim]``.
             sin: RoPE sine table ``[seq_len, head_dim]``.
-            mask: Attention mask ``[1, 1, seq_len, seq_len]`` (additive, float).
+            mask: Attention mask (additive, float).
+                Without cache: ``[1, 1, seq_len, seq_len]``.
+                With cache during prefill: ``[1, 1, seq_len, seq_len]``.
+                With cache during decode: ``None`` for full-attention layers,
+                ``[1, 1, 1, cached_len]`` for sliding-window layers (Gemma 3).
+            kv_cache: Optional KV cache.  When provided, new K/V entries are
+                stored and the full cached K/V is used for attention.
+            layer_idx: Layer index for cache indexing.  Only used when
+                ``kv_cache`` is not ``None``.
 
         Returns:
             Output tensor ``[batch, seq_len, hidden_size]``.
@@ -251,6 +264,10 @@ class Attention(nn.Module):
 
         # Rotary position embeddings.
         q, k = apply_rope(q, k, cos, sin)
+
+        # KV cache: store new K/V and retrieve full cached K/V.
+        if kv_cache is not None:
+            k, v = kv_cache.update(layer_idx, k, v)
 
         # GQA: expand K/V heads to match Q heads.
         if self.num_kv_heads < self.num_heads:

@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from infer.cache.simple import KVCache
 from infer.models.common import (
     Attention,
     GatedMLP,
@@ -408,6 +409,249 @@ class TestAttention:
 
         with pytest.raises(ValueError, match="divisible"):
             self._make_attn(num_heads=4, num_kv_heads=3)
+
+    # --- KV cache tests ---
+
+    def test_kv_cache_prefill_output_shape(self) -> None:
+        """With KV cache, prefill output shape matches no-cache output."""
+        attn = self._make_attn()
+        seq_len = 6
+        cache = KVCache.allocate(
+            num_layers=1,
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            max_seq_len=seq_len + 10,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        x = torch.randn(1, seq_len, self.HIDDEN)
+        cos, sin = build_rope_cos_sin(self.HEAD_DIM, seq_len)
+        mask = causal_mask(seq_len)
+        out = attn(x, cos, sin, mask=mask, kv_cache=cache, layer_idx=0)
+        assert out.shape == (1, seq_len, self.HIDDEN)
+
+    def test_kv_cache_decode_output_shape(self) -> None:
+        """Single-token decode with cache produces [batch, 1, hidden] output."""
+        attn = self._make_attn()
+        prompt_len = 4
+        cache = KVCache.allocate(
+            num_layers=1,
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            max_seq_len=prompt_len + 5,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        # Prefill
+        x = torch.randn(1, prompt_len, self.HIDDEN)
+        cos, sin = build_rope_cos_sin(self.HEAD_DIM, prompt_len)
+        mask = causal_mask(prompt_len)
+        attn(x, cos, sin, mask=mask, kv_cache=cache, layer_idx=0)
+        cache.advance(prompt_len)
+
+        # Decode one token
+        x_decode = torch.randn(1, 1, self.HIDDEN)
+        cos_d, sin_d = build_rope_cos_sin(self.HEAD_DIM, prompt_len + 1)
+        cos_d = cos_d[prompt_len : prompt_len + 1]
+        sin_d = sin_d[prompt_len : prompt_len + 1]
+        out = attn(x_decode, cos_d, sin_d, mask=None, kv_cache=cache, layer_idx=0)
+        assert out.shape == (1, 1, self.HIDDEN)
+
+    def test_kv_cache_equivalence(self) -> None:
+        """Cached prefill + decode produces same output as full no-cache forward."""
+        attn = self._make_attn()
+        torch.manual_seed(42)
+        seq_len = 5
+        x_all = torch.randn(1, seq_len, self.HIDDEN)
+        cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, seq_len)
+        mask_all = causal_mask(seq_len)
+
+        # Full forward without cache.
+        out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
+
+        # Prefill first 4, then decode 1.
+        cache = KVCache.allocate(
+            num_layers=1,
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            max_seq_len=seq_len,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        prefill_len = seq_len - 1
+        mask_prefill = causal_mask(prefill_len)
+        attn(
+            x_all[:, :prefill_len, :],
+            cos_all[:prefill_len],
+            sin_all[:prefill_len],
+            mask=mask_prefill,
+            kv_cache=cache,
+            layer_idx=0,
+        )
+        cache.advance(prefill_len)
+
+        # Decode last token — no mask needed for full attention.
+        out_decode = attn(
+            x_all[:, prefill_len : prefill_len + 1, :],
+            cos_all[prefill_len : prefill_len + 1],
+            sin_all[prefill_len : prefill_len + 1],
+            mask=None,
+            kv_cache=cache,
+            layer_idx=0,
+        )
+
+        # The last position's output should match.
+        torch.testing.assert_close(
+            out_decode[:, 0, :], out_no_cache[:, -1, :], atol=1e-5, rtol=1e-5
+        )
+
+    def test_kv_cache_none_is_noop(self) -> None:
+        """Passing kv_cache=None behaves identically to the original forward."""
+        attn = self._make_attn()
+        torch.manual_seed(0)
+        x = torch.randn(1, 4, self.HIDDEN)
+        cos, sin = build_rope_cos_sin(self.HEAD_DIM, 4)
+        mask = causal_mask(4)
+
+        out1 = attn(x, cos, sin, mask=mask)
+        out2 = attn(x, cos, sin, mask=mask, kv_cache=None, layer_idx=0)
+        torch.testing.assert_close(out1, out2)
+
+    def test_kv_cache_equivalence_with_qk_norm(self) -> None:
+        """Cached path matches no-cache path when QK-norm is enabled."""
+        attn = self._make_attn(qk_norm=True)
+        torch.manual_seed(99)
+        seq_len = 5
+        x_all = torch.randn(1, seq_len, self.HIDDEN)
+        cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, seq_len)
+        mask_all = causal_mask(seq_len)
+
+        # Full forward without cache.
+        out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
+
+        # Prefill first 4, then decode 1.
+        cache = KVCache.allocate(
+            num_layers=1,
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            max_seq_len=seq_len,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        prefill_len = seq_len - 1
+        attn(
+            x_all[:, :prefill_len, :],
+            cos_all[:prefill_len],
+            sin_all[:prefill_len],
+            mask=causal_mask(prefill_len),
+            kv_cache=cache,
+            layer_idx=0,
+        )
+        cache.advance(prefill_len)
+
+        out_decode = attn(
+            x_all[:, prefill_len : prefill_len + 1, :],
+            cos_all[prefill_len : prefill_len + 1],
+            sin_all[prefill_len : prefill_len + 1],
+            mask=None,
+            kv_cache=cache,
+            layer_idx=0,
+        )
+
+        torch.testing.assert_close(
+            out_decode[:, 0, :], out_no_cache[:, -1, :], atol=1e-5, rtol=1e-5
+        )
+
+    def test_kv_cache_multi_step_decode(self) -> None:
+        """Prefill(3) + decode 3 tokens one-at-a-time matches a full 6-token forward."""
+        attn = self._make_attn()
+        torch.manual_seed(7)
+        total_len = 6
+        prefill_len = 3
+        x_all = torch.randn(1, total_len, self.HIDDEN)
+        cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, total_len)
+        mask_all = causal_mask(total_len)
+
+        # Full forward without cache.
+        out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
+
+        # Cached: prefill first 3.
+        cache = KVCache.allocate(
+            num_layers=1,
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            max_seq_len=total_len,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        attn(
+            x_all[:, :prefill_len, :],
+            cos_all[:prefill_len],
+            sin_all[:prefill_len],
+            mask=causal_mask(prefill_len),
+            kv_cache=cache,
+            layer_idx=0,
+        )
+        cache.advance(prefill_len)
+
+        # Decode tokens 3, 4, 5 one at a time.
+        for i in range(prefill_len, total_len):
+            out_decode = attn(
+                x_all[:, i : i + 1, :],
+                cos_all[i : i + 1],
+                sin_all[i : i + 1],
+                mask=None,
+                kv_cache=cache,
+                layer_idx=0,
+            )
+            cache.advance(1)
+
+            torch.testing.assert_close(
+                out_decode[:, 0, :], out_no_cache[:, i, :], atol=1e-5, rtol=1e-5
+            )
+
+    def test_kv_cache_equivalence_no_gqa(self) -> None:
+        """Cached path works when num_kv_heads == num_heads (MHA, no GQA expansion)."""
+        attn = self._make_attn(num_kv_heads=self.NUM_HEADS)
+        torch.manual_seed(13)
+        seq_len = 5
+        x_all = torch.randn(1, seq_len, self.HIDDEN)
+        cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, seq_len)
+        mask_all = causal_mask(seq_len)
+
+        out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
+
+        cache = KVCache.allocate(
+            num_layers=1,
+            num_kv_heads=self.NUM_HEADS,
+            head_dim=self.HEAD_DIM,
+            max_seq_len=seq_len,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        prefill_len = seq_len - 1
+        attn(
+            x_all[:, :prefill_len, :],
+            cos_all[:prefill_len],
+            sin_all[:prefill_len],
+            mask=causal_mask(prefill_len),
+            kv_cache=cache,
+            layer_idx=0,
+        )
+        cache.advance(prefill_len)
+
+        out_decode = attn(
+            x_all[:, prefill_len : prefill_len + 1, :],
+            cos_all[prefill_len : prefill_len + 1],
+            sin_all[prefill_len : prefill_len + 1],
+            mask=None,
+            kv_cache=cache,
+            layer_idx=0,
+        )
+
+        torch.testing.assert_close(
+            out_decode[:, 0, :], out_no_cache[:, -1, :], atol=1e-5, rtol=1e-5
+        )
 
 
 class TestGatedMLP:

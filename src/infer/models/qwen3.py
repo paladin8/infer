@@ -16,9 +16,14 @@ Block structure::
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from torch import Tensor, nn
 
 from infer.loader.config import ModelConfig
+
+if TYPE_CHECKING:
+    from infer.cache.simple import KVCache
 from infer.models.common import (
     Attention,
     GatedMLP,
@@ -74,6 +79,8 @@ class Qwen3TransformerBlock(nn.Module):
         cos: Tensor,
         sin: Tensor,
         mask: Tensor | None = None,
+        kv_cache: KVCache | None = None,
+        layer_idx: int = 0,
     ) -> Tensor:
         """Forward pass.
 
@@ -81,7 +88,9 @@ class Qwen3TransformerBlock(nn.Module):
             x: Input tensor ``[batch, seq_len, hidden_size]``.
             cos: RoPE cosine table ``[seq_len, head_dim]``.
             sin: RoPE sine table ``[seq_len, head_dim]``.
-            mask: Attention mask ``[1, 1, seq_len, seq_len]`` (additive, float).
+            mask: Attention mask (additive, float).
+            kv_cache: Optional KV cache (passed through to attention).
+            layer_idx: Layer index for cache indexing.
 
         Returns:
             Output tensor ``[batch, seq_len, hidden_size]``.
@@ -89,7 +98,7 @@ class Qwen3TransformerBlock(nn.Module):
         # Attention sub-layer with pre-norm.
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, cos, sin, mask)
+        x = self.self_attn(x, cos, sin, mask, kv_cache=kv_cache, layer_idx=layer_idx)
         x = residual + x
 
         # MLP sub-layer with pre-norm.
@@ -110,6 +119,7 @@ class Qwen3Model(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
+        self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
@@ -139,23 +149,38 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, kv_cache: KVCache | None = None) -> Tensor:
         """Forward pass.
 
         Args:
             input_ids: Token IDs, shape ``[batch, seq_len]``.
+            kv_cache: Optional KV cache for incremental decoding.
 
         Returns:
-            Logits, shape ``[batch, seq_len, vocab_size]``.
+            Logits, shape ``[batch, seq_len, vocab_size]``
+            (``[batch, 1, vocab_size]`` when using cache).
         """
         x = self.embed_tokens(input_ids)
         seq_len = x.shape[1]
-        cos = self.cos[:seq_len]
-        sin = self.sin[:seq_len]
-        mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
 
-        for layer in self.layers:
-            x = layer(x, cos, sin, mask)
+        if kv_cache is not None:
+            pos = kv_cache.seq_len
+            if seq_len > 1:
+                assert pos == 0, "Chunked prefill not supported in Phase 3"
+            cos = self.cos[pos : pos + seq_len]
+            sin = self.sin[pos : pos + seq_len]
+            mask = None if seq_len == 1 else causal_mask(seq_len, dtype=x.dtype, device=x.device)
+        else:
+            cos = self.cos[:seq_len]
+            sin = self.sin[:seq_len]
+            mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
+
+        for i, layer in enumerate(self.layers):
+            x = layer(x, cos, sin, mask, kv_cache=kv_cache, layer_idx=i)
+
+        if kv_cache is not None:
+            kv_cache.advance(seq_len)
+            x = x[:, -1:, :]
 
         x = self.norm(x)
         return self.lm_head(x)
