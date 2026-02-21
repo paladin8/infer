@@ -1,4 +1,4 @@
-"""Phase 2 generation benchmark: measure throughput and latency without KV cache.
+"""Generation benchmark: measure throughput and latency with optional KV cache.
 
 Usage (ad-hoc single run):
     uv run python benchmarks/bench_generation.py \
@@ -6,9 +6,8 @@ Usage (ad-hoc single run):
         --prompt-tokens 256 --max-new-tokens 256
 
 Usage (canonical suite):
-    uv run python benchmarks/bench_generation.py --suite quick
-    uv run python benchmarks/bench_generation.py --suite standard
     uv run python benchmarks/bench_generation.py --suite full
+    uv run python benchmarks/bench_generation.py --suite full --no-kv-cache
 """
 
 from __future__ import annotations
@@ -23,8 +22,10 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from infer.cache.simple import KVCache
 from infer.engine.generate import GenerationResult, generate
 from infer.engine.sampler import SamplingParams
+from infer.loader.config import ModelConfig
 from infer.loader.model_loader import load_model
 from infer.loader.tokenizer import Tokenizer
 
@@ -66,8 +67,8 @@ CANONICAL_CONFIGS: list[BenchmarkConfig] = [
     BenchmarkConfig("short-greedy", prompt_tokens=64, max_new_tokens=64),
     BenchmarkConfig("medium-greedy", prompt_tokens=256, max_new_tokens=256),
     BenchmarkConfig("prefill-heavy", prompt_tokens=1024, max_new_tokens=64),
-    BenchmarkConfig("decode-heavy", prompt_tokens=64, max_new_tokens=512),
-    BenchmarkConfig("long-context", prompt_tokens=1024, max_new_tokens=512),
+    BenchmarkConfig("decode-heavy", prompt_tokens=64, max_new_tokens=1024),
+    BenchmarkConfig("long-context", prompt_tokens=1024, max_new_tokens=1024),
     BenchmarkConfig(
         "medium-sampled",
         prompt_tokens=256,
@@ -166,6 +167,7 @@ class ConfigReport:
     step_p99_ms: float
     step_min_ms: float
     step_max_ms: float
+    cache_memory_mb: float
     end_gpu_memory_gb: float
     end_gpu_reserved_gb: float
     peak_gpu_memory_gb: float
@@ -180,11 +182,24 @@ def run_config(
     device: str,
     warmup_runs: int = 2,
     trials: int = 3,
+    use_kv_cache: bool = True,
+    model_config: ModelConfig | None = None,
 ) -> ConfigReport:
     """Run a single benchmark config and return computed metrics."""
     prompt_ids = make_synthetic_prompt(tokenizer, config.prompt_tokens)
     actual_prompt_tokens = len(prompt_ids)
     params = config.to_sampling_params()
+
+    # Compute KV cache memory (theoretical allocation size).
+    cache_memory_mb = 0.0
+    if use_kv_cache and model_config is not None:
+        dtype = next(model.parameters()).dtype
+        max_seq_len = actual_prompt_tokens + config.max_new_tokens
+        tmp_cache = KVCache.from_model_config(
+            model_config, max_seq_len=max_seq_len, dtype=dtype, device="cpu"
+        )
+        cache_memory_mb = tmp_cache.memory_bytes / 1e6
+        del tmp_cache
 
     # Release cached allocator blocks from previous configs.
     if device == "cuda":
@@ -192,7 +207,7 @@ def run_config(
 
     # Warmup.
     for _ in range(warmup_runs):
-        generate(model, tokenizer, prompt_ids, params, device=device)
+        generate(model, tokenizer, prompt_ids, params, device=device, use_kv_cache=use_kv_cache)
 
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -201,7 +216,7 @@ def run_config(
     # Timed trials.
     results: list[GenerationResult] = []
     for i in range(trials):
-        r = generate(model, tokenizer, prompt_ids, params, device=device)
+        r = generate(model, tokenizer, prompt_ids, params, device=device, use_kv_cache=use_kv_cache)
         results.append(r)
         line = (
             f"    Trial {i + 1}: {r.generated_tokens} tok, "
@@ -265,6 +280,7 @@ def run_config(
         step_p99_ms=percentile(all_step_ms, 99),
         step_min_ms=min(all_step_ms) if all_step_ms else 0.0,
         step_max_ms=max(all_step_ms) if all_step_ms else 0.0,
+        cache_memory_mb=cache_memory_mb,
         end_gpu_memory_gb=end_gpu_mem_gb,
         end_gpu_reserved_gb=end_gpu_reserved_gb,
         peak_gpu_memory_gb=peak_gpu_mem_gb,
@@ -289,12 +305,19 @@ def print_detailed_report(
     post_load_reserved_gb: float,
     config: BenchmarkConfig,
     trials: int,
+    use_kv_cache: bool = True,
 ) -> None:
     """Print the full detailed report for a single config run."""
+    cache_label = "enabled" if use_kv_cache else "disabled"
     print()
-    print("=== Phase 2 Generation Benchmark ===")
+    print("=== Generation Benchmark ===")
     print(f"Model:            {model_id}")
     print(f"Dtype:            {dtype_str}")
+    print(f"KV Cache:         {cache_label}", end="")
+    if use_kv_cache and report.cache_memory_mb > 0:
+        print(f" ({report.cache_memory_mb:.1f} MB)")
+    else:
+        print()
     print(f"Device:           {device}" + (f" ({gpu_name})" if gpu_name else ""))
     if cuda_version:
         print(f"CUDA version:     {cuda_version}")
@@ -362,32 +385,46 @@ def print_suite_summary(
     device: str,
     gpu_name: str,
     suite_name: str,
+    use_kv_cache: bool = True,
 ) -> None:
     """Print a compact comparison table across all configs in a suite."""
     print()
     device_label = f"{device} ({gpu_name})" if gpu_name else device
-    print(f"=== Suite '{suite_name}' Summary: {model_id} ({dtype_str}, {device_label}) ===")
+    cache_label = "KV cache" if use_kv_cache else "no cache"
+    print(
+        f"=== Suite '{suite_name}' Summary: {model_id} "
+        f"({dtype_str}, {cache_label}, {device_label}) ==="
+    )
     print()
 
     # Header.
-    header = (
+    cols = (
         f"{'Config':<24s}  {'Prompt':>6s}  {'Gen':>5s}  "
         f"{'TTFT(ms)':>8s}  {'Decode(t/s)':>11s}  {'E2E(t/s)':>9s}  "
-        f"{'Wall(s)':>8s}  {'PeakAlloc':>9s}  {'PeakResv':>9s}"
+        f"{'Wall(s)':>8s}  {'StepP50':>8s}  {'StepP95':>8s}"
     )
-    print(header)
-    print("-" * len(header))
+    if use_kv_cache:
+        cols += f"  {'Cache(MB)':>9s}"
+    cols += f"  {'PeakAlloc':>9s}"
+    print(cols)
+    print("-" * len(cols))
 
     for r in reports:
         peak_alloc_str = f"{r.peak_gpu_memory_gb:.1f} GB" if r.peak_gpu_memory_gb > 0 else "N/A"
-        peak_resv_str = f"{r.peak_gpu_reserved_gb:.1f} GB" if r.peak_gpu_reserved_gb > 0 else "N/A"
         decode_str = f"{r.decode_throughput_tps:.1f}" if r.decode_throughput_tps > 0 else "N/A"
-        print(
+        step_p50 = f"{r.step_p50_ms:.1f}" if r.step_p50_ms > 0 else "N/A"
+        step_p95 = f"{r.step_p95_ms:.1f}" if r.step_p95_ms > 0 else "N/A"
+        line = (
             f"{r.config_name:<24s}  {r.prompt_tokens:>6d}  {r.generated_tokens:>5d}  "
             f"{r.ttft_median_ms:>8.1f}  {decode_str:>11s}  "
             f"{r.e2e_throughput_tps:>9.1f}  {r.wall_time_median_s:>8.1f}  "
-            f"{peak_alloc_str:>9s}  {peak_resv_str:>9s}"
+            f"{step_p50:>8s}  {step_p95:>8s}"
         )
+        if use_kv_cache:
+            cache_str = f"{r.cache_memory_mb:.1f}" if r.cache_memory_mb > 0 else "N/A"
+            line += f"  {cache_str:>9s}"
+        line += f"  {peak_alloc_str:>9s}"
+        print(line)
 
     print()
 
@@ -403,6 +440,7 @@ class LoadedModel:
 
     model: nn.Module
     tokenizer: Tokenizer
+    config: ModelConfig
     device: str
     gpu_name: str
     cuda_version: str
@@ -422,7 +460,7 @@ def load_benchmark_model(model_id: str, dtype_str: str) -> LoadedModel:
 
     print(f"Loading model: {model_id} ({dtype_str}) ...")
     t0 = time.perf_counter()
-    model, _config = load_model(model_id, dtype=dtype, device=device)
+    model, config = load_model(model_id, dtype=dtype, device=device)
     tokenizer = Tokenizer(model_id)
     print(f"Model loaded in {time.perf_counter() - t0:.1f}s")
 
@@ -439,6 +477,7 @@ def load_benchmark_model(model_id: str, dtype_str: str) -> LoadedModel:
     return LoadedModel(
         model=model,
         tokenizer=tokenizer,
+        config=config,
         device=device,
         gpu_name=gpu_name,
         cuda_version=cuda_version,
@@ -460,10 +499,11 @@ def build_report_json(
     loaded: LoadedModel,
     config: BenchmarkConfig,
     trials: int,
+    use_kv_cache: bool = True,
 ) -> dict[str, object]:
     """Build a JSON-serializable report dict for a single config."""
     return {
-        "phase": 2,
+        "use_kv_cache": use_kv_cache,
         "config_name": config.name,
         "model": model_id,
         "dtype": dtype_str,
@@ -488,6 +528,7 @@ def build_report_json(
         "per_step_latency_min_ms": round(report.step_min_ms, 2),
         "per_step_latency_max_ms": round(report.step_max_ms, 2),
         "wall_time_median_s": round(report.wall_time_median_s, 3),
+        "cache_memory_mb": round(report.cache_memory_mb, 1),
         "post_load_gpu_gb": round(loaded.post_load_mem_gb, 2),
         "post_load_gpu_reserved_gb": round(loaded.post_load_reserved_gb, 2),
         "end_gpu_memory_gb": round(report.end_gpu_memory_gb, 2),
@@ -508,7 +549,7 @@ def build_report_json(
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Phase 2 generation benchmark",
+        description="Generation benchmark with optional KV cache",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "suite tiers:\n"
@@ -537,7 +578,12 @@ def main() -> None:
         action="store_true",
         help="Don't save JSON report to disk",
     )
-
+    parser.add_argument(
+        "--kv-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable KV cache (default: enabled)",
+    )
     # Suite mode.
     parser.add_argument(
         "--suite",
@@ -569,20 +615,22 @@ def main() -> None:
         _run_adhoc(args)
 
 
-def _run_suite(args: argparse.Namespace) -> None:
-    """Run a canonical suite of benchmark configs."""
-    suite_name: str = args.suite
-    config_names = SUITE_TIERS[suite_name]
-    configs = [_CONFIGS_BY_NAME[name] for name in config_names]
-
-    loaded = load_benchmark_model(args.model, args.dtype)
-
+def _run_suite_once(
+    args: argparse.Namespace,
+    loaded: LoadedModel,
+    configs: list[BenchmarkConfig],
+    *,
+    use_kv_cache: bool,
+    suite_name: str,
+) -> list[ConfigReport]:
+    """Run a suite of configs once with the given cache setting."""
+    cache_label = "KV cache" if use_kv_cache else "no cache"
     reports: list[ConfigReport] = []
     all_json: list[dict[str, object]] = []
 
     for i, config in enumerate(configs):
         print(
-            f"\n[{i + 1}/{len(configs)}] Running config: {config.name} "
+            f"\n[{i + 1}/{len(configs)}] Running config: {config.name} ({cache_label}) "
             f"(prompt={config.prompt_tokens}, gen={config.max_new_tokens}) ..."
         )
         report = run_config(
@@ -592,6 +640,8 @@ def _run_suite(args: argparse.Namespace) -> None:
             device=loaded.device,
             warmup_runs=args.warmup_runs,
             trials=args.trials,
+            use_kv_cache=use_kv_cache,
+            model_config=loaded.config,
         )
         reports.append(report)
         all_json.append(
@@ -602,6 +652,7 @@ def _run_suite(args: argparse.Namespace) -> None:
                 loaded=loaded,
                 config=config,
                 trials=args.trials,
+                use_kv_cache=use_kv_cache,
             )
         )
 
@@ -612,14 +663,16 @@ def _run_suite(args: argparse.Namespace) -> None:
         device=loaded.device,
         gpu_name=loaded.gpu_name,
         suite_name=suite_name,
+        use_kv_cache=use_kv_cache,
     )
 
     if not args.no_save:
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         model_slug = args.model.replace("/", "_")
-        report_path = REPORTS_DIR / f"phase2_{model_slug}_{args.dtype}_{suite_name}.json"
+        cache_tag = "kvcache" if use_kv_cache else "nocache"
+        report_path = REPORTS_DIR / f"{model_slug}_{args.dtype}_{suite_name}_{cache_tag}.json"
         suite_report: dict[str, object] = {
-            "phase": 2,
+            "use_kv_cache": use_kv_cache,
             "suite": suite_name,
             "model": args.model,
             "dtype": args.dtype,
@@ -638,10 +691,23 @@ def _run_suite(args: argparse.Namespace) -> None:
             json.dump(suite_report, f, indent=2)
         print(f"Report saved to {report_path}")
 
+    return reports
+
+
+def _run_suite(args: argparse.Namespace) -> None:
+    """Run a canonical suite of benchmark configs."""
+    suite_name: str = args.suite
+    config_names = SUITE_TIERS[suite_name]
+    configs = [_CONFIGS_BY_NAME[name] for name in config_names]
+
+    loaded = load_benchmark_model(args.model, args.dtype)
+    _run_suite_once(args, loaded, configs, use_kv_cache=args.kv_cache, suite_name=suite_name)
+
 
 def _run_adhoc(args: argparse.Namespace) -> None:
     """Run a single ad-hoc benchmark."""
     loaded = load_benchmark_model(args.model, args.dtype)
+    use_kv_cache: bool = args.kv_cache
 
     # Build config from CLI args.
     if args.prompt:
@@ -658,7 +724,8 @@ def _run_adhoc(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
 
-    print(f"\nRunning: prompt={config.prompt_tokens}, gen={config.max_new_tokens} ...")
+    cache_label = "KV cache" if use_kv_cache else "no cache"
+    print(f"\nRunning ({cache_label}): prompt={config.prompt_tokens}, gen={config.max_new_tokens}")
     report = run_config(
         loaded.model,
         loaded.tokenizer,
@@ -666,6 +733,8 @@ def _run_adhoc(args: argparse.Namespace) -> None:
         device=loaded.device,
         warmup_runs=args.warmup_runs,
         trials=args.trials,
+        use_kv_cache=use_kv_cache,
+        model_config=loaded.config,
     )
 
     print_detailed_report(
@@ -679,12 +748,14 @@ def _run_adhoc(args: argparse.Namespace) -> None:
         post_load_reserved_gb=loaded.post_load_reserved_gb,
         config=config,
         trials=args.trials,
+        use_kv_cache=use_kv_cache,
     )
 
     if not args.no_save:
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         model_slug = args.model.replace("/", "_")
-        report_path = REPORTS_DIR / f"phase2_{model_slug}_{args.dtype}.json"
+        cache_tag = "kvcache" if use_kv_cache else "nocache"
+        report_path = REPORTS_DIR / f"{model_slug}_{args.dtype}_{cache_tag}.json"
         report_json = build_report_json(
             report,
             model_id=args.model,
@@ -692,6 +763,7 @@ def _run_adhoc(args: argparse.Namespace) -> None:
             loaded=loaded,
             config=config,
             trials=args.trials,
+            use_kv_cache=use_kv_cache,
         )
         with open(report_path, "w") as f:
             json.dump(report_json, f, indent=2)
