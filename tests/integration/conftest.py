@@ -8,7 +8,7 @@ import torch
 
 @pytest.fixture()
 def device() -> str:
-    """Return 'cuda' if a CUDA GPU is available, otherwise 'cpu'."""
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+    """Return 'cuda' — Triton kernels require CUDA."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton kernel tests")
+    return "cuda"

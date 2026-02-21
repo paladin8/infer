@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from torch import Tensor, nn
 
+from infer.kernels.fused_norm_residual import triton_fused_residual_rms_norm
 from infer.loader.config import ModelConfig
 
 if TYPE_CHECKING:
@@ -96,11 +97,15 @@ class LlamaTransformerBlock(nn.Module):
         residual = x
         x = self.input_layernorm(x)
         x = self.self_attn(x, cos, sin, mask, kv_cache=kv_cache, layer_idx=layer_idx)
-        x = residual + x
 
-        # MLP sub-layer with pre-norm.
-        residual = x
-        x = self.post_attention_layernorm(x)
+        # MLP sub-layer with fused residual add + pre-norm.
+        residual, x = triton_fused_residual_rms_norm(
+            residual,
+            x,
+            self.post_attention_layernorm.weight,
+            eps=self.post_attention_layernorm.eps,
+        )
+
         x = self.mlp(x)
         x = residual + x
 

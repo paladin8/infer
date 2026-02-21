@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor, nn
 
+from infer.kernels.fused_norm_residual import triton_fused_residual_rms_norm
+from infer.kernels.rms_norm import triton_rms_norm
 from infer.loader.config import ModelConfig
 
 if TYPE_CHECKING:
@@ -64,14 +66,7 @@ class Gemma3RMSNorm(RMSNorm):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        # Unlike standard RMSNorm which casts back to input_dtype before the
-        # weight multiply, HF's Gemma3RMSNorm multiplies in float32 then casts:
-        #   HF Llama/Qwen3: self.weight * normed.to(input_dtype)  (bf16 * bf16)
-        #   HF Gemma3:      (1 + self.weight.float()) * normed    (f32 * f32)
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return ((1.0 + self.weight.float()) * normed).to(input_dtype)
+        return triton_rms_norm(x, self.weight, eps=self.eps, gemma_style=True)
 
 
 class Gemma3TransformerBlock(nn.Module):
@@ -157,11 +152,16 @@ class Gemma3TransformerBlock(nn.Module):
         x = self.input_layernorm(x)
         x = self.self_attn(x, cos, sin, mask, kv_cache=kv_cache, layer_idx=layer_idx)
         x = self.post_attention_layernorm(x)
-        x = residual + x
 
-        # MLP sub-layer with sandwich norm.
-        residual = x
-        x = self.pre_feedforward_layernorm(x)
+        # MLP sub-layer: fuse residual add + pre-feedforward norm.
+        residual, x = triton_fused_residual_rms_norm(
+            residual,
+            x,
+            self.pre_feedforward_layernorm.weight,
+            eps=self.pre_feedforward_layernorm.eps,
+            gemma_style=True,
+        )
+
         x = self.mlp(x)
         x = self.post_feedforward_layernorm(x)
         x = residual + x

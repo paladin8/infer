@@ -15,6 +15,7 @@ dependencies = [
     "sse-starlette>=3.2",
     "orjson>=3.11",
     "jinja2>=3.1",
+    "triton>=3.6,<4; platform_system == 'Linux'",
 ]
 
 [dependency-groups]
@@ -30,9 +31,6 @@ dev = [
 bench = [
     "httpx>=0.28",
     "tabulate>=0.9",
-]
-kernels = [
-    "triton>=3.6,<4; platform_system == 'Linux'",
 ]
 
 [build-system]

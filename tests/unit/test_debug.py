@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import Tensor, nn
 
 from infer.debug import ModelDiff, compare_models, format_diff
 from infer.loader.config import ModelConfig
 from infer.models.llama import LlamaModel
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required for Triton kernel tests", allow_module_level=True)
+
+DEVICE = "cuda"
 
 
 def _make_small_config() -> ModelConfig:
@@ -51,12 +57,12 @@ class TestCompareModels:
     def test_smoke_returns_model_diff(self) -> None:
         """compare_models returns a ModelDiff with the right number of layer diffs."""
         config = _make_small_config()
-        our_model = LlamaModel(config)
-        ref_model = _FakeHFModel(config)
+        our_model = LlamaModel(config).to(DEVICE)
+        ref_model = _FakeHFModel(config).to(DEVICE)
         our_model.eval()
         ref_model.eval()
 
-        input_ids = torch.randint(0, 50, (1, 8))
+        input_ids = torch.randint(0, 50, (1, 8), device=DEVICE)
         diff = compare_models(our_model, ref_model, input_ids)
 
         assert isinstance(diff, ModelDiff)
@@ -68,8 +74,8 @@ class TestCompareModels:
     def test_identical_models_zero_error(self) -> None:
         """Two models with identical weights should have zero error."""
         config = _make_small_config()
-        our_model = LlamaModel(config)
-        ref_model = _FakeHFModel(config)
+        our_model = LlamaModel(config).to(DEVICE)
+        ref_model = _FakeHFModel(config).to(DEVICE)
 
         # Copy our weights into the ref model so they are identical.
         ref_model.model.load_state_dict(our_model.state_dict())
@@ -77,7 +83,7 @@ class TestCompareModels:
         ref_model.eval()
 
         torch.manual_seed(42)
-        input_ids = torch.randint(0, 50, (1, 8))
+        input_ids = torch.randint(0, 50, (1, 8), device=DEVICE)
         diff = compare_models(our_model, ref_model, input_ids)
 
         assert diff.embedding_diff.max_abs_error == 0.0
@@ -91,13 +97,13 @@ class TestFormatDiff:
     def test_produces_table(self) -> None:
         """format_diff returns a string with the expected table structure."""
         config = _make_small_config()
-        our_model = LlamaModel(config)
-        ref_model = _FakeHFModel(config)
+        our_model = LlamaModel(config).to(DEVICE)
+        ref_model = _FakeHFModel(config).to(DEVICE)
         ref_model.model.load_state_dict(our_model.state_dict())
         our_model.eval()
         ref_model.eval()
 
-        input_ids = torch.randint(0, 50, (1, 8))
+        input_ids = torch.randint(0, 50, (1, 8), device=DEVICE)
         diff = compare_models(our_model, ref_model, input_ids)
         table = format_diff(diff)
 

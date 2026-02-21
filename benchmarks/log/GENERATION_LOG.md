@@ -118,3 +118,84 @@ Per-step decode latency is now approximately constant across sequence lengths, c
 - Step latency is near-constant across all configs (short vs long), confirming KV cache works correctly — no O(n) per-step growth.
 - Sampling transforms (top-k, top-p, repetition penalty) add negligible overhead.
 - Long-context (1024+1024) cache sizes: Llama 67 MB, Qwen3 235 MB, Gemma3 55 MB — all fit comfortably alongside model weights.
+
+---
+
+## 2026-02-21 — Triton fused kernels (Phase 3.1)
+
+Fused Triton kernels for RMSNorm, RoPE, residual+RMSNorm, and SwiGLU/GeGLU activation. Also replaced `repeat_interleave` with zero-copy `expand` for GQA head expansion.
+
+Kernels: `src/infer/kernels/{rms_norm,rope,fused_norm_residual,activation}.py`.
+Triton kernels are always used (required dependency, no fallback paths).
+
+### E2E throughput (tok/s)
+
+| Config    | Llama | Qwen3 | Gemma3 |
+|-----------|------:|------:|-------:|
+| short     | 215.1 | 133.2 |  120.0 |
+| medium    | 213.1 | 133.8 |  121.4 |
+| prefill   | 194.2 | 120.5 |  118.9 |
+| decode    | 214.9 | 134.1 |  128.5 |
+| long      | 208.1 | 131.7 |  116.1 |
+| sampled   | 214.4 | 133.9 |  127.0 |
+| full-pipe | 214.2 | 135.3 |  126.0 |
+
+### Decode throughput (tok/s)
+
+| Config    | Llama | Qwen3 | Gemma3 |
+|-----------|------:|------:|-------:|
+| short     | 219.0 | 135.5 |  122.2 |
+| medium    | 214.8 | 134.9 |  122.3 |
+| prefill   | 213.4 | 132.3 |  124.1 |
+| decode    | 215.1 | 134.2 |  130.9 |
+| long      | 209.3 | 132.5 |  116.4 |
+| sampled   | 216.0 | 135.0 |  127.7 |
+| full-pipe | 216.3 | 136.4 |  127.6 |
+
+### Per-step decode latency (ms)
+
+| Config    | Llama P50 | Llama P95 | Qwen3 P50 | Qwen3 P95 | Gemma3 P50 | Gemma3 P95 |
+|-----------|----------:|----------:|----------:|----------:|-----------:|-----------:|
+| short     |       4.6 |       5.6 |       7.4 |       8.7 |        8.2 |        9.8 |
+| medium    |       4.6 |       5.2 |       7.3 |       8.4 |        8.0 |        9.3 |
+| prefill   |       4.7 |       5.2 |       7.5 |       8.6 |        8.0 |        9.3 |
+| decode    |       4.6 |       5.1 |       7.3 |       8.3 |        7.6 |        8.6 |
+| long      |       4.7 |       5.2 |       7.5 |       8.3 |        8.6 |        9.5 |
+| sampled   |       4.6 |       5.0 |       7.3 |       8.1 |        7.8 |        8.9 |
+| full-pipe |       4.6 |       5.1 |       7.3 |       8.0 |        7.8 |        8.9 |
+
+### TTFT / prefill (ms)
+
+| Config    | Llama | Qwen3 | Gemma3 |
+|-----------|------:|------:|-------:|
+| short     |   5.4 |   8.6 |    8.8 |
+| medium    |   8.5 |  14.8 |    9.4 |
+| prefill   |  29.6 |  47.1 |   22.8 |
+| long      |  28.8 |  45.8 |   22.8 |
+
+### KV cache memory (MB) and peak GPU allocation (GB)
+
+| Config    | Llama cache | Llama peak | Qwen3 cache | Qwen3 peak | Gemma3 cache | Gemma3 peak |
+|-----------|------------:|-----------:|------------:|-----------:|-------------:|------------:|
+| short     |         4.2 |        2.8 |        14.7 |        3.8 |          3.4 |         2.6 |
+| medium    |        16.8 |        2.9 |        58.7 |        3.9 |         13.6 |         2.6 |
+| prefill   |        35.7 |        2.9 |       124.8 |        4.0 |         29.0 |         2.6 |
+| decode    |        35.7 |        2.9 |       124.8 |        3.9 |         29.0 |         2.6 |
+| long      |        67.1 |        3.0 |       234.9 |        4.1 |         54.5 |         2.6 |
+
+### Speedup vs Phase 3 (KV cache baseline)
+
+| Model   | Phase 3 decode | Phase 3.1 decode | Speedup | Step latency reduction |
+|---------|---------------:|-----------------:|--------:|-----------------------:|
+| Llama   |     148 tok/s  |       215 tok/s  |   1.45x |   6.8ms → 4.6ms (32%)  |
+| Qwen3   |      74 tok/s  |       135 tok/s  |   1.82x |  13.4ms → 7.3ms (46%)  |
+| Gemma3  |      60 tok/s  |       122 tok/s  |   2.03x |  16.5ms → 8.0ms (52%)  |
+
+### Notes
+
+- **Llama 3.2 1B**: 45% faster (148→215 tok/s). Already memory-bandwidth-bound at 6.8ms/step, so gains come primarily from reducing kernel launch overhead and intermediate memory traffic.
+- **Qwen3 1.7B**: 82% faster (74→135 tok/s). Biggest absolute gain from fused kernels — 28 layers means 28× the savings from fused residual+norm and fused activation per step.
+- **Gemma3 1B**: 103% faster (60→122 tok/s). Largest relative gain. The 26-layer sliding-window architecture had the most kernel launch overhead to eliminate. GQA expand (replacing `repeat_interleave` with zero-copy `expand`) also helps since Gemma3 has only 1 KV head (4× expansion).
+- **TTFT improved** across all models (Gemma3 prefill: 35ms→23ms, Llama: 31ms→29ms) from fused kernels reducing overhead during the prefill forward pass.
+- **Memory unchanged** — fused kernels reduce intermediate tensor allocations but cache sizes and peak allocation stay the same since model weights dominate.
+- Kernels: fused RMSNorm (standard + Gemma style), fused RoPE (single kernel for Q+K with separate input/output strides), fused residual+RMSNorm, fused SwiGLU/GeGLU activation.

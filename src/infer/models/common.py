@@ -9,6 +9,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from infer.kernels.activation import triton_fused_gated_activation
+from infer.kernels.rms_norm import triton_rms_norm
+from infer.kernels.rope import triton_apply_rope
+
 if TYPE_CHECKING:
     from infer.cache.simple import KVCache
 
@@ -31,12 +35,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        # Upcast to float32 for numerical stability with bfloat16/float16 inputs.
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        # Cast normed back before weight multiply to match HF rounding convention.
-        return self.weight.to(input_dtype) * normed.to(input_dtype)
+        return triton_rms_norm(x, self.weight, eps=self.eps, gemma_style=False)
 
 
 # ---------------------------------------------------------------------------
@@ -134,13 +133,6 @@ def build_rope_cos_sin(
     return emb.cos(), emb.sin()
 
 
-def _rotate_half(x: Tensor) -> Tensor:
-    """Swap and negate halves: [a, b] -> [-b, a]."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def apply_rope(
     q: Tensor,
     k: Tensor,
@@ -158,12 +150,7 @@ def apply_rope(
     Returns:
         ``(q_rotated, k_rotated)`` with the same shapes as the inputs.
     """
-    # Broadcast cos/sin over batch and head dimensions.
-    cos = cos[None, None, :, :]  # [1, 1, seq_len, head_dim]
-    sin = sin[None, None, :, :]
-    q_rotated = q * cos + _rotate_half(q) * sin
-    k_rotated = k * cos + _rotate_half(k) * sin
-    return q_rotated.to(q.dtype), k_rotated.to(k.dtype)
+    return triton_apply_rope(q, k, cos, sin)
 
 
 # ---------------------------------------------------------------------------
@@ -269,11 +256,22 @@ class Attention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(layer_idx, k, v)
 
-        # GQA: expand K/V heads to match Q heads.
+        # GQA: expand K/V heads to match Q heads (zero-copy broadcast).
         if self.num_kv_heads < self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
+            bsz, _, seq, hd = k.shape
+            k = (
+                k[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, n_rep, seq, hd)
+                .reshape(bsz, -1, seq, hd)
+                .contiguous()
+            )
+            v = (
+                v[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, n_rep, seq, hd)
+                .reshape(bsz, -1, seq, hd)
+                .contiguous()
+            )
 
         # Scaled dot-product attention.
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
@@ -287,10 +285,7 @@ class Attention(nn.Module):
 # Gated MLP
 # ---------------------------------------------------------------------------
 
-_ACTIVATIONS: dict[str, nn.Module] = {
-    "silu": nn.SiLU(),
-    "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
-}
+_VALID_ACTIVATIONS = {"silu", "gelu_pytorch_tanh"}
 
 
 class GatedMLP(nn.Module):
@@ -317,12 +312,17 @@ class GatedMLP(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
-        if act_fn not in _ACTIVATIONS:
-            raise ValueError(f"Unknown activation: {act_fn!r}. Choose from {sorted(_ACTIVATIONS)}")
-        self.act_fn = _ACTIVATIONS[act_fn]
+        if act_fn not in _VALID_ACTIVATIONS:
+            raise ValueError(
+                f"Unknown activation: {act_fn!r}. Choose from {sorted(_VALID_ACTIVATIONS)}"
+            )
+        self._use_gelu = act_fn == "gelu_pytorch_tanh"
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        activated = triton_fused_gated_activation(gate, up, use_gelu=self._use_gelu)
+        return self.down_proj(activated)
 
 
 # ---------------------------------------------------------------------------

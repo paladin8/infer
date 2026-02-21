@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from infer.cache.simple import KVCache
@@ -17,16 +18,22 @@ from infer.models.common import (
     sliding_window_causal_mask,
 )
 
+_CUDA_AVAILABLE = torch.cuda.is_available()
+_DEVICE = "cuda" if _CUDA_AVAILABLE else "cpu"
 
+_requires_cuda = pytest.mark.skipif(not _CUDA_AVAILABLE, reason="CUDA required for Triton kernels")
+
+
+@_requires_cuda
 class TestRMSNorm:
     """Test RMSNorm matches the expected formula."""
 
     def test_output_matches_formula(self) -> None:
         dim = 16
-        norm = RMSNorm(dim, eps=1e-6)
+        norm = RMSNorm(dim, eps=1e-6).to(_DEVICE)
         # Use a non-trivial weight so we're not just multiplying by 1.
-        norm.weight = torch.nn.Parameter(torch.randn(dim))
-        x = torch.randn(2, 4, dim)
+        norm.weight = torch.nn.Parameter(torch.randn(dim, device=_DEVICE))
+        x = torch.randn(2, 4, dim, device=_DEVICE)
 
         result = norm(x)
         # Reference computation in float32 (matches the upcast inside RMSNorm).
@@ -37,21 +44,21 @@ class TestRMSNorm:
 
     def test_output_shape(self) -> None:
         dim = 32
-        norm = RMSNorm(dim)
-        x = torch.randn(2, 8, dim)
+        norm = RMSNorm(dim).to(_DEVICE)
+        x = torch.randn(2, 8, dim, device=_DEVICE)
         assert norm(x).shape == x.shape
 
     def test_output_dtype(self) -> None:
         dim = 16
-        norm = RMSNorm(dim)
-        x = torch.randn(2, 4, dim)
+        norm = RMSNorm(dim).to(_DEVICE)
+        x = torch.randn(2, 4, dim, device=_DEVICE)
         assert norm(x).dtype == x.dtype
 
     def test_unit_weight_is_identity_scale(self) -> None:
         """With weight=ones, output should equal normalized x."""
         dim = 8
-        norm = RMSNorm(dim, eps=1e-6)
-        x = torch.randn(3, dim)
+        norm = RMSNorm(dim, eps=1e-6).to(_DEVICE)
+        x = torch.randn(3, dim, device=_DEVICE)
 
         result = norm(x)
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
@@ -61,9 +68,9 @@ class TestRMSNorm:
     def test_different_eps(self) -> None:
         """Different eps values produce different outputs for near-zero input."""
         dim = 4
-        norm_small = RMSNorm(dim, eps=1e-10)
-        norm_large = RMSNorm(dim, eps=1.0)
-        x = torch.full((1, dim), 1e-6)
+        norm_small = RMSNorm(dim, eps=1e-10).to(_DEVICE)
+        norm_large = RMSNorm(dim, eps=1.0).to(_DEVICE)
+        x = torch.full((1, dim), 1e-6, device=_DEVICE)
         out_small = norm_small(x)
         out_large = norm_large(x)
         assert not torch.allclose(out_small, out_large)
@@ -71,8 +78,8 @@ class TestRMSNorm:
     def test_bfloat16_matches_float32(self) -> None:
         """bfloat16 input should produce results close to a float32 reference."""
         dim = 64
-        norm = RMSNorm(dim, eps=1e-6)
-        x_f32 = torch.randn(2, 4, dim)
+        norm = RMSNorm(dim, eps=1e-6).to(_DEVICE)
+        x_f32 = torch.randn(2, 4, dim, device=_DEVICE)
         x_bf16 = x_f32.to(torch.bfloat16)
         ref = norm(x_f32)
         out = norm(x_bf16)
@@ -209,20 +216,20 @@ class TestBuildRopeCosSin:
         torch.testing.assert_close(sin_none, sin_default)
 
     def test_unknown_rope_type_raises(self) -> None:
-        import pytest
-
         with pytest.raises(ValueError, match="Unknown rope_type"):
             build_rope_cos_sin(64, 128, rope_scaling={"rope_type": "unknown"})
 
 
+@_requires_cuda
 class TestApplyRope:
     """Test RoPE rotation application."""
 
     def test_output_shapes(self) -> None:
         batch, heads, kv_heads, seq_len, head_dim = 2, 4, 2, 8, 16
-        q = torch.randn(batch, heads, seq_len, head_dim)
-        k = torch.randn(batch, kv_heads, seq_len, head_dim)
+        q = torch.randn(batch, heads, seq_len, head_dim, device=_DEVICE)
+        k = torch.randn(batch, kv_heads, seq_len, head_dim, device=_DEVICE)
         cos, sin = build_rope_cos_sin(head_dim, seq_len)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
         q_rot, k_rot = apply_rope(q, k, cos, sin)
         assert q_rot.shape == q.shape
         assert k_rot.shape == k.shape
@@ -230,9 +237,10 @@ class TestApplyRope:
     def test_position_zero_is_identity(self) -> None:
         """At position 0, angles are all 0, so rotation should be identity."""
         head_dim = 8
-        q = torch.randn(1, 1, 1, head_dim)
-        k = torch.randn(1, 1, 1, head_dim)
+        q = torch.randn(1, 1, 1, head_dim, device=_DEVICE)
+        k = torch.randn(1, 1, 1, head_dim, device=_DEVICE)
         cos, sin = build_rope_cos_sin(head_dim, 1)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
         q_rot, k_rot = apply_rope(q, k, cos, sin)
         torch.testing.assert_close(q_rot, q)
         torch.testing.assert_close(k_rot, k)
@@ -248,10 +256,12 @@ class TestApplyRope:
         sin_p = sin[pos]
 
         # Input: q = [a, b, c, d] at position 1.
-        q = torch.tensor([[[[1.0, 2.0, 3.0, 4.0]]]])  # [1, 1, 1, 4]
-        k = torch.tensor([[[[5.0, 6.0, 7.0, 8.0]]]])
+        q = torch.tensor([[[[1.0, 2.0, 3.0, 4.0]]]], device=_DEVICE)  # [1, 1, 1, 4]
+        k = torch.tensor([[[[5.0, 6.0, 7.0, 8.0]]]], device=_DEVICE)
 
-        q_rot, _k_rot = apply_rope(q, k, cos_p.unsqueeze(0), sin_p.unsqueeze(0))
+        q_rot, _k_rot = apply_rope(
+            q, k, cos_p.unsqueeze(0).to(_DEVICE), sin_p.unsqueeze(0).to(_DEVICE)
+        )
 
         # Manual: rotate_half([a,b,c,d]) = [-c,-d,a,b]
         # rotated = [a,b,c,d]*cos + [-c,-d,a,b]*sin
@@ -262,16 +272,17 @@ class TestApplyRope:
 
         q_flat = q.squeeze()
         q_half = torch.cat([-q_flat[2:], q_flat[:2]])
-        expected_q = q_flat * c + q_half * s
+        expected_q = q_flat * c.to(_DEVICE) + q_half * s.to(_DEVICE)
 
         torch.testing.assert_close(q_rot.squeeze(), expected_q)
 
     def test_different_positions_differ(self) -> None:
         """Different positions should produce different rotations."""
         head_dim = 16
-        q = torch.randn(1, 1, 4, head_dim)
-        k = torch.randn(1, 1, 4, head_dim)
+        q = torch.randn(1, 1, 4, head_dim, device=_DEVICE)
+        k = torch.randn(1, 1, 4, head_dim, device=_DEVICE)
         cos, sin = build_rope_cos_sin(head_dim, 4)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
         q_rot, _ = apply_rope(q, k, cos, sin)
         # Positions 0 and 1 should differ (unless input happens to be zero).
         assert not torch.allclose(q_rot[0, 0, 0], q_rot[0, 0, 1])
@@ -279,9 +290,10 @@ class TestApplyRope:
     def test_rotation_preserves_norm(self) -> None:
         """RoPE rotation should preserve vector norms."""
         head_dim = 32
-        q = torch.randn(2, 4, 8, head_dim)
-        k = torch.randn(2, 2, 8, head_dim)
+        q = torch.randn(2, 4, 8, head_dim, device=_DEVICE)
+        k = torch.randn(2, 2, 8, head_dim, device=_DEVICE)
         cos, sin = build_rope_cos_sin(head_dim, 8)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
         q_rot, k_rot = apply_rope(q, k, cos, sin)
         torch.testing.assert_close(q_rot.norm(dim=-1), q.norm(dim=-1), atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(k_rot.norm(dim=-1), k.norm(dim=-1), atol=1e-5, rtol=1e-5)
@@ -289,14 +301,16 @@ class TestApplyRope:
     def test_preserves_dtype(self) -> None:
         """Output dtype should match input dtype even when cos/sin are float32."""
         head_dim = 16
-        q = torch.randn(1, 1, 4, head_dim, dtype=torch.bfloat16)
-        k = torch.randn(1, 1, 4, head_dim, dtype=torch.bfloat16)
+        q = torch.randn(1, 1, 4, head_dim, dtype=torch.bfloat16, device=_DEVICE)
+        k = torch.randn(1, 1, 4, head_dim, dtype=torch.bfloat16, device=_DEVICE)
         cos, sin = build_rope_cos_sin(head_dim, 4)  # float32
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
         q_rot, k_rot = apply_rope(q, k, cos, sin)
         assert q_rot.dtype == torch.bfloat16
         assert k_rot.dtype == torch.bfloat16
 
 
+@_requires_cuda
 class TestAttention:
     """Test the multi-head attention module."""
 
@@ -314,13 +328,14 @@ class TestAttention:
             "head_dim": self.HEAD_DIM,
         }
         kwargs.update(overrides)
-        return Attention(**kwargs)  # type: ignore[arg-type]
+        return Attention(**kwargs).to(_DEVICE)  # type: ignore[arg-type]
 
     def _forward(
         self, attn: Attention, batch: int = 1, seq_len: int = 4, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        x = torch.randn(batch, seq_len, self.HIDDEN)
+        x = torch.randn(batch, seq_len, self.HIDDEN, device=_DEVICE)
         cos, sin = build_rope_cos_sin(attn.head_dim, seq_len)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
         return attn(x, cos, sin, mask=mask)
 
     def test_output_shape(self) -> None:
@@ -374,9 +389,7 @@ class TestAttention:
 
     def test_with_causal_mask(self) -> None:
         seq_len = 6
-        # Additive causal mask: 0.0 = attend, -inf = mask.
-        mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)
-        mask = mask[None, None, :, :]  # [1, 1, seq_len, seq_len]
+        mask = causal_mask(seq_len, device=_DEVICE)
         attn = self._make_attn()
         out = self._forward(attn, seq_len=seq_len, mask=mask)
         assert out.shape == (1, seq_len, self.HIDDEN)
@@ -389,9 +402,10 @@ class TestAttention:
             num_heads=4,
             num_kv_heads=2,
             head_dim=32,  # != 64 // 4 = 16
-        )
-        x = torch.randn(1, 4, 64)
+        ).to(_DEVICE)
+        x = torch.randn(1, 4, 64, device=_DEVICE)
         cos, sin = build_rope_cos_sin(32, 4)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
         out = attn(x, cos, sin)
         assert out.shape == (1, 4, 64)
 
@@ -405,10 +419,13 @@ class TestAttention:
         assert attn.o_proj.out_features == self.HIDDEN
 
     def test_indivisible_heads_raises(self) -> None:
-        import pytest
-
         with pytest.raises(ValueError, match="divisible"):
-            self._make_attn(num_heads=4, num_kv_heads=3)
+            Attention(
+                hidden_size=self.HIDDEN,
+                num_heads=4,
+                num_kv_heads=3,
+                head_dim=self.HEAD_DIM,
+            )
 
     # --- KV cache tests ---
 
@@ -422,11 +439,12 @@ class TestAttention:
             head_dim=self.HEAD_DIM,
             max_seq_len=seq_len + 10,
             dtype=torch.float32,
-            device="cpu",
+            device=_DEVICE,
         )
-        x = torch.randn(1, seq_len, self.HIDDEN)
+        x = torch.randn(1, seq_len, self.HIDDEN, device=_DEVICE)
         cos, sin = build_rope_cos_sin(self.HEAD_DIM, seq_len)
-        mask = causal_mask(seq_len)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
+        mask = causal_mask(seq_len, device=_DEVICE)
         out = attn(x, cos, sin, mask=mask, kv_cache=cache, layer_idx=0)
         assert out.shape == (1, seq_len, self.HIDDEN)
 
@@ -440,20 +458,21 @@ class TestAttention:
             head_dim=self.HEAD_DIM,
             max_seq_len=prompt_len + 5,
             dtype=torch.float32,
-            device="cpu",
+            device=_DEVICE,
         )
         # Prefill
-        x = torch.randn(1, prompt_len, self.HIDDEN)
+        x = torch.randn(1, prompt_len, self.HIDDEN, device=_DEVICE)
         cos, sin = build_rope_cos_sin(self.HEAD_DIM, prompt_len)
-        mask = causal_mask(prompt_len)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
+        mask = causal_mask(prompt_len, device=_DEVICE)
         attn(x, cos, sin, mask=mask, kv_cache=cache, layer_idx=0)
         cache.advance(prompt_len)
 
         # Decode one token
-        x_decode = torch.randn(1, 1, self.HIDDEN)
+        x_decode = torch.randn(1, 1, self.HIDDEN, device=_DEVICE)
         cos_d, sin_d = build_rope_cos_sin(self.HEAD_DIM, prompt_len + 1)
-        cos_d = cos_d[prompt_len : prompt_len + 1]
-        sin_d = sin_d[prompt_len : prompt_len + 1]
+        cos_d = cos_d[prompt_len : prompt_len + 1].to(_DEVICE)
+        sin_d = sin_d[prompt_len : prompt_len + 1].to(_DEVICE)
         out = attn(x_decode, cos_d, sin_d, mask=None, kv_cache=cache, layer_idx=0)
         assert out.shape == (1, 1, self.HIDDEN)
 
@@ -462,9 +481,10 @@ class TestAttention:
         attn = self._make_attn()
         torch.manual_seed(42)
         seq_len = 5
-        x_all = torch.randn(1, seq_len, self.HIDDEN)
+        x_all = torch.randn(1, seq_len, self.HIDDEN, device=_DEVICE)
         cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, seq_len)
-        mask_all = causal_mask(seq_len)
+        cos_all, sin_all = cos_all.to(_DEVICE), sin_all.to(_DEVICE)
+        mask_all = causal_mask(seq_len, device=_DEVICE)
 
         # Full forward without cache.
         out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
@@ -476,10 +496,10 @@ class TestAttention:
             head_dim=self.HEAD_DIM,
             max_seq_len=seq_len,
             dtype=torch.float32,
-            device="cpu",
+            device=_DEVICE,
         )
         prefill_len = seq_len - 1
-        mask_prefill = causal_mask(prefill_len)
+        mask_prefill = causal_mask(prefill_len, device=_DEVICE)
         attn(
             x_all[:, :prefill_len, :],
             cos_all[:prefill_len],
@@ -509,9 +529,10 @@ class TestAttention:
         """Passing kv_cache=None behaves identically to the original forward."""
         attn = self._make_attn()
         torch.manual_seed(0)
-        x = torch.randn(1, 4, self.HIDDEN)
+        x = torch.randn(1, 4, self.HIDDEN, device=_DEVICE)
         cos, sin = build_rope_cos_sin(self.HEAD_DIM, 4)
-        mask = causal_mask(4)
+        cos, sin = cos.to(_DEVICE), sin.to(_DEVICE)
+        mask = causal_mask(4, device=_DEVICE)
 
         out1 = attn(x, cos, sin, mask=mask)
         out2 = attn(x, cos, sin, mask=mask, kv_cache=None, layer_idx=0)
@@ -522,9 +543,10 @@ class TestAttention:
         attn = self._make_attn(qk_norm=True)
         torch.manual_seed(99)
         seq_len = 5
-        x_all = torch.randn(1, seq_len, self.HIDDEN)
+        x_all = torch.randn(1, seq_len, self.HIDDEN, device=_DEVICE)
         cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, seq_len)
-        mask_all = causal_mask(seq_len)
+        cos_all, sin_all = cos_all.to(_DEVICE), sin_all.to(_DEVICE)
+        mask_all = causal_mask(seq_len, device=_DEVICE)
 
         # Full forward without cache.
         out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
@@ -536,14 +558,14 @@ class TestAttention:
             head_dim=self.HEAD_DIM,
             max_seq_len=seq_len,
             dtype=torch.float32,
-            device="cpu",
+            device=_DEVICE,
         )
         prefill_len = seq_len - 1
         attn(
             x_all[:, :prefill_len, :],
             cos_all[:prefill_len],
             sin_all[:prefill_len],
-            mask=causal_mask(prefill_len),
+            mask=causal_mask(prefill_len, device=_DEVICE),
             kv_cache=cache,
             layer_idx=0,
         )
@@ -568,9 +590,10 @@ class TestAttention:
         torch.manual_seed(7)
         total_len = 6
         prefill_len = 3
-        x_all = torch.randn(1, total_len, self.HIDDEN)
+        x_all = torch.randn(1, total_len, self.HIDDEN, device=_DEVICE)
         cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, total_len)
-        mask_all = causal_mask(total_len)
+        cos_all, sin_all = cos_all.to(_DEVICE), sin_all.to(_DEVICE)
+        mask_all = causal_mask(total_len, device=_DEVICE)
 
         # Full forward without cache.
         out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
@@ -582,13 +605,13 @@ class TestAttention:
             head_dim=self.HEAD_DIM,
             max_seq_len=total_len,
             dtype=torch.float32,
-            device="cpu",
+            device=_DEVICE,
         )
         attn(
             x_all[:, :prefill_len, :],
             cos_all[:prefill_len],
             sin_all[:prefill_len],
-            mask=causal_mask(prefill_len),
+            mask=causal_mask(prefill_len, device=_DEVICE),
             kv_cache=cache,
             layer_idx=0,
         )
@@ -615,9 +638,10 @@ class TestAttention:
         attn = self._make_attn(num_kv_heads=self.NUM_HEADS)
         torch.manual_seed(13)
         seq_len = 5
-        x_all = torch.randn(1, seq_len, self.HIDDEN)
+        x_all = torch.randn(1, seq_len, self.HIDDEN, device=_DEVICE)
         cos_all, sin_all = build_rope_cos_sin(self.HEAD_DIM, seq_len)
-        mask_all = causal_mask(seq_len)
+        cos_all, sin_all = cos_all.to(_DEVICE), sin_all.to(_DEVICE)
+        mask_all = causal_mask(seq_len, device=_DEVICE)
 
         out_no_cache = attn(x_all, cos_all, sin_all, mask=mask_all)
 
@@ -627,14 +651,14 @@ class TestAttention:
             head_dim=self.HEAD_DIM,
             max_seq_len=seq_len,
             dtype=torch.float32,
-            device="cpu",
+            device=_DEVICE,
         )
         prefill_len = seq_len - 1
         attn(
             x_all[:, :prefill_len, :],
             cos_all[:prefill_len],
             sin_all[:prefill_len],
-            mask=causal_mask(prefill_len),
+            mask=causal_mask(prefill_len, device=_DEVICE),
             kv_cache=cache,
             layer_idx=0,
         )
@@ -654,6 +678,7 @@ class TestAttention:
         )
 
 
+@_requires_cuda
 class TestGatedMLP:
     """Test the gated MLP module."""
 
@@ -661,33 +686,34 @@ class TestGatedMLP:
     INTERMEDIATE = 64
 
     def test_output_shape(self) -> None:
-        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE)
-        x = torch.randn(2, 8, self.HIDDEN)
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE).to(_DEVICE)
+        x = torch.randn(2, 8, self.HIDDEN, device=_DEVICE)
         assert mlp(x).shape == x.shape
 
     def test_silu_matches_manual(self) -> None:
         """Verify output matches down(silu(gate(x)) * up(x))."""
-        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="silu")
-        x = torch.randn(1, 4, self.HIDDEN)
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="silu").to(_DEVICE)
+        x = torch.randn(1, 4, self.HIDDEN, device=_DEVICE)
 
         expected = mlp.down_proj(torch.nn.functional.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
         torch.testing.assert_close(mlp(x), expected)
 
     def test_gelu_tanh_matches_manual(self) -> None:
         """Verify output matches down(gelu_tanh(gate(x)) * up(x))."""
-        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="gelu_pytorch_tanh")
-        x = torch.randn(1, 4, self.HIDDEN)
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="gelu_pytorch_tanh").to(_DEVICE)
+        x = torch.randn(1, 4, self.HIDDEN, device=_DEVICE)
 
         gelu = torch.nn.GELU(approximate="tanh")
         expected = mlp.down_proj(gelu(mlp.gate_proj(x)) * mlp.up_proj(x))
         torch.testing.assert_close(mlp(x), expected)
 
     def test_with_bias(self) -> None:
-        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, bias=True)
+        mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, bias=True).to(_DEVICE)
         assert mlp.gate_proj.bias is not None
         assert mlp.up_proj.bias is not None
         assert mlp.down_proj.bias is not None
-        assert mlp(torch.randn(1, 4, self.HIDDEN)).shape == (1, 4, self.HIDDEN)
+        x = torch.randn(1, 4, self.HIDDEN, device=_DEVICE)
+        assert mlp(x).shape == (1, 4, self.HIDDEN)
 
     def test_without_bias(self) -> None:
         mlp = GatedMLP(self.HIDDEN, self.INTERMEDIATE, bias=False)
@@ -705,8 +731,6 @@ class TestGatedMLP:
         assert mlp.down_proj.out_features == self.HIDDEN
 
     def test_unknown_activation_raises(self) -> None:
-        import pytest
-
         with pytest.raises(ValueError, match="Unknown activation"):
             GatedMLP(self.HIDDEN, self.INTERMEDIATE, act_fn="relu")
 

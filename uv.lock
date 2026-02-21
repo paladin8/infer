@@ -300,6 +300,7 @@ dependencies = [
     { name = "sse-starlette" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -317,9 +318,6 @@ dev = [
     { name = "ruff" },
     { name = "types-requests" },
 ]
-kernels = [
-    { name = "triton", marker = "sys_platform == 'linux'" },
-]
 
 [package.metadata]
 requires-dist = [
@@ -332,6 +330,7 @@ requires-dist = [
     { name = "sse-starlette", specifier = ">=3.2" },
     { name = "torch", specifier = ">=2.10,<3" },
     { name = "transformers", specifier = ">=5.1,<6" },
+    { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.6,<4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.40" },
 ]
 
@@ -349,7 +348,6 @@ dev = [
     { name = "ruff", specifier = ">=0.15" },
     { name = "types-requests", specifier = ">=2.32.4" },
 ]
-kernels = [{ name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.6,<4" }]
 
 [[package]]
 name = "iniconfig"

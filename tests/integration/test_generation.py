@@ -142,12 +142,12 @@ def test_stop_string(model_id: str, device: str) -> None:
         pytest.skip(f"Could not load tokenizer for {model_id}: {exc}")
 
     prompt = render_chat_template(
-        [{"role": "user", "content": "List three colors, one per line."}],
+        [{"role": "user", "content": "Write a short paragraph about the ocean."}],
         model_type=config.model_type,
     )
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-    # Generate WITHOUT stop string to confirm the model produces the pattern.
+    # Generate a baseline without stop strings.
     baseline = generate(
         model,
         tokenizer,
@@ -155,19 +155,23 @@ def test_stop_string(model_id: str, device: str) -> None:
         SamplingParams(temperature=0.0, max_new_tokens=128),
         device=device,
     )
-    if "\n\n" not in baseline.text:
-        pytest.skip("Model output does not contain stop pattern")
+    assert len(baseline.text) > 20, f"Baseline too short to test stop strings: {baseline.text!r}"
+
+    # Pick a stop string from the middle of the baseline output so the test
+    # doesn't depend on any particular model producing a specific pattern.
+    mid = len(baseline.text) // 2
+    stop_str = baseline.text[mid : mid + 4]
 
     # Generate WITH stop string and verify truncation.
     result = generate(
         model,
         tokenizer,
         prompt_ids,
-        SamplingParams(temperature=0.0, max_new_tokens=128, stop=["\n\n"]),
+        SamplingParams(temperature=0.0, max_new_tokens=128, stop=[stop_str]),
         device=device,
     )
     assert result.finish_reason == "stop"
-    assert "\n\n" not in result.text
+    assert stop_str not in result.text
     assert result.generated_tokens < baseline.generated_tokens
 
 

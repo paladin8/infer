@@ -38,7 +38,7 @@ To keep implementation tractable, phases are grouped into milestones:
 
 | Milestone | Phases | Outcome |
 |----------|--------|---------|
-| M1 Core Inference | 1a-3 | Single-request generation with KV cache |
+| M1 Core Inference | 1a-3.1 | Single-request generation with KV cache + Triton kernels |
 | M2 Serving MVP | 4-5 | Multi-request serving with continuous batching + SSE |
 | M3 Advanced Memory/Scheduling | 6-9 | Paged attention, speculative decoding, prefix caching, CPU offload preemption |
 
@@ -293,6 +293,26 @@ Exit criteria:
 
 - Output equivalence vs Phase 2 under greedy decode.
 - Measured decode throughput improvement over Phase 2 on same hardware/model.
+
+### Phase 3.1: Triton Kernel Optimization
+
+Goal:
+
+- Close the gap between current decode throughput and hardware memory-bandwidth limits via fused Triton kernels, reducing kernel launch overhead and redundant HBM traffic.
+
+Deliverables:
+
+- Profiling script (`benchmarks/profile_generation.py`) with Chrome trace export and CUDA kernel summary.
+- Fused Triton kernels: RMSNorm, RoPE, residual+RMSNorm, SwiGLU/GeGLU activation.
+- Triton kernels used unconditionally (no fallback paths — Triton is a required dependency).
+- Unit tests for each kernel (Triton vs PyTorch correctness).
+- Sanity check script (`scripts/sanity_check.py`) for quick manual verification of all models.
+
+Exit criteria:
+
+- Measurable decode throughput improvement on all 3 dev models.
+- All existing tests pass (Phase 1–3 regressions checked).
+- Benchmark log updated with Triton-enabled results.
 
 ### Phase 4: Static Batching and SSE API
 
@@ -602,6 +622,11 @@ infer/
 │       │   ├── prefix.py
 │       │   └── offload.py
 │       ├── kernels/
+│       │   ├── __init__.py
+│       │   ├── rms_norm.py
+│       │   ├── rope.py
+│       │   ├── fused_norm_residual.py
+│       │   ├── activation.py
 │       │   └── paged_attention.py
 │       ├── speculative/
 │       │   └── spec_decode.py
@@ -611,6 +636,8 @@ infer/
 │   ├── run_matrix.py
 │   ├── workloads/
 │   └── reports/
+├── scripts/
+│   └── sanity_check.py
 ├── tests/
 │   ├── unit/
 │   ├── integration/
@@ -629,6 +656,7 @@ infer/
 - Start with custom model code, use `transformers` only for `AutoTokenizer` and parity checks.
 - Use `jinja2` for chat template rendering with our own template strings per model (no `transformers.apply_chat_template`, no custom parser).
 - Use SDPA as default fast path before Triton specialization.
+- Triton is a required dependency; kernels are always used (no PyTorch fallback paths). This simplifies the codebase and avoids maintaining two code paths. The fused RoPE kernel uses FMA instructions, producing results that are slightly different from but more precise than HF's PyTorch implementation (verified against fp64 ground truth).
 - Scope Triton work to paged gather kernel first.
 - Keep engine internals synchronous with a clean `step()` boundary for async API integration.
 - Make continuous batching policy runtime-configurable and benchmark each policy.

@@ -8,12 +8,19 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from infer.loader.config import ModelConfig
 from infer.models.gemma3 import Gemma3Model
 from infer.models.llama import LlamaModel
 from infer.models.qwen3 import Qwen3Model
+
+# Skip entire module if CUDA is unavailable — Triton kernels require CUDA.
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required for Triton kernel tests", allow_module_level=True)
+
+DEVICE = "cuda"
 
 # ---------------------------------------------------------------------------
 # Shared small configs
@@ -65,17 +72,17 @@ _GEMMA3_CONFIG = ModelConfig(
 
 class TestLlamaModel:
     def test_output_shape(self) -> None:
-        model = LlamaModel(_LLAMA_CONFIG)
+        model = LlamaModel(_LLAMA_CONFIG).to(DEVICE)
         model.eval()
-        input_ids = torch.randint(0, 100, (1, 8))
+        input_ids = torch.randint(0, 100, (1, 8), device=DEVICE)
         with torch.no_grad():
             logits = model(input_ids)
         assert logits.shape == (1, 8, 100)
 
     def test_output_dtype_matches_model(self) -> None:
-        model = LlamaModel(_LLAMA_CONFIG)
+        model = LlamaModel(_LLAMA_CONFIG).to(DEVICE)
         model.eval()
-        input_ids = torch.randint(0, 100, (2, 5))
+        input_ids = torch.randint(0, 100, (2, 5), device=DEVICE)
         with torch.no_grad():
             logits = model(input_ids)
         assert logits.dtype == torch.float32
@@ -93,9 +100,9 @@ class TestLlamaModel:
 
     def test_batch_dimension(self) -> None:
         """Verify batch dim > 1 works correctly."""
-        model = LlamaModel(_LLAMA_CONFIG)
+        model = LlamaModel(_LLAMA_CONFIG).to(DEVICE)
         model.eval()
-        input_ids = torch.randint(0, 100, (3, 6))
+        input_ids = torch.randint(0, 100, (3, 6), device=DEVICE)
         with torch.no_grad():
             logits = model(input_ids)
         assert logits.shape == (3, 6, 100)
@@ -108,17 +115,17 @@ class TestLlamaModel:
 
 class TestQwen3Model:
     def test_output_shape(self) -> None:
-        model = Qwen3Model(_QWEN3_CONFIG)
+        model = Qwen3Model(_QWEN3_CONFIG).to(DEVICE)
         model.eval()
-        input_ids = torch.randint(0, 100, (1, 8))
+        input_ids = torch.randint(0, 100, (1, 8), device=DEVICE)
         with torch.no_grad():
             logits = model(input_ids)
         assert logits.shape == (1, 8, 100)
 
     def test_output_dtype_matches_model(self) -> None:
-        model = Qwen3Model(_QWEN3_CONFIG)
+        model = Qwen3Model(_QWEN3_CONFIG).to(DEVICE)
         model.eval()
-        input_ids = torch.randint(0, 100, (1, 5))
+        input_ids = torch.randint(0, 100, (1, 5), device=DEVICE)
         with torch.no_grad():
             logits = model(input_ids)
         assert logits.dtype == torch.float32
@@ -142,17 +149,17 @@ class TestQwen3Model:
 
 class TestGemma3Model:
     def test_output_shape(self) -> None:
-        model = Gemma3Model(_GEMMA3_CONFIG)
+        model = Gemma3Model(_GEMMA3_CONFIG).to(DEVICE)
         model.eval()
-        input_ids = torch.randint(0, 100, (1, 8))
+        input_ids = torch.randint(0, 100, (1, 8), device=DEVICE)
         with torch.no_grad():
             logits = model(input_ids)
         assert logits.shape == (1, 8, 100)
 
     def test_output_dtype_matches_model(self) -> None:
-        model = Gemma3Model(_GEMMA3_CONFIG)
+        model = Gemma3Model(_GEMMA3_CONFIG).to(DEVICE)
         model.eval()
-        input_ids = torch.randint(0, 100, (1, 5))
+        input_ids = torch.randint(0, 100, (1, 5), device=DEVICE)
         with torch.no_grad():
             logits = model(input_ids)
         assert logits.dtype == torch.float32

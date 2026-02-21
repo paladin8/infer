@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from infer.models.common import RMSNorm, build_rope_cos_sin, causal_mask, sliding_window_causal_mask
@@ -9,7 +10,12 @@ from infer.models.gemma3 import Gemma3RMSNorm, Gemma3TransformerBlock
 from infer.models.llama import LlamaTransformerBlock
 from infer.models.qwen3 import Qwen3TransformerBlock
 
+# Skip entire module if CUDA is unavailable — Triton kernels require CUDA.
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required for Triton kernel tests", allow_module_level=True)
+
 # Small dimensions for fast unit tests.
+DEVICE = "cuda"
 HIDDEN = 64
 INTER = 128
 NUM_HEADS = 4
@@ -23,45 +29,53 @@ EPS = 1e-5
 def _make_rope(
     seq_len: int = SEQ_LEN, head_dim: int = HEAD_DIM
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build vanilla RoPE cos/sin tables."""
+    """Build vanilla RoPE cos/sin tables on CUDA."""
     cos, sin = build_rope_cos_sin(head_dim, seq_len)
-    return cos, sin
+    return cos.to(DEVICE), sin.to(DEVICE)
 
 
 class TestLlamaTransformerBlock:
     """Test the Llama 3 transformer block."""
 
     def test_output_shape(self) -> None:
-        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         assert out.shape == (BATCH, SEQ_LEN, HIDDEN)
 
     def test_output_dtype_matches_input(self) -> None:
-        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         assert out.dtype == x.dtype
 
     def test_with_causal_mask(self) -> None:
-        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
-        mask = causal_mask(SEQ_LEN)
+        mask = causal_mask(SEQ_LEN, device=DEVICE)
         out = block(x, cos, sin, mask=mask)
         assert out.shape == (BATCH, SEQ_LEN, HIDDEN)
 
     def test_residual_connection(self) -> None:
         """With zeroed-out sub-layers, output should equal input (residual passthrough)."""
-        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
+        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
         # Zero all parameters in attention and MLP to make them output zero.
         with torch.no_grad():
             for name, param in block.named_parameters():
                 if "layernorm" not in name:
                     param.zero_()
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         torch.testing.assert_close(out, x, atol=1e-5, rtol=1e-5)
@@ -86,7 +100,7 @@ class TestLlamaTransformerBlock:
     def test_silu_activation(self) -> None:
         """Llama block should use SiLU (SwiGLU)."""
         block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        assert isinstance(block.mlp.act_fn, torch.nn.SiLU)
+        assert not block.mlp._use_gelu
 
     def test_state_dict_keys(self) -> None:
         """State dict keys should match our internal weight naming convention."""
@@ -106,19 +120,23 @@ class TestLlamaTransformerBlock:
         assert keys == expected
 
     def test_different_inputs_give_different_outputs(self) -> None:
-        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
+        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
         cos, sin = _make_rope()
-        x1 = torch.randn(1, SEQ_LEN, HIDDEN)
-        x2 = torch.randn(1, SEQ_LEN, HIDDEN)
+        x1 = torch.randn(1, SEQ_LEN, HIDDEN, device=DEVICE)
+        x2 = torch.randn(1, SEQ_LEN, HIDDEN, device=DEVICE)
         out1 = block(x1, cos, sin)
         out2 = block(x2, cos, sin)
         assert not torch.allclose(out1, out2)
 
     def test_deterministic(self) -> None:
         """Same input should produce the same output."""
-        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
+        block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
         cos, sin = _make_rope()
-        x = torch.randn(1, SEQ_LEN, HIDDEN)
+        x = torch.randn(1, SEQ_LEN, HIDDEN, device=DEVICE)
         out1 = block(x, cos, sin)
         out2 = block(x, cos, sin)
         torch.testing.assert_close(out1, out2)
@@ -126,8 +144,8 @@ class TestLlamaTransformerBlock:
     def test_bfloat16(self) -> None:
         """Block should produce valid bf16 output without NaN."""
         block = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        block = block.to(torch.bfloat16)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, dtype=torch.bfloat16)
+        block = block.to(torch.bfloat16).to(DEVICE)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         assert out.dtype == torch.bfloat16
@@ -138,17 +156,21 @@ class TestQwen3TransformerBlock:
     """Test the Qwen 3 transformer block."""
 
     def test_output_shape(self) -> None:
-        block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         assert out.shape == (BATCH, SEQ_LEN, HIDDEN)
 
     def test_with_causal_mask(self) -> None:
-        block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
-        mask = causal_mask(SEQ_LEN)
+        mask = causal_mask(SEQ_LEN, device=DEVICE)
         out = block(x, cos, sin, mask=mask)
         assert out.shape == (BATCH, SEQ_LEN, HIDDEN)
 
@@ -173,7 +195,7 @@ class TestQwen3TransformerBlock:
     def test_silu_activation(self) -> None:
         """Qwen 3 block should use SiLU (SwiGLU)."""
         block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        assert isinstance(block.mlp.act_fn, torch.nn.SiLU)
+        assert not block.mlp._use_gelu
 
     def test_state_dict_keys(self) -> None:
         """State dict should be Llama keys + q_norm/k_norm."""
@@ -206,12 +228,14 @@ class TestQwen3TransformerBlock:
 
     def test_residual_connection(self) -> None:
         """With zeroed-out sub-layers, output should equal input."""
-        block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
+        block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
         with torch.no_grad():
             for name, param in block.named_parameters():
                 if "layernorm" not in name:
                     param.zero_()
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         torch.testing.assert_close(out, x, atol=1e-5, rtol=1e-5)
@@ -219,8 +243,8 @@ class TestQwen3TransformerBlock:
     def test_bfloat16(self) -> None:
         """Block should produce valid bf16 output without NaN."""
         block = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        block = block.to(torch.bfloat16)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, dtype=torch.bfloat16)
+        block = block.to(torch.bfloat16).to(DEVICE)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         assert out.dtype == torch.bfloat16
@@ -229,10 +253,14 @@ class TestQwen3TransformerBlock:
     def test_different_from_llama_with_same_weights(self) -> None:
         """QK-norm should cause different outputs even with identical base weights."""
         torch.manual_seed(42)
-        llama = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
+        llama = LlamaTransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
         torch.manual_seed(42)
-        qwen3 = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
-        x = torch.randn(1, SEQ_LEN, HIDDEN)
+        qwen3 = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
+        x = torch.randn(1, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out_llama = llama(x, cos, sin)
         out_qwen3 = qwen3(x, cos, sin)
@@ -246,8 +274,8 @@ class TestGemma3RMSNorm:
     def test_zero_weight_is_identity_scaling(self) -> None:
         """With default zero weights, (1 + 0) = 1, so it's just normalization."""
         dim = 16
-        norm = Gemma3RMSNorm(dim, eps=1e-6)
-        x = torch.randn(2, 4, dim)
+        norm = Gemma3RMSNorm(dim, eps=1e-6).to(DEVICE)
+        x = torch.randn(2, 4, dim, device=DEVICE)
         out = norm(x)
         # Compare to standard normalization (no weight scaling).
         x_f32 = x.to(torch.float32)
@@ -268,10 +296,10 @@ class TestGemma3RMSNorm:
     def test_nonzero_weight_applies_offset(self) -> None:
         """With weight=0.5, should scale by (1 + 0.5) = 1.5."""
         dim = 8
-        norm = Gemma3RMSNorm(dim, eps=1e-6)
+        norm = Gemma3RMSNorm(dim, eps=1e-6).to(DEVICE)
         with torch.no_grad():
             norm.weight.fill_(0.5)
-        x = torch.randn(1, 4, dim)
+        x = torch.randn(1, 4, dim, device=DEVICE)
         out = norm(x)
         # Manual computation.
         x_f32 = x.to(torch.float32)
@@ -280,15 +308,15 @@ class TestGemma3RMSNorm:
         torch.testing.assert_close(out, expected.to(x.dtype), atol=1e-5, rtol=1e-5)
 
     def test_output_shape(self) -> None:
-        norm = Gemma3RMSNorm(16)
-        x = torch.randn(2, 4, 16)
+        norm = Gemma3RMSNorm(16).to(DEVICE)
+        x = torch.randn(2, 4, 16, device=DEVICE)
         assert norm(x).shape == x.shape
 
     def test_bfloat16_stability(self) -> None:
         """Should produce stable results with bfloat16 input."""
         dim = 32
-        norm = Gemma3RMSNorm(dim)
-        x_f32 = torch.randn(2, 4, dim)
+        norm = Gemma3RMSNorm(dim).to(DEVICE)
+        x_f32 = torch.randn(2, 4, dim, device=DEVICE)
         x_bf16 = x_f32.to(torch.bfloat16)
         out_f32 = norm(x_f32)
         out_bf16 = norm(x_bf16)
@@ -297,9 +325,9 @@ class TestGemma3RMSNorm:
     def test_equivalent_to_standard_at_init(self) -> None:
         """At init, Gemma3 (zeros, 1+w) should match standard (ones, w) RMSNorm."""
         dim = 16
-        standard = RMSNorm(dim, eps=1e-6)
-        gemma3 = Gemma3RMSNorm(dim, eps=1e-6)
-        x = torch.randn(2, 4, dim)
+        standard = RMSNorm(dim, eps=1e-6).to(DEVICE)
+        gemma3 = Gemma3RMSNorm(dim, eps=1e-6).to(DEVICE)
+        x = torch.randn(2, 4, dim, device=DEVICE)
         # Both should produce the same output at init time.
         torch.testing.assert_close(standard(x), gemma3(x), atol=1e-5, rtol=1e-5)
 
@@ -310,28 +338,28 @@ class TestGemma3TransformerBlock:
     def _make_block(self) -> Gemma3TransformerBlock:
         return Gemma3TransformerBlock(
             HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS, query_pre_attn_scalar=256.0
-        )
+        ).to(DEVICE)
 
     def test_output_shape(self) -> None:
         block = self._make_block()
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         assert out.shape == (BATCH, SEQ_LEN, HIDDEN)
 
     def test_with_causal_mask(self) -> None:
         block = self._make_block()
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
-        mask = causal_mask(SEQ_LEN)
+        mask = causal_mask(SEQ_LEN, device=DEVICE)
         out = block(x, cos, sin, mask=mask)
         assert out.shape == (BATCH, SEQ_LEN, HIDDEN)
 
     def test_with_sliding_window_mask(self) -> None:
         block = self._make_block()
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
-        mask = sliding_window_causal_mask(SEQ_LEN, window_size=4)
+        mask = sliding_window_causal_mask(SEQ_LEN, window_size=4, device=DEVICE)
         out = block(x, cos, sin, mask=mask)
         assert out.shape == (BATCH, SEQ_LEN, HIDDEN)
 
@@ -365,7 +393,7 @@ class TestGemma3TransformerBlock:
     def test_gelu_activation(self) -> None:
         """Gemma 3 block should use GELU-tanh (GeGLU)."""
         block = self._make_block()
-        assert isinstance(block.mlp.act_fn, torch.nn.GELU)
+        assert block.mlp._use_gelu
 
     def test_attention_scale(self) -> None:
         """Attention scale should use query_pre_attn_scalar, not head_dim."""
@@ -406,15 +434,21 @@ class TestGemma3TransformerBlock:
             for name, param in block.named_parameters():
                 if "layernorm" not in name:
                     param.zero_()
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         torch.testing.assert_close(out, x, atol=1e-5, rtol=1e-5)
 
     def test_bfloat16(self) -> None:
         """Block should produce valid bf16 output without NaN."""
-        block = self._make_block().to(torch.bfloat16)
-        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, dtype=torch.bfloat16)
+        block = (
+            Gemma3TransformerBlock(
+                HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS, query_pre_attn_scalar=256.0
+            )
+            .to(torch.bfloat16)
+            .to(DEVICE)
+        )
+        x = torch.randn(BATCH, SEQ_LEN, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
         cos, sin = _make_rope()
         out = block(x, cos, sin)
         assert out.dtype == torch.bfloat16
@@ -423,10 +457,12 @@ class TestGemma3TransformerBlock:
     def test_sandwich_norm_differs_from_pre_norm(self) -> None:
         """Sandwich norm should produce different results from pre-norm (Qwen 3)."""
         torch.manual_seed(42)
-        qwen3 = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS)
+        qwen3 = Qwen3TransformerBlock(HIDDEN, INTER, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, EPS).to(
+            DEVICE
+        )
         torch.manual_seed(42)
         gemma3 = self._make_block()
-        x = torch.randn(1, SEQ_LEN, HIDDEN)
+        x = torch.randn(1, SEQ_LEN, HIDDEN, device=DEVICE)
         cos, sin = _make_rope()
         out_qwen3 = qwen3(x, cos, sin)
         out_gemma3 = gemma3(x, cos, sin)
