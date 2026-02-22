@@ -326,15 +326,13 @@ Deliverables:
 - Padded/varlen attention support for mixed prompt lengths.
 - FastAPI endpoint (`POST /v1/completions`) with SSE streaming (the only API surface — no separate non-streaming path).
 - HTTP error responses for invalid requests (400 for bad params, 422 for unsupported fields, 503 when queue is full).
-- Early `genai-perf` validation: confirm the SSE streaming format is compatible and run a baseline benchmark.
+- Custom benchmark script (`bench_serving.py`) measuring TTFT, ITL, and throughput under concurrent load.
 
 Exit criteria:
 
 - Throughput under concurrent load exceeds sequential serving baseline.
 - Regression tests cover mixed sequence lengths and EOS handling in batch.
-- `genai-perf` can drive the API endpoint and produce a valid report.
-
-Note: Confirm `genai-perf` SSE compatibility early in this phase. If incompatible, fall back to a simple custom benchmark script (concurrent requests measuring TTFT/ITL) for M2 and revisit `genai-perf` integration later.
+- Benchmark script produces a valid report with TTFT, ITL, and throughput metrics.
 
 ### Phase 5: Continuous Batching (v1 completion target)
 
@@ -444,13 +442,12 @@ class EngineConfig:
     max_batch_size: int = 32
     max_num_batched_tokens: int = 8192
 
-    # KV cache
-    use_kv_cache: bool = True
-    use_paged_attention: bool = False
-    block_size: int = 16
+    # KV cache (always on; backend selects implementation)
+    kv_cache_backend: str = "contiguous"  # "contiguous" | "paged"
+    block_size: int = 16                  # paged backend only
 
     # Batching
-    batching_mode: str = "continuous"  # "none" | "static" | "continuous"
+    batching_mode: str = "continuous"  # "static" | "continuous"
     scheduler_policy: str = "fcfs"     # "fcfs" | "prefill_first" | "decode_round_robin"
 
     # Speculative decoding
@@ -470,23 +467,20 @@ class EngineConfig:
 
 Compatibility rules to enforce in config validation:
 
-- `use_paged_attention=True` requires `use_kv_cache=True`.
-- `use_speculative=True` requires `draft_model` and batching mode not equal to `"none"`.
-- `use_prefix_caching=True` requires paged attention mode.
-- `preemption_mode="cpu_offload"` requires `batching_mode="continuous"` and paged attention mode.
+- `use_speculative=True` requires `draft_model` and `batching_mode="continuous"`.
+- `use_prefix_caching=True` requires `kv_cache_backend="paged"`.
+- `preemption_mode="cpu_offload"` requires `batching_mode="continuous"` and `kv_cache_backend="paged"`.
 
 Benchmark matrix baseline:
 
-| Config | KV Cache | Batching | Paged | Prefix | Speculative | Preemption |
-|-------|----------|----------|-------|--------|-------------|------------|
-| Baseline | off | none | off | off | off | none |
-| +KV Cache | on | none | off | off | off | none |
-| +Static Batch | on | static | off | off | off | none |
-| +Continuous | on | continuous | off | off | off | recompute |
-| +Paged | on | continuous | on | off | off | recompute |
-| +Prefix | on | continuous | on | on | off | recompute |
-| +Speculative | on | continuous | on | on | on | recompute |
-| +CPU Offload | on | continuous | on | on | on | cpu_offload |
+| Config | KV Backend | Batching | Prefix | Speculative | Preemption |
+|--------|-----------|----------|--------|-------------|------------|
+| Static Batch | contiguous | static | off | off | none |
+| +Continuous | contiguous | continuous | off | off | recompute |
+| +Paged | paged | continuous | off | off | recompute |
+| +Prefix | paged | continuous | on | off | recompute |
+| +Speculative | paged | continuous | on | on | recompute |
+| +CPU Offload | paged | continuous | on | on | cpu_offload |
 
 Scheduler policy sweep (Phase 5+):
 
@@ -528,7 +522,7 @@ Scheduler policy sweep (Phase 5+):
 
 ## 10. Metrics and Benchmarking
 
-Use NVIDIA `genai-perf` as the primary harness and add internal counters from the engine.
+Use a custom benchmark script (`bench_serving.py`) as the primary harness and add internal counters from the engine.
 
 Core metrics:
 
@@ -661,7 +655,8 @@ infer/
 - Keep engine internals synchronous with a clean `step()` boundary for async API integration.
 - Make continuous batching policy runtime-configurable and benchmark each policy.
 - Add CPU offload preemption as a late advanced feature (Phase 9), after paged attention/prefix work.
-- Use `genai-perf` as primary benchmark harness; validate SSE compatibility in Phase 4 with a simple custom script as fallback.
+- Use a custom `bench_serving.py` as the primary serving benchmark harness (our SSE format uses custom event types that don't match external tools' OpenAI assumptions).
+- KV caching is always on — no toggle to disable it. The `kv_cache_backend` config selects the implementation (`"contiguous"` for Phase 3's pre-allocated cache, `"paged"` for Phase 6's block-allocated cache).
 - Use `src/infer/` package layout to avoid import ambiguity with the repo name.
 
 ---
