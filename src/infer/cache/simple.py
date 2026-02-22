@@ -51,6 +51,7 @@ class KVCache:
         config: ModelConfig,
         max_seq_len: int,
         *,
+        batch_size: int = 1,
         dtype: torch.dtype = torch.bfloat16,
         device: str | torch.device = "cuda",
     ) -> KVCache:
@@ -58,12 +59,20 @@ class KVCache:
 
         Extracts ``num_hidden_layers``, ``num_key_value_heads``, and
         ``computed_head_dim`` from ``config``.
+
+        Args:
+            config: Model configuration.
+            max_seq_len: Maximum sequence length to allocate for.
+            batch_size: Number of sequences in the batch (default 1).
+            dtype: Cache tensor dtype.
+            device: Cache tensor device.
         """
         return KVCache.allocate(
             num_layers=config.num_hidden_layers,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.computed_head_dim,
             max_seq_len=max_seq_len,
+            batch_size=batch_size,
             dtype=dtype,
             device=device,
         )

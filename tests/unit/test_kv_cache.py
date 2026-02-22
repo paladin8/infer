@@ -90,6 +90,14 @@ class TestFromModelConfig:
         assert cache.v.shape == expected
         assert cache.seq_len == 0
 
+    def test_batch_size(self, config: ModelConfig) -> None:
+        cache = KVCache.from_model_config(
+            config, max_seq_len=MAX_SEQ_LEN, batch_size=4, dtype=DTYPE, device=DEVICE
+        )
+        expected = (NUM_LAYERS, 4, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM)
+        assert cache.k.shape == expected
+        assert cache.v.shape == expected
+
     def test_uses_computed_head_dim(self) -> None:
         """When head_dim is None, computed_head_dim = hidden_size // num_attention_heads."""
         config = ModelConfig(
