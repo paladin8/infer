@@ -310,6 +310,7 @@ bench = [
     { name = "tabulate" },
 ]
 dev = [
+    { name = "httpx" },
     { name = "mypy" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -340,6 +341,7 @@ bench = [
     { name = "tabulate", specifier = ">=0.9" },
 ]
 dev = [
+    { name = "httpx", specifier = ">=0.28" },
     { name = "mypy", specifier = ">=1.19" },
     { name = "pre-commit", specifier = ">=4.5" },
     { name = "pytest", specifier = ">=9.0" },

@@ -135,6 +135,8 @@ Supported request fields for v1:
 - `max_tokens: int`
 - `temperature: float`
 - `top_p: float`
+- `top_k: int | null`
+- `repetition_penalty: float`
 - `stream: bool` (always treated as `true`; accepted for OpenAI compatibility)
 - `stop: str | list[str] | null`
 - `seed: int | null`
@@ -190,11 +192,19 @@ class SamplingParams:
     seed: int | None = None
 
 @dataclass
-class GenerationRequest:
+class Request:
     request_id: str
     prompt_token_ids: list[int]
-    sampling: SamplingParams
+    sampling_params: SamplingParams
     arrival_time_s: float
+
+    # Mutable state
+    state: RequestState = RequestState.WAITING
+    generated_token_ids: list[int] = field(default_factory=list)
+    finish_reason: str | None = None
+    error: str | None = None
+    generator: torch.Generator | None = None
+    output_queue: asyncio.Queue[StepOutput] | None = None
 
 @dataclass
 class StepOutput:
@@ -202,7 +212,10 @@ class StepOutput:
     token_id: int | None
     text_delta: str
     finished: bool
+    finish_reason: str | None = None
     error: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 ```
 
 Engine invariants:
@@ -607,9 +620,11 @@ infer/
 │       ├── engine/
 │       │   ├── config.py
 │       │   ├── engine.py
+│       │   ├── request.py
 │       │   ├── runner.py
 │       │   ├── scheduler.py
-│       │   └── sampler.py
+│       │   ├── sampler.py
+│       │   └── generate.py
 │       ├── cache/
 │       │   ├── simple.py
 │       │   ├── paged.py
@@ -625,7 +640,9 @@ infer/
 │       ├── speculative/
 │       │   └── spec_decode.py
 │       └── server/
-│           └── api.py
+│           ├── __init__.py
+│           ├── api.py
+│           └── __main__.py
 ├── benchmarks/
 │   ├── run_matrix.py
 │   ├── workloads/
@@ -638,7 +655,12 @@ infer/
 │   └── stress/
 └── docs/
     ├── OVERALL_DESIGN.md
-    └── PHASE_1B.md
+    ├── PHASE_1A.md
+    ├── PHASE_1B.md
+    ├── PHASE_2.md
+    ├── PHASE_3.md
+    ├── PHASE_3_1.md
+    └── PHASE_4.md
 ```
 
 ---

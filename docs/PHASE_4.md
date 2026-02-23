@@ -312,6 +312,7 @@ class ModelRunner:
         self._prompt_lens: list[int] = []     # real prompt length per request
         self._max_prompt_len: int = 0
         self._padding_mask: Tensor | None = None  # [batch, max_total_seq_len]
+        self._prev_text_lens: list[int] = []  # for incremental text_delta tracking
 
     @torch.inference_mode()
     def prefill(self, requests: list[Request]) -> list[StepOutput]:
@@ -501,6 +502,15 @@ class Engine:
         self.scheduler = StaticScheduler(config)
         self.runner = ModelRunner(self.model, self.tokenizer, config)
         self.model_id: str = config.model  # full HF model ID for validation
+
+    @classmethod
+    def from_components(
+        cls, config: EngineConfig, model: nn.Module, tokenizer: object,
+    ) -> Self:
+        """Create an engine from pre-built components (for testing).
+
+        Bypasses model/tokenizer loading so tests can inject mock objects.
+        """
 
     def add_request(
         self,
@@ -692,6 +702,11 @@ async def engine_loop(engine: Engine) -> None:
 The `asyncio.sleep(0)` between steps is critical — without it, the engine would starve the event loop and SSE events would not be sent until the batch completes. With it, token events are flushed after each step.
 
 The `asyncio.sleep(0.001)` when idle prevents busy-waiting. 1ms is short enough that new requests are picked up promptly.
+
+**App factories**: two factory functions create the FastAPI app:
+
+- `create_app(config: EngineConfig)` — production factory. Loads a real model inside the lifespan. Routes are registered at app creation using an `_EngineProxy` that forwards attribute access to the real engine once the lifespan starts. This avoids registering routes inside the lifespan (which would miss the route table).
+- `create_app_with_engine(engine: Engine)` — testing factory. Accepts a pre-built engine (typically from `Engine.from_components()` with a mock model) so integration tests can run without loading real models.
 
 ### 9. Server entry point (`src/infer/server/__main__.py`)
 
