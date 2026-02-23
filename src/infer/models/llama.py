@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 from torch import Tensor, nn
 
 from infer.kernels.fused_norm_residual import triton_fused_residual_rms_norm
@@ -151,27 +152,50 @@ class LlamaModel(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, input_ids: Tensor, kv_cache: KVCache | None = None) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        kv_cache: KVCache | None = None,
+        padding_mask: Tensor | None = None,
+    ) -> Tensor:
         """Forward pass.
 
         Args:
             input_ids: Token IDs, shape ``[batch, seq_len]``.
             kv_cache: Optional KV cache for incremental decoding.
+            padding_mask: Optional boolean mask, shape ``[batch, total_kv_len]``.
+                ``True`` for real token positions, ``False`` for padding.
+                When provided, combined with the internal causal mask to
+                exclude padding from attention.
 
         Returns:
             Logits, shape ``[batch, seq_len, vocab_size]``
-            (``[batch, 1, vocab_size]`` when using cache).
+            (``[batch, 1, vocab_size]`` when using cache without padding_mask).
         """
         x = self.embed_tokens(input_ids)
-        seq_len = x.shape[1]
+        batch_size, seq_len, _ = x.shape
 
+        mask: Tensor | None
         if kv_cache is not None:
             pos = kv_cache.seq_len
             if seq_len > 1:
-                assert pos == 0, "Chunked prefill not supported in Phase 3"
+                assert pos == 0, "Chunked prefill not supported"
             cos = self.cos[pos : pos + seq_len]
             sin = self.sin[pos : pos + seq_len]
-            mask = None if seq_len == 1 else causal_mask(seq_len, dtype=x.dtype, device=x.device)
+
+            if padding_mask is not None:
+                kv_len = pos + seq_len
+                if seq_len > 1:
+                    mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
+                    mask = mask.expand(batch_size, -1, -1, -1).clone()
+                else:
+                    mask = torch.zeros(batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device)
+                pad_mask = ~padding_mask[:, None, None, :kv_len]
+                mask.masked_fill_(pad_mask, float("-inf"))
+            else:
+                mask = (
+                    None if seq_len == 1 else causal_mask(seq_len, dtype=x.dtype, device=x.device)
+                )
         else:
             cos = self.cos[:seq_len]
             sin = self.sin[:seq_len]
@@ -182,7 +206,8 @@ class LlamaModel(nn.Module):
 
         if kv_cache is not None:
             kv_cache.advance(seq_len)
-            x = x[:, -1:, :]
+            if padding_mask is None:
+                x = x[:, -1:, :]
 
         x = self.norm(x)
         return self.lm_head(x)
