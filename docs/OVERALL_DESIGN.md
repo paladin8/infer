@@ -377,14 +377,23 @@ Goal:
 
 Deliverables:
 
-- Block allocator + page tables.
-- Gather-based paged attention path.
-- Optional Triton gather kernel.
+- `CachePoolProtocol` abstracting pool interface (both `SlottedKVCache` and `PagedKVCachePool` satisfy it).
+- `BlockAllocator` with O(1) alloc/free, double-free detection, owner tracking, and leak detection.
+- `PagedKVCachePool` with block tensor storage, page tables, and audit/reclaim for leaked blocks.
+- Three paged cache views (`PagedPrefillCacheView`, `PagedDecodeCacheView`, `PagedBatchedPrefillCacheView`).
+- Split scheduler interface (`retire()` → `admit(free_kv_tokens)` → `decode_requests()`).
+- Vectorized flat-gather decode path (indices computed once per step, reused across layers).
+- Optional Triton paged attention kernel (fused gather + attention for decode).
 
 Exit criteria:
 
 - Higher max concurrent sequence capacity than contiguous mode at same VRAM limit.
 - Correctness tests pass with randomized page mappings.
+- `CachePoolProtocol` satisfied by both backends; no `isinstance` checks in runner or engine.
+- All Phase 1-5 tests pass with `kv_cache_backend="contiguous"` (no regression).
+- `audit_blocks()` returns empty after normal request lifecycle.
+
+See `docs/PHASE_6.md` for the full design.
 
 ### Phase 7: Chunked Prefill
 
@@ -445,6 +454,7 @@ class EngineConfig:
     # KV cache (always on; backend selects implementation)
     kv_cache_backend: str = "contiguous"  # "contiguous" | "paged"
     block_size: int = 16                  # paged backend only
+    num_gpu_blocks: int | None = None     # paged backend only; None = auto
 
     # Batching
     batching_mode: str = "continuous"  # "static" | "continuous"
