@@ -8,6 +8,12 @@ from torch import Tensor, nn
 from infer.cache.simple import KVCache
 from infer.engine.config import EngineConfig
 from infer.engine.request import Request, RequestState, StepOutput
+from infer.engine.runner_helpers import (
+    check_stop,
+    make_finished_noop,
+    make_step_output,
+    truncate_at_stop,
+)
 from infer.engine.sampler import sample_token
 from infer.loader.tokenizer import Tokenizer
 
@@ -120,14 +126,14 @@ class ModelRunner:
             text = self.tokenizer.decode(req.generated_token_ids, skip_special_tokens=True)
             text_delta = text[self._prev_text_lens[i] :]
 
-            finished, reason = self._check_stop(req, token)
+            finished, reason = check_stop(req, token, self.tokenizer)
             if finished:
                 req.state = RequestState.FINISHED
                 req.finish_reason = reason
                 if reason == "stop":
-                    text_delta = self._truncate_at_stop(text, self._prev_text_lens[i], req)
+                    text_delta = truncate_at_stop(text, self._prev_text_lens[i], req)
             self._prev_text_lens[i] = len(text)
-            outputs.append(self._make_step_output(req, token, text_delta, finished, reason))
+            outputs.append(make_step_output(req, token, text_delta, finished, reason))
 
         return outputs
 
@@ -161,7 +167,7 @@ class ModelRunner:
         for i, req in enumerate(requests):
             if req.state != RequestState.DECODE:
                 # Already finished — emit no-op output.
-                outputs.append(self._make_finished_noop(req))
+                outputs.append(make_finished_noop(req))
                 continue
 
             context = req.prompt_token_ids + req.generated_token_ids
@@ -178,14 +184,14 @@ class ModelRunner:
             text = self.tokenizer.decode(req.generated_token_ids, skip_special_tokens=True)
             text_delta = text[self._prev_text_lens[i] :]
 
-            finished, reason = self._check_stop(req, token)
+            finished, reason = check_stop(req, token, self.tokenizer)
             if finished:
                 req.state = RequestState.FINISHED
                 req.finish_reason = reason
                 if reason == "stop":
-                    text_delta = self._truncate_at_stop(text, self._prev_text_lens[i], req)
+                    text_delta = truncate_at_stop(text, self._prev_text_lens[i], req)
             self._prev_text_lens[i] = len(text)
-            outputs.append(self._make_step_output(req, token, text_delta, finished, reason))
+            outputs.append(make_step_output(req, token, text_delta, finished, reason))
 
         return outputs
 
@@ -196,71 +202,3 @@ class ModelRunner:
         self._max_prompt_len = 0
         self._padding_mask = None
         self._prev_text_lens = []
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _truncate_at_stop(self, full_text: str, prev_len: int, req: Request) -> str:
-        """Truncate text_delta at the earliest stop string, excluding the stop string."""
-        stop_strings = req.sampling_params.stop or []
-        earliest = len(full_text)
-        for s in stop_strings:
-            idx = full_text.find(s)
-            if idx != -1 and idx < earliest:
-                earliest = idx
-        return full_text[prev_len:earliest]
-
-    def _check_stop(self, req: Request, token: int) -> tuple[bool, str | None]:
-        """Check stop conditions for a request after appending a token.
-
-        Returns ``(finished, finish_reason)``.
-        """
-        # EOS takes priority.
-        eos_ids: set[int] = self.tokenizer.eos_token_ids
-        if token in eos_ids:
-            return True, "eos"
-
-        # Stop strings.
-        if req.sampling_params.stop:
-            text = self.tokenizer.decode(req.generated_token_ids, skip_special_tokens=True)
-            for s in req.sampling_params.stop:
-                if s in text:
-                    return True, "stop"
-
-        # Max tokens.
-        if len(req.generated_token_ids) >= req.sampling_params.max_new_tokens:
-            return True, "length"
-
-        return False, None
-
-    def _make_step_output(
-        self,
-        req: Request,
-        token: int,
-        text_delta: str,
-        finished: bool,
-        reason: str | None,
-    ) -> StepOutput:
-        """Create a StepOutput for a normal (active) request."""
-        return StepOutput(
-            request_id=req.request_id,
-            token_id=token,
-            text_delta=text_delta,
-            finished=finished,
-            finish_reason=reason,
-            prompt_tokens=len(req.prompt_token_ids) if finished else 0,
-            completion_tokens=len(req.generated_token_ids) if finished else 0,
-        )
-
-    def _make_finished_noop(self, req: Request) -> StepOutput:
-        """Create a no-op StepOutput for an already-finished request."""
-        return StepOutput(
-            request_id=req.request_id,
-            token_id=None,
-            text_delta="",
-            finished=True,
-            finish_reason=req.finish_reason,
-            prompt_tokens=len(req.prompt_token_ids),
-            completion_tokens=len(req.generated_token_ids),
-        )

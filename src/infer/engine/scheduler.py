@@ -1,9 +1,10 @@
-"""Static-batching scheduler with FCFS ordering and bounded wait."""
+"""Scheduling policies for the serving engine."""
 
 from __future__ import annotations
 
 import time
 from collections import deque
+from dataclasses import dataclass, field
 
 from infer.engine.config import EngineConfig
 from infer.engine.request import Request, RequestState
@@ -86,3 +87,76 @@ class StaticScheduler:
     def _batch_done(self) -> bool:
         """True if every request in the active batch is finished or failed."""
         return all(r.state in (RequestState.FINISHED, RequestState.FAILED) for r in self.active)
+
+
+# ---------------------------------------------------------------------------
+# Continuous batching scheduler
+# ---------------------------------------------------------------------------
+
+_TERMINAL_STATES = frozenset({RequestState.FINISHED, RequestState.FAILED})
+
+
+@dataclass
+class ScheduleOutput:
+    """Result of one continuous scheduling step."""
+
+    prefill: list[Request] = field(default_factory=list)
+    decode: list[Request] = field(default_factory=list)
+    retired: list[Request] = field(default_factory=list)
+
+
+class ContinuousScheduler:
+    """Per-step scheduler for continuous batching.
+
+    Each ``schedule()`` call:
+
+    1. Retires finished/failed requests from the active set.
+    2. Counts available capacity (``max_batch_size - active``).
+    3. Admits new requests from the waiting queue up to capacity (FCFS).
+    4. Returns the prefill list, decode list, and retired list.
+
+    No bounded wait timer: requests are admitted immediately when slots are
+    available.  No preemption: active requests run to completion.
+    """
+
+    def __init__(self, config: EngineConfig) -> None:
+        self.config = config
+        self.waiting: deque[Request] = deque()
+        self.active: list[Request] = []
+
+    def add_request(self, request: Request) -> bool:
+        """Add a request to the waiting queue.
+
+        Returns ``False`` if the queue is full (caller should return 503).
+        """
+        if len(self.waiting) >= self.config.max_waiting_requests:
+            return False
+        self.waiting.append(request)
+        return True
+
+    def schedule(self) -> ScheduleOutput:
+        """Run one scheduling step.
+
+        1. Retire finished/failed requests from the active set.
+        2. Admit up to free capacity from the waiting queue (FCFS).
+        3. Return prefill, decode, and retired lists.
+        """
+        # 1. Retire finished.
+        retired = [r for r in self.active if r.state in _TERMINAL_STATES]
+        self.active = [r for r in self.active if r.state not in _TERMINAL_STATES]
+
+        # 2. Admit new requests.
+        capacity = self.config.max_batch_size - len(self.active)
+        new: list[Request] = []
+        while self.waiting and len(new) < capacity:
+            new.append(self.waiting.popleft())
+        self.active.extend(new)
+
+        # 3. Partition active into decode (already prefilled) and prefill (new).
+        decode = [r for r in self.active if r.state == RequestState.DECODE]
+
+        return ScheduleOutput(prefill=new, decode=decode, retired=retired)
+
+    def has_work(self) -> bool:
+        """True if there are active or waiting requests."""
+        return bool(self.active) or bool(self.waiting)

@@ -9,10 +9,11 @@ from typing import Self
 import torch
 
 from infer.engine.config import EngineConfig
+from infer.engine.continuous_runner import ContinuousRunner
 from infer.engine.request import Request, RequestState, StepOutput
 from infer.engine.runner import ModelRunner
 from infer.engine.sampler import SamplingParams
-from infer.engine.scheduler import StaticScheduler
+from infer.engine.scheduler import ContinuousScheduler, StaticScheduler
 from infer.loader.model_loader import load_model
 from infer.loader.tokenizer import Tokenizer
 
@@ -22,18 +23,18 @@ class Engine:
 
     The engine owns the model, tokenizer, scheduler, and runner.  The API
     layer calls :meth:`add_request` and the engine loop calls :meth:`step`.
+
+    The ``batching_mode`` config selects the scheduler and runner:
+
+    - ``"static"``: :class:`StaticScheduler` + :class:`ModelRunner` (Phase 4).
+    - ``"continuous"``: :class:`ContinuousScheduler` + :class:`ContinuousRunner` (Phase 5).
     """
 
     def __init__(self, config: EngineConfig) -> None:
         dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[config.dtype]
         model, _model_config = load_model(config.model, dtype=dtype, device=config.device)
         tokenizer = Tokenizer(config.model)
-
-        self.config = config
-        self.model_id = config.model
-        self.tokenizer = tokenizer
-        self.scheduler = StaticScheduler(config)
-        self.runner = ModelRunner(model, tokenizer, config)
+        self._init_components(config, model, tokenizer)
 
     @classmethod
     def from_components(
@@ -44,12 +45,26 @@ class Engine:
     ) -> Self:
         """Create an engine from pre-built components (for testing)."""
         engine = object.__new__(cls)
-        engine.config = config
-        engine.model_id = config.model
-        engine.tokenizer = tokenizer  # type: ignore[assignment]
-        engine.scheduler = StaticScheduler(config)
-        engine.runner = ModelRunner(model, tokenizer, config)  # type: ignore[arg-type]
+        engine._init_components(config, model, tokenizer)  # type: ignore[arg-type]
         return engine
+
+    def _init_components(
+        self,
+        config: EngineConfig,
+        model: torch.nn.Module,
+        tokenizer: Tokenizer,
+    ) -> None:
+        """Initialize engine components based on batching mode."""
+        self.config = config
+        self.model_id = config.model
+        self.tokenizer = tokenizer
+
+        if config.batching_mode == "continuous":
+            self.scheduler: StaticScheduler | ContinuousScheduler = ContinuousScheduler(config)
+            self.runner: ModelRunner | ContinuousRunner = ContinuousRunner(model, tokenizer, config)
+        else:
+            self.scheduler = StaticScheduler(config)
+            self.runner = ModelRunner(model, tokenizer, config)
 
     def add_request(
         self,
@@ -89,7 +104,24 @@ class Engine:
         return self.scheduler.add_request(request)
 
     def step(self) -> None:
-        """Run one engine step: schedule a batch and execute a forward pass."""
+        """Run one engine step: schedule and execute forward pass(es)."""
+        if isinstance(self.scheduler, ContinuousScheduler):
+            self._step_continuous()
+        else:
+            self._step_static()
+
+    def has_work(self) -> bool:
+        """True if the scheduler has active or waiting requests."""
+        return self.scheduler.has_work()
+
+    # ------------------------------------------------------------------
+    # Static batching step (Phase 4)
+    # ------------------------------------------------------------------
+
+    def _step_static(self) -> None:
+        assert isinstance(self.scheduler, StaticScheduler)
+        assert isinstance(self.runner, ModelRunner)
+
         batch = self.scheduler.schedule()
         if not batch:
             return
@@ -122,6 +154,43 @@ class Engine:
                     )
             self.runner.clear_batch()
 
-    def has_work(self) -> bool:
-        """True if the scheduler has active or waiting requests."""
-        return self.scheduler.has_work()
+    # ------------------------------------------------------------------
+    # Continuous batching step (Phase 5)
+    # ------------------------------------------------------------------
+
+    def _step_continuous(self) -> None:
+        assert isinstance(self.scheduler, ContinuousScheduler)
+        assert isinstance(self.runner, ContinuousRunner)
+
+        schedule = self.scheduler.schedule()
+
+        # Free retired slots.
+        for req in schedule.retired:
+            if req.slot_idx is not None:
+                self.runner.free_slot(req.slot_idx)
+            self.runner.cleanup_request(req.request_id)
+
+        if not schedule.prefill and not schedule.decode:
+            return
+
+        try:
+            outputs = self.runner.step(schedule.prefill, schedule.decode)
+            for req, output in outputs:
+                if req.output_queue is not None:
+                    req.output_queue.put_nowait(output)
+
+        except Exception as exc:
+            for req in schedule.prefill + schedule.decode:
+                req.state = RequestState.FAILED
+                req.error = str(exc)
+                if req.output_queue is not None:
+                    req.output_queue.put_nowait(
+                        StepOutput(
+                            request_id=req.request_id,
+                            token_id=None,
+                            text_delta="",
+                            finished=True,
+                            finish_reason=None,
+                            error=str(exc),
+                        )
+                    )

@@ -71,5 +71,8 @@ class Request:
     # None means non-deterministic sampling.
     generator: torch.Generator | None = field(default=None, repr=False)
 
+    # Cache pool slot — assigned during prefill, freed on retire (continuous batching).
+    slot_idx: int | None = field(default=None, repr=False)
+
     # Output channel — set by the server when the request is enqueued.
     output_queue: asyncio.Queue[StepOutput] | None = field(default=None, repr=False)

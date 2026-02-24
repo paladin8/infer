@@ -22,6 +22,12 @@ def main() -> None:
     parser.add_argument("--max-waiting-requests", type=int, default=64)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--batch-wait-timeout", type=float, default=0.05)
+    parser.add_argument(
+        "--batching-mode",
+        default="static",
+        choices=["static", "continuous"],
+        help="batching strategy (default: static)",
+    )
     args = parser.parse_args()
 
     config = EngineConfig(
@@ -33,6 +39,7 @@ def main() -> None:
         max_waiting_requests=args.max_waiting_requests,
         seed=args.seed,
         batch_wait_timeout_s=args.batch_wait_timeout,
+        batching_mode=args.batching_mode,
     )
 
     app = create_app(config)

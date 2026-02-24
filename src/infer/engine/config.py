@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_VALID_BATCHING_MODES = {"static"}  # Phase 5 adds "continuous"
+_VALID_BATCHING_MODES = {"static", "continuous"}
 _VALID_SCHEDULER_POLICIES = {"fcfs"}
 _VALID_KV_CACHE_BACKENDS = {"contiguous"}  # Phase 6 adds "paged"
 _VALID_DTYPES = {"bfloat16", "float16"}

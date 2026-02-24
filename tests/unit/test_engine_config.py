@@ -72,10 +72,9 @@ class TestEngineConfigValidation:
         cfg = EngineConfig(model="m", batch_wait_timeout_s=0.0)
         assert cfg.batch_wait_timeout_s == 0.0
 
-    def test_continuous_batching_mode_rejected(self) -> None:
-        """Phase 5 value is not yet supported."""
-        with pytest.raises(ValueError, match="batching_mode"):
-            EngineConfig(model="m", batching_mode="continuous")
+    def test_continuous_batching_mode_accepted(self) -> None:
+        cfg = EngineConfig(model="m", batching_mode="continuous")
+        assert cfg.batching_mode == "continuous"
 
     def test_paged_kv_cache_backend_rejected(self) -> None:
         """Phase 6 value is not yet supported."""

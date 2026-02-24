@@ -246,7 +246,7 @@ class TestTritonRoPE:
 
         # Compare element-wise against 2D RoPE at each position.
         for i in range(batch):
-            pos = positions[i, 0].item()
+            pos = int(positions[i, 0].item())
             cos_2d = cos_full[pos : pos + 1]  # [1, head_dim]
             sin_2d = sin_full[pos : pos + 1]
             q_ref_i, k_ref_i = _pytorch_apply_rope(q[i : i + 1], k[i : i + 1], cos_2d, sin_2d)
