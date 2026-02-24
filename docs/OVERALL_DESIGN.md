@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-`infer` is an LLM inference runtime built from scratch on top of PyTorch. The goal is to understand how systems like vLLM, TGI, and SGLang work by building one incrementally, starting from "load weights and produce one token" and working up to continuous batching, paged attention, and speculative decoding.
+`infer` is an LLM inference runtime built from scratch on top of PyTorch. The goal is to understand how systems like vLLM, TGI, and SGLang work by building one incrementally, starting from "load weights and produce one token" and working up to continuous batching, paged attention, and chunked prefill.
 
 ### Goals
 
@@ -28,7 +28,7 @@ v1 is complete at the end of **Phase 5**:
 - Correctness tests pass (parity checks + scheduler/cache tests).
 - A benchmark report exists comparing baseline vs. each enabled optimization through Phase 5.
 
-Phases 6-9 are advanced extensions, not required for v1.
+Phases 6-8 are advanced extensions, not required for v1.
 
 ---
 
@@ -40,7 +40,7 @@ To keep implementation tractable, phases are grouped into milestones:
 |----------|--------|---------|
 | M1 Core Inference | 1a-3.1 | Single-request generation with KV cache + Triton kernels |
 | M2 Serving MVP | 4-5 | Multi-request serving with continuous batching + SSE |
-| M3 Advanced Memory/Scheduling | 6-9 | Paged attention, speculative decoding, prefix caching, CPU offload preemption |
+| M3 Advanced Memory/Scheduling | 6-8 | Paged attention, chunked prefill, prefix caching |
 
 Guardrails:
 
@@ -70,7 +70,6 @@ Guardrails:
 - Target architectures: Llama 3, Qwen 3, Gemma 3.
 - Dev models: `meta-llama/Llama-3.2-1B-Instruct`, `Qwen/Qwen3-1.7B`, `google/gemma-3-1b-it`.
 - Practical unquantized target range on dev hardware: 1B-3B class models.
-- Default speculative pair target: ~3B target with ~1B draft (or smaller), chosen based on fit and stability on 16 GB.
 - Larger models (for example 7B-8B class) are advanced and typically require quantization and/or reduced concurrency.
 - Use local model paths when possible to avoid benchmark variance from download latency.
 
@@ -383,22 +382,24 @@ Exit criteria:
 - Higher max concurrent sequence capacity than contiguous mode at same VRAM limit.
 - Correctness tests pass with randomized page mappings.
 
-### Phase 7: Speculative Decoding
+### Phase 7: Chunked Prefill
 
 Goal:
 
-- Draft/verify loop for faster decode.
+- Break long prefills into fixed-size chunks that interleave with decode steps, preventing decode stalls when new requests arrive.
 
 Deliverables:
 
-- Draft model integration.
-- Acceptance/rejection logic with distribution-preserving algorithm.
-- Scheduler integration for variable verification step sizes.
+- Configurable chunk size (`prefill_chunk_size` in `EngineConfig`).
+- Scheduler support for partial prefill: track per-request prefill progress and resume across iterations.
+- Mixed prefill-chunk + decode batches within a single `step()` call.
+- Attention mask handling for partial prefill sequences alongside decoding sequences.
 
 Exit criteria:
 
-- Throughput gain measured on compatible draft/target pair.
-- Distribution correctness checks for sampled outputs (statistical tests).
+- ITL stability improvement under concurrent prefill+decode workload vs unchunked baseline.
+- No throughput regression on decode-only workload (chunking disabled or chunk size >= prompt length).
+- Correctness: chunked prefill produces identical logits to full prefill under greedy decode.
 
 ### Phase 8: Prefix Caching
 
@@ -416,24 +417,6 @@ Exit criteria:
 
 - TTFT improvement on shared-prefix workload.
 - Cache correctness tests for refcount + eviction edge cases.
-
-### Phase 9: CPU Offload Preemption (Advanced)
-
-Goal:
-
-- Keep high-priority requests making progress under KV pressure by offloading preempted sequence state to CPU memory and later restoring it.
-
-Deliverables:
-
-- Preemption mode supporting CPU offload + resume.
-- Host-pinned memory buffers for offloaded KV/state payloads.
-- Scheduler policy hooks to choose victims and re-admit offloaded sequences.
-
-Exit criteria:
-
-- Under memory pressure, service remains live without hard OOM for tested workloads.
-- Resumed requests produce equivalent outputs to non-preempted execution under deterministic settings.
-- Benchmark includes throughput/latency impact of offload preemption vs recompute preemption.
 
 ---
 
@@ -463,16 +446,15 @@ class EngineConfig:
     batching_mode: str = "continuous"  # "static" | "continuous"
     scheduler_policy: str = "fcfs"     # "fcfs" | "prefill_first" | "decode_round_robin"
 
-    # Speculative decoding
-    use_speculative: bool = False
-    draft_model: str | None = None
-    spec_tokens: int = 5
+    # Chunked prefill
+    use_chunked_prefill: bool = False
+    prefill_chunk_size: int = 512
 
     # Prefix caching
     use_prefix_caching: bool = False
 
     # Preemption
-    preemption_mode: str = "recompute"  # "none" | "recompute" | "cpu_offload"
+    preemption_mode: str = "recompute"  # "none" | "recompute"
 
     # Attention backend
     attention_backend: str = "sdpa"    # "naive" | "sdpa" | "flash" | "triton_paged"
@@ -480,20 +462,18 @@ class EngineConfig:
 
 Compatibility rules to enforce in config validation:
 
-- `use_speculative=True` requires `draft_model` and `batching_mode="continuous"`.
+- `use_chunked_prefill=True` requires `batching_mode="continuous"`.
 - `use_prefix_caching=True` requires `kv_cache_backend="paged"`.
-- `preemption_mode="cpu_offload"` requires `batching_mode="continuous"` and `kv_cache_backend="paged"`.
 
 Benchmark matrix baseline:
 
-| Config | KV Backend | Batching | Prefix | Speculative | Preemption |
-|--------|-----------|----------|--------|-------------|------------|
+| Config | KV Backend | Batching | Chunked Prefill | Prefix | Preemption |
+|--------|-----------|----------|-----------------|--------|------------|
 | Static Batch | contiguous | static | off | off | none |
 | +Continuous | contiguous | continuous | off | off | recompute |
 | +Paged | paged | continuous | off | off | recompute |
-| +Prefix | paged | continuous | on | off | recompute |
-| +Speculative | paged | continuous | on | on | recompute |
-| +CPU Offload | paged | continuous | on | on | cpu_offload |
+| +Chunked | paged | continuous | on | off | recompute |
+| +Prefix | paged | continuous | on | on | recompute |
 
 Scheduler policy sweep (Phase 5+):
 
@@ -575,7 +555,7 @@ Test layers:
 - Stress tests:
   - queue growth and backpressure
   - cancellation/disconnect handling
-  - OOM/preemption paths (advanced phases), including CPU offload + resume behavior
+  - OOM/preemption paths (advanced phases)
 
 Milestone gates:
 
@@ -628,8 +608,7 @@ infer/
 │       ├── cache/
 │       │   ├── simple.py
 │       │   ├── paged.py
-│       │   ├── prefix.py
-│       │   └── offload.py
+│       │   └── prefix.py
 │       ├── kernels/
 │       │   ├── __init__.py
 │       │   ├── rms_norm.py
@@ -637,8 +616,6 @@ infer/
 │       │   ├── fused_norm_residual.py
 │       │   ├── activation.py
 │       │   └── paged_attention.py
-│       ├── speculative/
-│       │   └── spec_decode.py
 │       └── server/
 │           ├── __init__.py
 │           ├── api.py
@@ -676,7 +653,6 @@ infer/
 - Scope Triton work to paged gather kernel first.
 - Keep engine internals synchronous with a clean `step()` boundary for async API integration.
 - Make continuous batching policy runtime-configurable and benchmark each policy.
-- Add CPU offload preemption as a late advanced feature (Phase 9), after paged attention/prefix work.
 - Use a custom `bench_serving.py` as the primary serving benchmark harness (our SSE format uses custom event types that don't match external tools' OpenAI assumptions).
 - KV caching is always on — no toggle to disable it. The `kv_cache_backend` config selects the implementation (`"contiguous"` for Phase 3's pre-allocated cache, `"paged"` for Phase 6's block-allocated cache).
 - Use `src/infer/` package layout to avoid import ambiguity with the repo name.
@@ -694,7 +670,7 @@ None currently. Re-open after Phase 5 policy benchmarking if additional schedule
 - [vLLM: Easy, Fast, and Cheap LLM Serving (PagedAttention)](https://arxiv.org/abs/2309.06180)
 - [Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/conference/osdi22/presentation/yu)
 - [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104)
-- [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192)
+- [Sarathi: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills](https://arxiv.org/abs/2308.16369)
 - [FlashAttention: Fast and Memory-Efficient Exact Attention](https://arxiv.org/abs/2205.14135)
 - [Triton tutorials](https://triton-lang.org/main/getting-started/tutorials/)
 - [vLLM source code](https://github.com/vllm-project/vllm)
