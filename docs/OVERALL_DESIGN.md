@@ -68,8 +68,9 @@ Guardrails:
 ### Model assumptions
 
 - Target architectures: Llama 3, Qwen 3, Gemma 3.
-- Dev models: `meta-llama/Llama-3.2-1B-Instruct`, `Qwen/Qwen3-1.7B`, `google/gemma-3-1b-it`.
-- Practical unquantized target range on dev hardware: 1B-3B class models.
+- Dev models (unit tests, quick iteration): `meta-llama/Llama-3.2-1B-Instruct`, `Qwen/Qwen3-1.7B`, `google/gemma-3-1b-it`.
+- Benchmark models (serving benchmarks, Phase 4+): `meta-llama/Llama-3.2-3B-Instruct`, `Qwen/Qwen3-4B`, `google/gemma-3-1b-it`.
+- Practical unquantized target range on dev hardware: 1B-4B class models.
 - Larger models (for example 7B-8B class) are advanced and typically require quantization and/or reduced concurrency.
 - Use local model paths when possible to avoid benchmark variance from download latency.
 
@@ -94,7 +95,7 @@ Guardrails:
 │                   Scheduler                     │
 │  - Request queue                                │
 │  - Batching policy (static -> continuous)       │
-│  - Admission control / preemption               │
+│  - Admission control                             │
 └────────────────────┬────────────────────────────┘
                      │ Batch of sequences
                      ▼
@@ -110,7 +111,7 @@ Guardrails:
 │   Model Loader   │ │   KV Cache Manager       │
 │  - HF weights    │ │  - Contiguous/Paged mode │
 │  - Arch registry │ │  - Allocator/page tables │
-│  - Tokenization  │ │  - Eviction/preemption   │
+│  - Tokenization  │ │  - Eviction policy       │
 └──────────────────┘ └──────────────────────────┘
 ```
 
@@ -173,9 +174,9 @@ Core request state machine:
 
 `WAITING -> PREFILL -> DECODE -> FINISHED`
 
-Error/preemption states for advanced phases:
+Error state:
 
-`FAILED`, `PREEMPTED`
+`FAILED`
 
 Reference interfaces:
 
@@ -354,15 +355,17 @@ Goal:
 
 Deliverables:
 
-- Continuous scheduler (admit/retire each step).
+- Continuous scheduler (admit/retire each step, FCFS policy).
+- Slotted KV cache pool with per-slot position tracking.
+- Model `position_ids` support for batched decode with per-sequence RoPE.
+- Triton RoPE kernel update for 3D cos/sin.
 - Per-sequence lifecycle tracking.
-- Configurable scheduling policy selection (`fcfs`, `prefill_first`, `decode_round_robin`).
 
 Exit criteria:
 
 - Tail latency improvement vs static batching on mixed-length workload.
 - No starvation in stress test (bounded wait for queued requests).
-- Policy sweep benchmarks are recorded for each scheduling policy.
+- Benchmark results recorded comparing static vs continuous batching.
 - v1 Definition of Done satisfied.
 
 ### Phase 6: Paged Attention
@@ -453,9 +456,6 @@ class EngineConfig:
     # Prefix caching
     use_prefix_caching: bool = False
 
-    # Preemption
-    preemption_mode: str = "recompute"  # "none" | "recompute"
-
     # Attention backend
     attention_backend: str = "sdpa"    # "naive" | "sdpa" | "flash" | "triton_paged"
 ```
@@ -467,13 +467,13 @@ Compatibility rules to enforce in config validation:
 
 Benchmark matrix baseline:
 
-| Config | KV Backend | Batching | Chunked Prefill | Prefix | Preemption |
-|--------|-----------|----------|-----------------|--------|------------|
-| Static Batch | contiguous | static | off | off | none |
-| +Continuous | contiguous | continuous | off | off | recompute |
-| +Paged | paged | continuous | off | off | recompute |
-| +Chunked | paged | continuous | on | off | recompute |
-| +Prefix | paged | continuous | on | on | recompute |
+| Config       | KV Backend | Batching   | Chunked Prefill | Prefix |
+|--------------|------------|------------|-----------------|--------|
+| Static Batch | contiguous | static     | off             | off    |
+| +Continuous  | contiguous | continuous | off             | off    |
+| +Paged       | paged      | continuous | off             | off    |
+| +Chunked     | paged      | continuous | on              | off    |
+| +Prefix      | paged      | continuous | on              | on     |
 
 Scheduler policy sweep (Phase 5+):
 
@@ -502,7 +502,7 @@ Scheduler policy sweep (Phase 5+):
 - Keep policy modular.
 - Keep `scheduler_policy` runtime-configurable and benchmark all supported policies.
 - Minimum required fairness rule for v1:
-  - Decode-active sequences must receive service at least once every `N` scheduler iterations unless preempted.
+  - Decode-active sequences must receive service at least once every `N` scheduler iterations.
 - Admission control checks token budget and KV budget before enqueueing into active set.
 
 ### 9.4 Engine async-readiness
@@ -555,7 +555,7 @@ Test layers:
 - Stress tests:
   - queue growth and backpressure
   - cancellation/disconnect handling
-  - OOM/preemption paths (advanced phases)
+  - OOM handling (advanced phases)
 
 Milestone gates:
 
