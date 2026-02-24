@@ -121,3 +121,88 @@ Defaults: seed=42, 2 warmup requests per workload, JSON reports saved to `benchm
 | ITL P99 (ms)       |     26 |     40 |     33 |
 | Latency P50 (s)    | 20.704 | 29.543 | 21.178 |
 | Errors             |      0 |      0 |      0 |
+
+---
+
+## Phase 5 — Continuous Batching
+
+Server launched with `--batching-mode continuous`. Same hardware, models, seeds, and workload definitions as Phase 4. Multiple new requests arriving in the same step are batched into a single prefill forward pass (right-padded to the longest prompt) to amortize weight loading.
+
+### baseline — Sequential Single Requests
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |   87.1 |   65.8 |   86.3 |
+| TTFT P50 (ms)      |     35 |     43 |     25 |
+| TTFT P99 (ms)      |     37 |     44 |     27 |
+| ITL P50 (ms)       |     11 |     15 |     11 |
+| ITL P99 (ms)       |     13 |     17 |     16 |
+| Latency P50 (s)    |  2.939 |  3.875 |  2.966 |
+
+### continuous_batching — Staggered Arrivals
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  316.9 |  241.9 |  249.8 |
+| TTFT P50 (ms)      |   1825 |   3378 |   2965 |
+| TTFT P99 (ms)      |   4352 |   7918 |   7334 |
+| ITL P50 (ms)       |     21 |     28 |     28 |
+| ITL P99 (ms)       |     58 |     71 |     40 |
+| Latency P50 (s)    |  5.149 |  7.659 |  7.180 |
+| Errors             |      0 |      0 |      0 |
+
+### paged_attention — Bursty Arrivals, Bimodal Lengths
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  281.0 |  197.5 |  258.4 |
+| TTFT P50 (ms)      |  17341 |  28951 |  19037 |
+| TTFT P99 (ms)      |  40552 |  67679 |  50193 |
+| ITL P50 (ms)       |     26 |     38 |     29 |
+| ITL P99 (ms)       |     64 |     68 |     44 |
+| Latency P50 (s)    | 25.657 | 41.632 | 31.483 |
+| Errors             |      0 |      0 |      0 |
+
+### chunked_prefill — Long Prompts, Poisson Arrivals
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  197.4 |  137.3 |  240.4 |
+| TTFT P50 (ms)      |  13156 |  20259 |   9931 |
+| TTFT P99 (ms)      |  25153 |  39454 |  18861 |
+| ITL P50 (ms)       |     36 |     51 |     29 |
+| ITL P99 (ms)       |    140 |    191 |     64 |
+| Latency P50 (s)    | 17.881 | 27.012 | 14.063 |
+| Errors             |      0 |      0 |      0 |
+
+### prefix_caching — Shared System Prompt
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  256.4 |  104.2 |  258.0 |
+| TTFT P50 (ms)      |  17139 |  45287 |  16896 |
+| TTFT P99 (ms)      |  34569 |  90710 |  34148 |
+| ITL P50 (ms)       |     29 |     67 |     29 |
+| ITL P99 (ms)       |     95 |    191 |     51 |
+| Latency P50 (s)    | 23.779 | 64.245 | 24.676 |
+| Errors             |      0 |      0 |      0 |
+
+### Phase 5 vs Phase 4 — Comparison
+
+The continuous_batching workload is the headline comparison. Changes relative to Phase 4 static batching:
+
+| Metric             |   Llama |   Qwen3 |  Gemma3 |
+|--------------------|--------:|--------:|--------:|
+| Throughput         |   +25%  |   +26%  |    +8%  |
+| TTFT P50           |   -55%  |   -45%  |   -30%  |
+| TTFT P99           |   -55%  |   -44%  |   -33%  |
+| ITL P50            |   +24%  |   +22%  |   +22%  |
+| ITL P99            |  +205%  |  +163%  |   +38%  |
+
+**What improved**: TTFT dropped 30-55% across all models — requests no longer wait for an entire batch to drain before being admitted. Throughput improved 8-26% because the batch stays fuller (no wasted slots for already-finished requests). Batched prefill amortizes weight loading when multiple requests arrive in the same step.
+
+**What got worse**: ITL P99 increased 38-205% due to prefill stalls — when new requests are admitted, their prefill blocks decode for all active requests. Larger models (Llama 3B, Qwen3 4B) suffer more because their prefills take longer. This is the problem Phase 7 (chunked prefill) is designed to solve.
+
+**chunked_prefill workload**: Qwen3-4B improved from 96.5 (static) to 137.3 tok/s (+42% throughput), but ITL P99 increased from 78ms to 191ms. Long-prompt prefills still block decode even when batched — the stall is shorter (one batched pass vs N individual passes) but still present.
+
+**prefix_caching regression on Qwen3**: throughput dropped from 212.9 to 104.2 tok/s (-51%). At 8 RPS with ~1024-token prompts, batched prefills of the arriving requests are large (multiple 1024-token sequences padded together), creating long decode stalls. The problem is amplified on Qwen3-4B due to the model's higher per-token compute cost. Llama and Gemma3 showed mild regression (-15% and -9% respectively).

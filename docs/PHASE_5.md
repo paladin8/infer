@@ -48,10 +48,10 @@ Benchmark models: `meta-llama/Llama-3.2-3B-Instruct`, `Qwen/Qwen3-4B`, `google/g
 1. `scheduler.schedule()` — retire finished, admit new, return schedule
 2. Free cache slots for retired requests
 3. Batched decode for all active decode requests (one forward pass)
-4. Prefill new requests (individually, one forward pass each)
+4. Prefill new requests — single request uses individual prefill (no padding overhead), multiple requests use batched prefill (right-padded to longest prompt, one forward pass)
 5. Push StepOutputs to per-request queues
 
-Decode runs before prefill (step 3 before step 4) to prioritize inter-token latency for in-flight requests. A newly arrived request waits one step before prefill begins — this adds ~10ms to TTFT (one decode step) but keeps ITL stable for existing requests. A long prefill (e.g., 1024-token prompt) blocks decode for its duration — Phase 7 (chunked prefill) addresses this by breaking prefills into chunks interleaved with decode steps.
+Decode runs before prefill (step 3 before step 4) to prioritize inter-token latency for in-flight requests. A newly arrived request waits one step before prefill begins — this adds ~10ms to TTFT (one decode step) but keeps ITL stable for existing requests. When multiple requests arrive in the same step, batched prefill amortizes weight loading across all of them in a single forward pass (right-padded to the longest prompt). A long prefill blocks decode for its duration — Phase 7 (chunked prefill) addresses this by breaking prefills into chunks interleaved with decode steps.
 
 **No API changes**: the `POST /v1/completions` endpoint, SSE event format, and error responses are identical to Phase 4. Continuous batching is an internal engine improvement selected via `batching_mode="continuous"` in `EngineConfig`.
 
@@ -138,6 +138,11 @@ class SlottedKVCache:
 
     def decode_view(self, active_slots: list[int]) -> DecodeCacheView:
         """Return a multi-slot view for batched decode."""
+
+    def batched_prefill_view(
+        self, slots: list[int], prompt_lens: list[int],
+    ) -> BatchedPrefillCacheView:
+        """Return a multi-slot view for batched prefill."""
 ```
 
 **`PrefillCacheView`** wraps a single slot and provides the same interface as `KVCache` so the existing model forward code works unchanged:
@@ -225,6 +230,50 @@ class DecodeCacheView:
             self.slot_seq_lens[i] += n
         self._seq_len += n
 ```
+
+**`BatchedPrefillCacheView`** wraps multiple slots for batched prefill. It scatter-writes each batch element's K/V to its assigned pool slot and returns the input K/V directly (no gather needed during prefill):
+
+```python
+class BatchedPrefillCacheView:
+    """Multi-slot cache view for batched prefill.
+
+    Used when multiple requests arrive in the same step. Each batch
+    element's K/V is scatter-written to its assigned pool slot.
+    ``advance()`` sets per-slot seq_lens to actual prompt lengths,
+    not the padded length.
+    """
+
+    def __init__(self, pool: SlottedKVCache, slots: list[int], prompt_lens: list[int]) -> None:
+        self.pool = pool
+        self.slots = slots
+        self.prompt_lens = prompt_lens
+        self.seq_len: int = 0
+
+    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Scatter-write K/V to per-slot positions, return input directly.
+
+        k, v shape: ``[batch, num_kv_heads, padded_len, head_dim]``.
+        Each batch element is written to its slot at the current position.
+        Returns (k, v) unchanged — no gather needed during prefill.
+        """
+        padded_len = k.shape[2]
+        start = self.seq_len
+        end = start + padded_len
+        for i, slot in enumerate(self.slots):
+            self.pool.k[layer_idx, slot, :, start:end, :] = k[i]
+            self.pool.v[layer_idx, slot, :, start:end, :] = v[i]
+        return k, v
+
+    def advance(self, n: int) -> None:
+        """Set per-slot seq_lens to actual prompt lengths (not padded)."""
+        self.seq_len += n
+        for i, slot in enumerate(self.slots):
+            self.pool.seq_lens[slot] = self.prompt_lens[i]
+```
+
+**Why return input K/V directly**: during prefill, attention runs over the full prompt. The model already has the correct K/V tensors from the current forward pass — it doesn't need to read back from the pool. The scatter-write is purely for populating the pool so subsequent decode steps can read from it. This avoids the gather overhead that `DecodeCacheView` incurs.
+
+**Why `advance()` sets actual prompt lengths**: the padded forward pass processes `max_prompt_len` tokens, but shorter prompts only have `prompt_lens[i]` real tokens. Setting `pool.seq_lens[slot] = prompt_lens[i]` ensures decode starts reading from the correct position (right after the real prompt, not after padding).
 
 **Gather cost during decode**: `DecodeCacheView.update()` gathers K/V from the pool via advanced indexing, which creates a copy. Per layer: `2 × active_batch × num_kv_heads × max_len × head_dim × dtype_bytes`. For Llama 3B (28 layers, 8 KV heads, 128 dim, bf16) with 8 active requests and max_len=4096: ~3.5 GB total across all layers. This roughly doubles the KV memory traffic compared to contiguous batching. Acceptable at the dev model scale; Phase 6 (paged attention) eliminates this overhead with block-based gather.
 
@@ -471,7 +520,9 @@ class ContinuousRunner:
 
     Manages a pre-allocated SlottedKVCache pool. Each engine step runs:
     1. Batched decode for all active decode requests.
-    2. Individual prefill for each newly admitted request.
+    2. Prefill for newly admitted requests — single request uses individual
+       prefill (no padding overhead), multiple requests use batched prefill
+       (right-padded, one forward pass via BatchedPrefillCacheView).
 
     Args:
         model: A loaded model with a ``.config`` attribute.
@@ -508,29 +559,37 @@ class ContinuousRunner:
     def step(
         self, prefill: list[Request], decode: list[Request],
     ) -> list[tuple[Request, StepOutput]]:
-        """Run one engine step: batched decode then individual prefills."""
+        """Run one engine step: batched decode then prefills.
+
+        Dispatches prefill based on count: N=1 uses individual prefill
+        (PrefillCacheView, no padding), N>1 uses batched prefill
+        (BatchedPrefillCacheView, right-padded to longest prompt).
+        """
         outputs: list[tuple[Request, StepOutput]] = []
 
         # Phase 1: Batched decode.
         if decode:
             decode_outputs = self._batched_decode(decode)
-            outputs.extend(zip(decode, decode_outputs))
+            outputs.extend(zip(decode, decode_outputs, strict=True))
 
-        # Phase 2: Individual prefills.
-        for req in prefill:
-            output = self._prefill_one(req)
-            outputs.append((req, output))
+        # Phase 2: Prefill — individual or batched.
+        if len(prefill) == 1:
+            output = self._prefill_one(prefill[0])
+            outputs.append((prefill[0], output))
+        elif len(prefill) > 1:
+            prefill_outputs = self._prefill_batch(prefill)
+            outputs.extend(zip(prefill, prefill_outputs, strict=True))
 
         return outputs
 
     def free_slot(self, slot_idx: int, request_id: str) -> None:
-        """Release a cache slot and clean up tracking state.
-
-        Frees the pool slot and removes the request's _prev_text_lens entry.
-        """
+        """Release a cache slot and clean up tracking state."""
 
     def _prefill_one(self, req: Request) -> StepOutput:
         """Prefill a single request using PrefillCacheView."""
+
+    def _prefill_batch(self, requests: list[Request]) -> list[StepOutput]:
+        """Batched prefill for multiple requests using BatchedPrefillCacheView."""
 
     def _batched_decode(self, requests: list[Request]) -> list[StepOutput]:
         """Batched decode for all active requests using DecodeCacheView."""
@@ -583,6 +642,72 @@ def _prefill_one(self, req: Request) -> StepOutput:
 ```
 
 Note: during prefill, `padding_mask` is not passed (single request, no padding needed). The model's existing Phase 3 path handles this: `padding_mask is None` → last-position optimization applied → logits shape `[1, 1, vocab_size]`.
+
+**`_prefill_batch` flow** (used when multiple requests arrive in the same step):
+
+```python
+@torch.inference_mode()
+def _prefill_batch(self, requests: list[Request]) -> list[StepOutput]:
+    device = self.config.device
+    batch_size = len(requests)
+
+    # Allocate cache slots for all requests.
+    slots: list[int] = []
+    prompt_lens: list[int] = []
+    for req in requests:
+        slot = self.cache_pool.allocate_slot()
+        req.slot_idx = slot
+        slots.append(slot)
+        prompt_lens.append(len(req.prompt_token_ids))
+
+    # Right-pad prompts to longest and build input tensor.
+    max_prompt_len = max(prompt_lens)
+    padded = [
+        req.prompt_token_ids + [0] * (max_prompt_len - len(req.prompt_token_ids))
+        for req in requests
+    ]
+    input_ids = torch.tensor(padded, dtype=torch.long, device=device)  # [batch, max_prompt_len]
+
+    # Build padding mask: True for real tokens, False for padding.
+    padding_mask = torch.zeros(batch_size, max_prompt_len, dtype=torch.bool, device=device)
+    for i, plen in enumerate(prompt_lens):
+        padding_mask[i, :plen] = True
+
+    # Create batched prefill cache view — scatter-writes to per-slot positions.
+    view = self.cache_pool.batched_prefill_view(slots, prompt_lens)
+
+    # Forward pass — one batched pass for all new requests.
+    for req in requests:
+        req.state = RequestState.PREFILL
+    logits = self.model(input_ids, kv_cache=view, padding_mask=padding_mask)
+    # logits: [batch, max_prompt_len, vocab_size] (padding_mask present, no last-position opt)
+
+    # Sample per request at its actual last prompt position.
+    outputs: list[StepOutput] = []
+    for i, req in enumerate(requests):
+        next_logits = logits[i, prompt_lens[i] - 1, :]
+        context = req.prompt_token_ids
+        token = sample_token(next_logits, context, req.sampling_params, req.generator)
+        req.generated_token_ids.append(token)
+        req.state = RequestState.DECODE
+
+        # Initialize text tracking and check stop conditions.
+        text = self.tokenizer.decode(req.generated_token_ids, skip_special_tokens=True)
+        text_delta = text
+        self._prev_text_lens[req.request_id] = len(text)
+
+        finished, reason = self._check_stop(req, token)
+        if finished:
+            req.state = RequestState.FINISHED
+            req.finish_reason = reason
+            if reason == "stop":
+                text_delta = self._truncate_at_stop(text, 0, req)
+
+        outputs.append(self._make_step_output(req, token, text_delta, finished, reason))
+    return outputs
+```
+
+Key differences from `_prefill_one`: (1) right-pads prompts and passes `padding_mask` so the model skips the last-position optimization, returning full logits `[batch, max_prompt_len, vocab_size]`; (2) samples at each request's actual last position (`logits[i, prompt_lens[i] - 1, :]`); (3) uses `BatchedPrefillCacheView` which scatter-writes each batch element's K/V to its assigned pool slot and sets per-slot `seq_lens` to actual prompt lengths (not padded length) on `advance()`.
 
 **`_batched_decode` flow**:
 
@@ -750,7 +875,7 @@ src/infer/
 │   ├── __init__.py             # MODIFIED: export new types
 │   ├── protocol.py             # NEW: KVCacheProtocol
 │   ├── simple.py               # UNCHANGED: KVCache (still used for standalone generation)
-│   └── slotted.py              # NEW: SlottedKVCache, PrefillCacheView, DecodeCacheView
+│   └── slotted.py              # NEW: SlottedKVCache, PrefillCacheView, DecodeCacheView, BatchedPrefillCacheView
 ├── engine/
 │   ├── __init__.py             # MODIFIED: export ContinuousScheduler, ContinuousRunner, ScheduleOutput
 │   ├── config.py               # MODIFIED: add "continuous" to valid batching modes
@@ -823,6 +948,20 @@ tests/
 - Call `update()` with K/V of shape `[1, heads, 1, dim]`.
 - Verify gathered cache shape `[1, heads, 76, dim]`.
 
+**BatchedPrefillCacheView**:
+- Create view for slots [0, 2] with prompt_lens [10, 20] and padded_len=20.
+- Call `update()` with K/V of shape `[2, heads, 20, dim]`.
+- Verify scatter-write: slot 0 gets K/V at positions 0-19, slot 2 gets K/V at positions 0-19.
+- Verify `update()` returns the input K/V directly (no gather).
+- Call `advance(20)`. Verify `pool.seq_lens[0] == 10` and `pool.seq_lens[2] == 20` (actual prompt lengths, not padded).
+- Verify pool seq_lens overflow raises assertion error.
+- Verify KVCacheProtocol satisfaction.
+
+**Decode after batched prefill**:
+- Batch-prefill slots [0, 1] with prompt_lens [5, 10] (padded to 10).
+- Create decode view for [0, 1]. Verify `view.seq_len == 10`.
+- Run decode update. Verify data written at correct positions (5 and 10 respectively).
+
 **Slot reuse**:
 - Prefill slot 0 with prompt_len=50. Free slot 0. Prefill slot 0 again with prompt_len=30.
 - Verify seq_lens[0] == 30 (not 50+30).
@@ -859,6 +998,19 @@ Uses mock models (same pattern as `test_runner.py`).
 **Single-request prefill**:
 - Prefill one request. Verify slot allocated, `req.slot_idx` set, first token generated, state is DECODE.
 
+**Batched prefill (multiple requests)**:
+- Submit 3 requests simultaneously. Verify all get slots, first tokens, state is DECODE.
+- Verify batched path is used (N>1 dispatches to `_prefill_batch`).
+- Verify per-slot `seq_lens` match actual prompt lengths (not padded length).
+- Verify correct logits are sampled at each request's last real token position.
+
+**Batched prefill then decode**:
+- Batch-prefill 2 requests. Run decode step.
+- Verify both requests get correct second tokens with correct position_ids.
+
+**Single prefill uses individual path**:
+- Submit 1 request. Verify `_prefill_one` is used (no padding overhead).
+
 **Batched decode**:
 - Prefill 3 requests (individually). Run decode step.
 - Verify all 3 get a second token, position_ids are correct per request.
@@ -874,6 +1026,9 @@ Uses mock models (same pattern as `test_runner.py`).
 
 **EOS during prefill**:
 - Mock model returns EOS logits. Verify request finishes in PREFILL step with `finish_reason="eos"`.
+
+**EOS during batched prefill**:
+- Mock model returns EOS logits for one request in a batch. Verify that request finishes while others continue to DECODE.
 
 ### Model position_ids tests
 
@@ -926,7 +1081,7 @@ Uses mock models (same pattern as `test_runner.py`).
 
 **Per-slot KV cache pool instead of per-batch allocation**: static batching allocates a new KV cache per batch and frees it when the batch completes. Continuous batching has no batch boundaries, so the cache must persist across steps. A pre-allocated pool with slot management is the natural extension. Pre-allocation also avoids GPU memory fragmentation from repeated alloc/free.
 
-**Individual prefill, batched decode**: prefilling new requests one at a time is simple and correct — each request starts at position 0, uses the existing model forward path via `PrefillCacheView`, and writes directly into its assigned pool slot. Batching prefill requests together would require right-padding (as in Phase 4) plus scatter writes to different pool slots, adding complexity for marginal benefit (most steps have 0-1 new requests). Decode batching is essential for throughput: running N decode requests in one forward pass amortizes weight loading across all N requests.
+**Adaptive prefill (individual or batched)**: when a single request arrives, `_prefill_one` uses `PrefillCacheView` with no padding overhead. When multiple requests arrive in the same step, `_prefill_batch` right-pads them to the longest prompt and runs one batched forward pass via `BatchedPrefillCacheView`, amortizing weight loading. The dispatch threshold is N=1 (individual) vs N>1 (batched). Batched prefill matters most under high arrival rates where multiple requests queue up between decode steps — benchmarks show it recovers throughput that would otherwise collapse under bursty arrivals (e.g., Qwen3-4B chunked_prefill workload: 14.4 tok/s with individual prefill → 137.3 tok/s with batched). The `BatchedPrefillCacheView` scatter-writes each batch element's K/V to its assigned pool slot and returns the input K/V directly (no gather needed). Its `advance()` sets per-slot `seq_lens` to actual prompt lengths, not the padded length. This scatter-write primitive is also the foundation for Phase 7's chunked prefill, where partial prefill chunks are written to different slot positions.
 
 **Decode-first step order**: running the decode batch before prefilling new arrivals prioritizes inter-token latency for in-flight requests. A newly arrived request waits one step before prefill begins — this adds ~10ms to TTFT (one decode step) but keeps ITL stable for existing requests. The alternative (prefill-first) risks stalling all decode requests when a long prompt arrives. Phase 7's chunked prefill eliminates this tradeoff entirely.
 

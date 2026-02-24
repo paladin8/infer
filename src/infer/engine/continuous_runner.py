@@ -63,7 +63,7 @@ class ContinuousRunner:
         prefill: list[Request],
         decode: list[Request],
     ) -> list[tuple[Request, StepOutput]]:
-        """Run one engine step: batched decode then individual prefills.
+        """Run one engine step: batched decode then prefill.
 
         Returns a list of ``(request, step_output)`` pairs.
         """
@@ -74,10 +74,15 @@ class ContinuousRunner:
             decode_outputs = self._batched_decode(decode)
             outputs.extend(zip(decode, decode_outputs, strict=True))
 
-        # Phase 2: Individual prefills.
-        for req in prefill:
-            output = self._prefill_one(req)
-            outputs.append((req, output))
+        # Phase 2: Prefill new requests.
+        if len(prefill) == 1:
+            # Single request: no padding overhead.
+            output = self._prefill_one(prefill[0])
+            outputs.append((prefill[0], output))
+        elif len(prefill) > 1:
+            # Multiple requests: batch together to amortize weight loading.
+            prefill_outputs = self._prefill_batch(prefill)
+            outputs.extend(zip(prefill, prefill_outputs, strict=True))
 
         return outputs
 
@@ -130,6 +135,69 @@ class ContinuousRunner:
                 text_delta = truncate_at_stop(text, 0, req)
 
         return make_step_output(req, token, text_delta, finished, reason)
+
+    @torch.inference_mode()
+    def _prefill_batch(self, requests: list[Request]) -> list[StepOutput]:
+        """Prefill multiple requests in one batched forward pass.
+
+        Right-pads prompts to the longest length and runs a single forward
+        pass, amortizing weight loading across all new requests.
+        """
+        device = self.config.device
+
+        # Allocate cache slots for all requests.
+        slots: list[int] = []
+        for req in requests:
+            slot = self.cache_pool.allocate_slot()
+            req.slot_idx = slot
+            slots.append(slot)
+
+        # Right-pad prompts to max length.
+        prompt_lens = [len(req.prompt_token_ids) for req in requests]
+        max_len = max(prompt_lens)
+        padded = [
+            req.prompt_token_ids + [0] * (max_len - len(req.prompt_token_ids)) for req in requests
+        ]
+        input_ids = torch.tensor(padded, dtype=torch.long, device=device)  # [batch, max_len]
+
+        # Padding mask: True for valid positions.
+        batch_size = len(requests)
+        padding_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)
+        for i, plen in enumerate(prompt_lens):
+            padding_mask[i, :plen] = True
+
+        # Create batched cache view and run forward pass.
+        view = self.cache_pool.batched_prefill_view(slots, prompt_lens)
+        for req in requests:
+            req.state = RequestState.PREFILL
+        logits = self.model(input_ids, kv_cache=view, padding_mask=padding_mask)
+        # logits: [batch, max_len, vocab_size] (last-pos opt skipped due to padding_mask)
+
+        # Sample first token per request at its actual last position.
+        outputs: list[StepOutput] = []
+        for i, req in enumerate(requests):
+            next_logits = logits[i, prompt_lens[i] - 1, :]
+            context = req.prompt_token_ids
+            token = sample_token(next_logits, context, req.sampling_params, req.generator)
+            req.generated_token_ids.append(token)
+            req.state = RequestState.DECODE
+
+            # Initialize text tracking.
+            text = self.tokenizer.decode(req.generated_token_ids, skip_special_tokens=True)
+            text_delta = text
+            self._prev_text_lens[req.request_id] = len(text)
+
+            # Check stop conditions.
+            finished, reason = check_stop(req, token, self.tokenizer)
+            if finished:
+                req.state = RequestState.FINISHED
+                req.finish_reason = reason
+                if reason == "stop":
+                    text_delta = truncate_at_stop(text, 0, req)
+
+            outputs.append(make_step_output(req, token, text_delta, finished, reason))
+
+        return outputs
 
     @torch.inference_mode()
     def _batched_decode(self, requests: list[Request]) -> list[StepOutput]:

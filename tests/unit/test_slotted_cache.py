@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from infer.cache.simple import KVCache
-from infer.cache.slotted import DecodeCacheView, PrefillCacheView, SlottedKVCache
+from infer.cache.slotted import (
+    BatchedPrefillCacheView,
+    DecodeCacheView,
+    PrefillCacheView,
+    SlottedKVCache,
+)
 from infer.loader.config import ModelConfig
 
 # ---------------------------------------------------------------------------
@@ -478,3 +483,123 @@ class TestDecodeCacheViewExtra:
         view.advance(1)
         assert all(pool.seq_lens[s] == 11 for s in slots)
         assert view.seq_len == 11
+
+
+# ---------------------------------------------------------------------------
+# BatchedPrefillCacheView
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedPrefillCacheView:
+    def test_scatter_write_to_pool(self, pool: SlottedKVCache) -> None:
+        """Each batch element's K/V is written to its assigned slot."""
+        slots = [pool.allocate_slot() for _ in range(3)]
+        prompt_lens = [5, 3, 7]
+        view = pool.batched_prefill_view(slots, prompt_lens)
+
+        padded_len = max(prompt_lens)  # 7
+        k = torch.randn(3, NUM_KV_HEADS, padded_len, HEAD_DIM)
+        v = torch.randn(3, NUM_KV_HEADS, padded_len, HEAD_DIM)
+
+        view.update(layer_idx=0, k=k, v=v)
+
+        # Verify each slot got its batch element's data.
+        for i, slot in enumerate(slots):
+            torch.testing.assert_close(pool.k[0, slot, :, :padded_len, :], k[i])
+            torch.testing.assert_close(pool.v[0, slot, :, :padded_len, :], v[i])
+
+    def test_returns_input_kv(self, pool: SlottedKVCache) -> None:
+        """update() returns the input K/V directly (not a pool gather)."""
+        slots = [pool.allocate_slot() for _ in range(2)]
+        view = pool.batched_prefill_view(slots, [4, 6])
+
+        k = torch.randn(2, NUM_KV_HEADS, 6, HEAD_DIM)
+        v = torch.randn(2, NUM_KV_HEADS, 6, HEAD_DIM)
+
+        cached_k, cached_v = view.update(layer_idx=0, k=k, v=v)
+
+        # Returns the exact same tensors.
+        assert cached_k is k
+        assert cached_v is v
+
+    def test_advance_sets_actual_prompt_lens(self, pool: SlottedKVCache) -> None:
+        """advance() sets per-slot seq_lens to actual prompt lengths, not padded."""
+        slots = [pool.allocate_slot() for _ in range(3)]
+        prompt_lens = [5, 3, 7]
+        view = pool.batched_prefill_view(slots, prompt_lens)
+
+        padded_len = max(prompt_lens)
+        k = torch.randn(3, NUM_KV_HEADS, padded_len, HEAD_DIM)
+        v = torch.randn(3, NUM_KV_HEADS, padded_len, HEAD_DIM)
+        view.update(layer_idx=0, k=k, v=v)
+
+        # Model calls advance(padded_len).
+        view.advance(padded_len)
+
+        # Pool seq_lens should be actual lengths, not padded.
+        assert pool.seq_lens[slots[0]] == 5
+        assert pool.seq_lens[slots[1]] == 3
+        assert pool.seq_lens[slots[2]] == 7
+        # View's internal seq_len tracks padded length (unused after prefill).
+        assert view.seq_len == padded_len
+
+    def test_multiple_layers(self, pool: SlottedKVCache) -> None:
+        """Scatter-write works correctly across layers."""
+        slots = [pool.allocate_slot() for _ in range(2)]
+        view = pool.batched_prefill_view(slots, [4, 4])
+
+        k0 = torch.ones(2, NUM_KV_HEADS, 4, HEAD_DIM)
+        v0 = torch.ones(2, NUM_KV_HEADS, 4, HEAD_DIM)
+        k1 = torch.ones(2, NUM_KV_HEADS, 4, HEAD_DIM) * 2
+        v1 = torch.ones(2, NUM_KV_HEADS, 4, HEAD_DIM) * 2
+
+        view.update(layer_idx=0, k=k0, v=v0)
+        view.update(layer_idx=1, k=k1, v=v1)
+
+        torch.testing.assert_close(pool.k[0, slots[0], :, :4, :], k0[0])
+        torch.testing.assert_close(pool.k[1, slots[0], :, :4, :], k1[0])
+
+    def test_overflow_raises(self, pool: SlottedKVCache) -> None:
+        """Writing past max_seq_len raises AssertionError."""
+        slots = [pool.allocate_slot()]
+        view = pool.batched_prefill_view(slots, [MAX_SEQ_LEN + 1])
+
+        k = torch.randn(1, NUM_KV_HEADS, MAX_SEQ_LEN + 1, HEAD_DIM)
+        v = torch.randn(1, NUM_KV_HEADS, MAX_SEQ_LEN + 1, HEAD_DIM)
+        with pytest.raises(AssertionError, match="KV cache overflow"):
+            view.update(layer_idx=0, k=k, v=v)
+
+    def test_satisfies_protocol(self, pool: SlottedKVCache) -> None:
+        """BatchedPrefillCacheView has seq_len, update(), advance()."""
+        slots = [pool.allocate_slot()]
+        view: BatchedPrefillCacheView = pool.batched_prefill_view(slots, [4])
+        assert hasattr(view, "seq_len")
+        assert callable(view.update)
+        assert callable(view.advance)
+        assert view.seq_len == 0
+
+    def test_decode_after_batched_prefill(self, pool: SlottedKVCache) -> None:
+        """Slots prefilled via batched view work correctly with DecodeCacheView."""
+        slots = [pool.allocate_slot() for _ in range(2)]
+        prompt_lens = [5, 3]
+        view = pool.batched_prefill_view(slots, prompt_lens)
+
+        padded_len = max(prompt_lens)
+        k = torch.randn(2, NUM_KV_HEADS, padded_len, HEAD_DIM)
+        v = torch.randn(2, NUM_KV_HEADS, padded_len, HEAD_DIM)
+        view.update(layer_idx=0, k=k, v=v)
+        view.advance(padded_len)
+
+        # Now create a decode view over the same slots.
+        decode_view = pool.decode_view(slots)
+
+        # seq_len should be max of actual prompt lens (5), not padded (5 here too).
+        assert decode_view.seq_len == 5
+
+        # Decode step should work.
+        k_dec = torch.randn(2, NUM_KV_HEADS, 1, HEAD_DIM)
+        v_dec = torch.randn(2, NUM_KV_HEADS, 1, HEAD_DIM)
+        cached_k, _ = decode_view.update(layer_idx=0, k=k_dec, v=v_dec)
+
+        # Gathered cache covers [0 : max_seq_len + 1] = [0:6].
+        assert cached_k.shape == (2, NUM_KV_HEADS, 6, HEAD_DIM)

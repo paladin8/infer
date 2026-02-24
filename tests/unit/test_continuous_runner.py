@@ -706,3 +706,155 @@ class TestSlotExhaustion:
         r2 = _make_request("r2", [3, 4])
         with pytest.raises(RuntimeError, match="No free cache slots"):
             runner.step(prefill=[r2], decode=[])
+
+
+# ---------------------------------------------------------------------------
+# Batched prefill
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedPrefill:
+    def test_multiple_requests_batched(self) -> None:
+        """Multiple prefill requests run in one batched forward pass."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        r1 = _make_request("r1", [1, 2, 3])
+        r2 = _make_request("r2", [4, 5])
+        r3 = _make_request("r3", [6, 7, 8, 9])
+        outputs = runner.step(prefill=[r1, r2, r3], decode=[])
+
+        assert len(outputs) == 3
+        for req, out in outputs:
+            assert out.token_id == 7
+            assert req.state is RequestState.DECODE
+            assert req.slot_idx is not None
+            assert len(req.generated_token_ids) == 1
+
+    def test_batched_prefill_allocates_slots(self) -> None:
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config(max_batch_size=4)
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert runner.cache_pool.free_slot_count() == 4
+
+        r1 = _make_request("r1", [1, 2])
+        r2 = _make_request("r2", [3, 4, 5])
+        runner.step(prefill=[r1, r2], decode=[])
+
+        assert runner.cache_pool.free_slot_count() == 2
+        assert r1.slot_idx is not None
+        assert r2.slot_idx is not None
+        assert r1.slot_idx != r2.slot_idx
+
+    def test_batched_prefill_correct_seq_lens(self) -> None:
+        """After batched prefill, pool seq_lens reflect actual prompt lengths."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        r1 = _make_request("r1", [1, 2, 3])  # prompt_len=3
+        r2 = _make_request("r2", [4, 5])  # prompt_len=2
+        runner.step(prefill=[r1, r2], decode=[])
+
+        # seq_lens should be actual prompt lengths, not padded (3).
+        assert r1.slot_idx is not None
+        assert r2.slot_idx is not None
+        assert runner.cache_pool.seq_lens[r1.slot_idx] == 3
+        assert runner.cache_pool.seq_lens[r2.slot_idx] == 2
+
+    def test_single_prefill_uses_individual_path(self) -> None:
+        """Single request still uses individual prefill (no padding overhead)."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        req = _make_request("r1", [1, 2, 3])
+        outputs = runner.step(prefill=[req], decode=[])
+
+        assert len(outputs) == 1
+        _, out = outputs[0]
+        assert out.token_id == 7
+        assert req.state is RequestState.DECODE
+
+    def test_batched_prefill_then_decode(self) -> None:
+        """Requests prefilled in a batch can decode together afterwards."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        r1 = _make_request("r1", [1, 2, 3], max_new_tokens=3)
+        r2 = _make_request("r2", [4, 5], max_new_tokens=3)
+        runner.step(prefill=[r1, r2], decode=[])
+
+        # Both should be in DECODE state and decodable together.
+        outputs = runner.step(prefill=[], decode=[r1, r2])
+        assert len(outputs) == 2
+        for _, out in outputs:
+            assert out.token_id == 7
+
+        assert len(r1.generated_token_ids) == 2
+        assert len(r2.generated_token_ids) == 2
+
+    def test_mixed_step_with_batched_prefill(self) -> None:
+        """Decode + batched prefill in the same step."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        # Prefill A first.
+        a = _make_request("a", [1, 2])
+        runner.step(prefill=[a], decode=[])
+
+        # Mixed step: decode A, batched prefill B+C.
+        b = _make_request("b", [3, 4, 5])
+        c = _make_request("c", [6, 7])
+        outputs = runner.step(prefill=[b, c], decode=[a])
+
+        assert len(outputs) == 3
+        # Decode output first, then prefill outputs.
+        assert outputs[0][0].request_id == "a"
+        assert outputs[1][0].request_id == "b"
+        assert outputs[2][0].request_id == "c"
+        assert b.state is RequestState.DECODE
+        assert c.state is RequestState.DECODE
+
+    def test_batched_prefill_eos(self) -> None:
+        """EOS on first token in batched prefill finishes the request."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=99)
+        tokenizer = MockTokenizer(eos_token_ids={99})
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        r1 = _make_request("r1", [1, 2])
+        r2 = _make_request("r2", [3, 4, 5])
+        outputs = runner.step(prefill=[r1, r2], decode=[])
+
+        for _, out in outputs:
+            assert out.finished is True
+            assert out.finish_reason == "eos"
+
+    def test_batched_prefill_position_ids_for_decode(self) -> None:
+        """After batched prefill with different prompt lengths, decode position_ids are correct."""
+        model = ContinuousSequenceMockModel(vocab_size=100, sequences={})
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        r1 = _make_request("r1", [1, 2, 3])  # prompt_len=3
+        r2 = _make_request("r2", [4, 5, 6, 7, 8])  # prompt_len=5
+        runner.step(prefill=[r1, r2], decode=[])
+
+        # Decode: position_ids should be [3, 5] (actual prompt lengths).
+        runner.step(prefill=[], decode=[r1, r2])
+        assert model.last_position_ids is not None
+        pos = model.last_position_ids.squeeze(1).tolist()
+        assert pos[0] == 3
+        assert pos[1] == 5

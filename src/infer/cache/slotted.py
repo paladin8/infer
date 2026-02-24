@@ -73,6 +73,12 @@ class SlottedKVCache:
         """Return a single-slot view for prefill (KVCacheProtocol-compatible)."""
         return PrefillCacheView(self, slot)
 
+    def batched_prefill_view(
+        self, slots: list[int], prompt_lens: list[int]
+    ) -> BatchedPrefillCacheView:
+        """Return a multi-slot view for batched prefill."""
+        return BatchedPrefillCacheView(self, slots, prompt_lens)
+
     def decode_view(self, active_slots: list[int]) -> DecodeCacheView:
         """Return a multi-slot view for batched decode."""
         return DecodeCacheView(self, active_slots)
@@ -115,6 +121,51 @@ class PrefillCacheView:
         """Advance this slot's position counter."""
         self.seq_len += n
         self.pool.seq_lens[self.slot] = self.seq_len
+
+
+class BatchedPrefillCacheView:
+    """KVCacheProtocol-compatible view for batching multiple prefill requests.
+
+    Scatter-writes each batch element's K/V to its assigned pool slot.
+    On ``advance()``, per-slot ``seq_lens`` are set to actual prompt lengths
+    (not the padded length), so subsequent decode steps use correct positions.
+    """
+
+    def __init__(self, pool: SlottedKVCache, slots: list[int], prompt_lens: list[int]) -> None:
+        self.pool = pool
+        self.slots = slots
+        self.prompt_lens = prompt_lens
+        self.seq_len: int = 0  # starts at 0 for new requests
+
+    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Scatter-write K/V to pool slots and return for attention.
+
+        k, v shape: ``[batch, num_kv_heads, padded_len, head_dim]``.
+        Writes each batch element to its assigned slot in the pool.
+        Returns ``(k, v)`` directly — during prefill the input IS the full
+        cache, and the padding mask handles different actual lengths.
+        """
+        padded_len = k.shape[2]
+        start = self.seq_len
+        end = start + padded_len
+        max_seq_len = self.pool.k.shape[3]
+        assert end <= max_seq_len, (
+            f"KV cache overflow: writing to position {end} but max_seq_len is {max_seq_len}"
+        )
+        for i, slot in enumerate(self.slots):
+            self.pool.k[layer_idx, slot, :, start:end, :] = k[i]
+            self.pool.v[layer_idx, slot, :, start:end, :] = v[i]
+        return k, v
+
+    def advance(self, n: int) -> None:
+        """Advance position counters.
+
+        Sets per-slot ``seq_lens`` to actual prompt lengths (not the padded
+        length ``n``), so decode uses the correct positions.
+        """
+        self.seq_len += n
+        for i, slot in enumerate(self.slots):
+            self.pool.seq_lens[slot] = self.prompt_lens[i]
 
 
 class DecodeCacheView:

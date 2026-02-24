@@ -357,6 +357,7 @@ Deliverables:
 
 - Continuous scheduler (admit/retire each step, FCFS policy).
 - Slotted KV cache pool with per-slot position tracking.
+- Adaptive prefill: individual (N=1) or batched (N>1, right-padded with scatter-write via `BatchedPrefillCacheView`).
 - Model `position_ids` support for batched decode with per-sequence RoPE.
 - Triton RoPE kernel update for 3D cos/sin.
 - Per-sequence lifecycle tracking.
@@ -602,11 +603,15 @@ infer/
 │       │   ├── engine.py
 │       │   ├── request.py
 │       │   ├── runner.py
+│       │   ├── runner_helpers.py
+│       │   ├── continuous_runner.py
 │       │   ├── scheduler.py
 │       │   ├── sampler.py
 │       │   └── generate.py
 │       ├── cache/
+│       │   ├── protocol.py
 │       │   ├── simple.py
+│       │   ├── slotted.py
 │       │   ├── paged.py
 │       │   └── prefix.py
 │       ├── kernels/
@@ -637,7 +642,8 @@ infer/
     ├── PHASE_2.md
     ├── PHASE_3.md
     ├── PHASE_3_1.md
-    └── PHASE_4.md
+    ├── PHASE_4.md
+    └── PHASE_5.md
 ```
 
 ---
