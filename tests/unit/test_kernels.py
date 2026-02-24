@@ -224,6 +224,104 @@ class TestTritonRoPE:
         assert q_rot.dtype == q.dtype
         assert k_rot.dtype == k.dtype
 
+    @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+    def test_rope_3d_cos_sin(self, dtype: torch.dtype) -> None:
+        """3D cos/sin [batch, seq_len, head_dim] for continuous batching decode."""
+        batch, heads, kv_heads, seq_len, head_dim = 4, 8, 4, 1, 64
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=dtype, device="cuda")
+        k = torch.randn(batch, kv_heads, seq_len, head_dim, dtype=dtype, device="cuda")
+
+        # Build full RoPE table, then index with different positions per batch element.
+        max_pos = 128
+        cos_full, sin_full = build_rope_cos_sin(head_dim, max_pos)
+        cos_full = cos_full.to(dtype=dtype, device="cuda")
+        sin_full = sin_full.to(dtype=dtype, device="cuda")
+
+        # Simulate continuous batching: each request at a different position.
+        positions = torch.tensor([[10], [25], [50], [100]], device="cuda")
+        cos_3d = cos_full[positions]  # [4, 1, head_dim]
+        sin_3d = sin_full[positions]  # [4, 1, head_dim]
+
+        q_tri, k_tri = triton_apply_rope(q, k, cos_3d, sin_3d)
+
+        # Compare element-wise against 2D RoPE at each position.
+        for i in range(batch):
+            pos = positions[i, 0].item()
+            cos_2d = cos_full[pos : pos + 1]  # [1, head_dim]
+            sin_2d = sin_full[pos : pos + 1]
+            q_ref_i, k_ref_i = _pytorch_apply_rope(q[i : i + 1], k[i : i + 1], cos_2d, sin_2d)
+            _assert_close(q_tri[i : i + 1], q_ref_i, dtype)
+            _assert_close(k_tri[i : i + 1], k_ref_i, dtype)
+
+    def test_rope_3d_matches_2d_when_same_position(self) -> None:
+        """3D cos/sin with identical positions per batch element matches 2D result."""
+        batch, heads, kv_heads, seq_len, head_dim = 2, 4, 2, 1, 64
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float32, device="cuda")
+        k = torch.randn(batch, kv_heads, seq_len, head_dim, dtype=torch.float32, device="cuda")
+
+        cos_full, sin_full = build_rope_cos_sin(head_dim, 32)
+        cos_full = cos_full.to(device="cuda")
+        sin_full = sin_full.to(device="cuda")
+
+        pos = 5
+        cos_2d = cos_full[pos : pos + 1]  # [1, head_dim]
+        sin_2d = sin_full[pos : pos + 1]
+
+        # 3D: same position for all batch elements
+        positions = torch.tensor([[pos], [pos]], device="cuda")
+        cos_3d = cos_full[positions]  # [2, 1, head_dim]
+        sin_3d = sin_full[positions]
+
+        q_2d, k_2d = triton_apply_rope(q, k, cos_2d, sin_2d)
+        q_3d, k_3d = triton_apply_rope(q, k, cos_3d, sin_3d)
+
+        torch.testing.assert_close(q_2d, q_3d)
+        torch.testing.assert_close(k_2d, k_3d)
+
+    def test_rope_3d_multi_token(self) -> None:
+        """3D cos/sin with seq_len > 1 exercises stride_cos_batch * stride_cos_seq interaction."""
+        batch, heads, kv_heads, seq_len, head_dim = 2, 4, 2, 4, 64
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float32, device="cuda")
+        k = torch.randn(batch, kv_heads, seq_len, head_dim, dtype=torch.float32, device="cuda")
+
+        max_pos = 64
+        cos_full, sin_full = build_rope_cos_sin(head_dim, max_pos)
+        cos_full = cos_full.to(device="cuda")
+        sin_full = sin_full.to(device="cuda")
+
+        # Batch 0 at positions [5,6,7,8], batch 1 at positions [20,21,22,23]
+        positions = torch.tensor([[5, 6, 7, 8], [20, 21, 22, 23]], device="cuda")
+        cos_3d = cos_full[positions]  # [2, 4, head_dim]
+        sin_3d = sin_full[positions]
+
+        q_tri, k_tri = triton_apply_rope(q, k, cos_3d, sin_3d)
+
+        # Compare per batch element against 2D reference
+        for i in range(batch):
+            cos_2d = cos_full[positions[i]]  # [4, head_dim]
+            sin_2d = sin_full[positions[i]]
+            q_ref_i, k_ref_i = _pytorch_apply_rope(q[i : i + 1], k[i : i + 1], cos_2d, sin_2d)
+            _assert_close(q_tri[i : i + 1], q_ref_i, torch.float32)
+            _assert_close(k_tri[i : i + 1], k_ref_i, torch.float32)
+
+    def test_rope_3d_rejects_invalid_shapes(self) -> None:
+        """Wrapper rejects 1D and 4D cos/sin."""
+        q = torch.randn(1, 4, 1, 64, device="cuda")
+        k = torch.randn(1, 2, 1, 64, device="cuda")
+        cos_1d = torch.randn(64, device="cuda")
+        sin_1d = torch.randn(64, device="cuda")
+        with pytest.raises(ValueError, match=r"2-D.*or 3-D"):
+            triton_apply_rope(q, k, cos_1d, sin_1d)
+
+    def test_rope_mismatched_cos_sin_ndim(self) -> None:
+        """Wrapper rejects cos and sin with different ndim."""
+        q = torch.randn(1, 4, 1, 64, device="cuda")
+        k = torch.randn(1, 2, 1, 64, device="cuda")
+        cos_2d = torch.randn(1, 64, device="cuda")
+        sin_3d = torch.randn(1, 1, 64, device="cuda")
+        with pytest.raises(ValueError, match="same number of dimensions"):
+            triton_apply_rope(q, k, cos_2d, sin_3d)
+
 
 # ---------------------------------------------------------------------------
 # Fused residual + RMSNorm tests

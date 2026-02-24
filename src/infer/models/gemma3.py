@@ -35,7 +35,7 @@ from infer.kernels.rms_norm import triton_rms_norm
 from infer.loader.config import ModelConfig
 
 if TYPE_CHECKING:
-    from infer.cache.simple import KVCache
+    from infer.cache.protocol import KVCacheProtocol
 from infer.models.common import (
     Attention,
     GatedMLP,
@@ -131,7 +131,7 @@ class Gemma3TransformerBlock(nn.Module):
         cos: Tensor,
         sin: Tensor,
         mask: Tensor | None = None,
-        kv_cache: KVCache | None = None,
+        kv_cache: KVCacheProtocol | None = None,
         layer_idx: int = 0,
     ) -> Tensor:
         """Forward pass.
@@ -240,8 +240,9 @@ class Gemma3Model(nn.Module):
     def forward(
         self,
         input_ids: Tensor,
-        kv_cache: KVCache | None = None,
+        kv_cache: KVCacheProtocol | None = None,
         padding_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -252,10 +253,16 @@ class Gemma3Model(nn.Module):
                 ``True`` for real token positions, ``False`` for padding.
                 When provided, combined with the internal causal and
                 sliding-window masks to exclude padding from attention.
+            position_ids: Optional position indices, shape ``[batch, seq_len]``.
+                When provided, RoPE cos/sin are looked up per-sequence instead
+                of using ``kv_cache.seq_len``.  Used for continuous batching
+                decode where sequences are at different positions.
+                When ``None``, behavior is identical to Phase 4.
 
         Returns:
             Logits, shape ``[batch, seq_len, vocab_size]``
-            (``[batch, 1, vocab_size]`` when using cache without padding_mask).
+            (``[batch, 1, vocab_size]`` when using cache without padding_mask
+            and without position_ids).
         """
         x = self.embed_tokens(input_ids)
         x = x * self.embedding_normalizer
@@ -263,16 +270,22 @@ class Gemma3Model(nn.Module):
 
         if kv_cache is not None:
             pos = kv_cache.seq_len
-            if seq_len > 1:
-                assert pos == 0, "Chunked prefill not supported"
 
-            # RoPE tables: offset by current cache position.
-            local_cos = self.local_cos[pos : pos + seq_len]
-            local_sin = self.local_sin[pos : pos + seq_len]
-            global_cos = self.global_cos[pos : pos + seq_len]
-            global_sin = self.global_sin[pos : pos + seq_len]
+            if position_ids is not None:
+                local_cos = self.local_cos[position_ids]
+                local_sin = self.local_sin[position_ids]
+                global_cos = self.global_cos[position_ids]
+                global_sin = self.global_sin[position_ids]
+            else:
+                if seq_len > 1:
+                    assert pos == 0, "Chunked prefill not supported"
+                # RoPE tables: offset by current cache position.
+                local_cos = self.local_cos[pos : pos + seq_len]
+                local_sin = self.local_sin[pos : pos + seq_len]
+                global_cos = self.global_cos[pos : pos + seq_len]
+                global_sin = self.global_sin[pos : pos + seq_len]
 
-            if padding_mask is not None:
+            if padding_mask is not None or position_ids is not None:
                 kv_len = pos + seq_len
                 if seq_len > 1:
                     # Prefill: expand masks to batch dimension, then add padding.
@@ -299,12 +312,13 @@ class Gemma3Model(nn.Module):
                     cutoff = max(0, kv_len - self.sliding_window)
                     if cutoff > 0:
                         local_mask[:, :, :, :cutoff] = float("-inf")
-                # Apply padding to both masks.
-                pad_mask = ~padding_mask[:, None, None, :kv_len]
-                local_mask.masked_fill_(pad_mask, float("-inf"))
-                global_mask.masked_fill_(pad_mask, float("-inf"))
+                if padding_mask is not None:
+                    # Apply padding to both masks.
+                    pad_mask = ~padding_mask[:, None, None, :kv_len]
+                    local_mask.masked_fill_(pad_mask, float("-inf"))
+                    global_mask.masked_fill_(pad_mask, float("-inf"))
             elif seq_len == 1:
-                # Single-token decode (no padding).
+                # Single-token decode (no padding, no position_ids).
                 cached_len = pos + 1
                 global_mask = None
                 cutoff = max(0, cached_len - self.sliding_window)
@@ -314,7 +328,7 @@ class Gemma3Model(nn.Module):
                 else:
                     local_mask = None
             else:
-                # Prefill (no padding): standard masks.
+                # Prefill (no padding, no position_ids): standard masks.
                 local_mask = sliding_window_causal_mask(
                     seq_len, self.sliding_window, dtype=x.dtype, device=x.device
                 )
@@ -337,7 +351,7 @@ class Gemma3Model(nn.Module):
 
         if kv_cache is not None:
             kv_cache.advance(seq_len)
-            if padding_mask is None:
+            if padding_mask is None and position_ids is None:
                 x = x[:, -1:, :]
 
         x = self.norm(x)

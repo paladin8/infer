@@ -14,7 +14,7 @@ from infer.kernels.rms_norm import triton_rms_norm
 from infer.kernels.rope import triton_apply_rope
 
 if TYPE_CHECKING:
-    from infer.cache.simple import KVCache
+    from infer.cache.protocol import KVCacheProtocol
 
 
 class RMSNorm(nn.Module):
@@ -215,7 +215,7 @@ class Attention(nn.Module):
         cos: Tensor,
         sin: Tensor,
         mask: Tensor | None = None,
-        kv_cache: KVCache | None = None,
+        kv_cache: KVCacheProtocol | None = None,
         layer_idx: int = 0,
     ) -> Tensor:
         """Forward pass.

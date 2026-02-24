@@ -23,7 +23,7 @@ from infer.kernels.fused_norm_residual import triton_fused_residual_rms_norm
 from infer.loader.config import ModelConfig
 
 if TYPE_CHECKING:
-    from infer.cache.simple import KVCache
+    from infer.cache.protocol import KVCacheProtocol
 from infer.models.common import (
     Attention,
     GatedMLP,
@@ -78,7 +78,7 @@ class LlamaTransformerBlock(nn.Module):
         cos: Tensor,
         sin: Tensor,
         mask: Tensor | None = None,
-        kv_cache: KVCache | None = None,
+        kv_cache: KVCacheProtocol | None = None,
         layer_idx: int = 0,
     ) -> Tensor:
         """Forward pass.
@@ -155,8 +155,9 @@ class LlamaModel(nn.Module):
     def forward(
         self,
         input_ids: Tensor,
-        kv_cache: KVCache | None = None,
+        kv_cache: KVCacheProtocol | None = None,
         padding_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -167,10 +168,16 @@ class LlamaModel(nn.Module):
                 ``True`` for real token positions, ``False`` for padding.
                 When provided, combined with the internal causal mask to
                 exclude padding from attention.
+            position_ids: Optional position indices, shape ``[batch, seq_len]``.
+                When provided, RoPE cos/sin are looked up per-sequence instead
+                of using ``kv_cache.seq_len``.  Used for continuous batching
+                decode where sequences are at different positions.
+                When ``None``, behavior is identical to Phase 4.
 
         Returns:
             Logits, shape ``[batch, seq_len, vocab_size]``
-            (``[batch, 1, vocab_size]`` when using cache without padding_mask).
+            (``[batch, 1, vocab_size]`` when using cache without padding_mask
+            and without position_ids).
         """
         x = self.embed_tokens(input_ids)
         batch_size, seq_len, _ = x.shape
@@ -178,20 +185,26 @@ class LlamaModel(nn.Module):
         mask: Tensor | None
         if kv_cache is not None:
             pos = kv_cache.seq_len
-            if seq_len > 1:
-                assert pos == 0, "Chunked prefill not supported"
-            cos = self.cos[pos : pos + seq_len]
-            sin = self.sin[pos : pos + seq_len]
 
-            if padding_mask is not None:
+            if position_ids is not None:
+                cos = self.cos[position_ids]  # [batch, seq_len, head_dim]
+                sin = self.sin[position_ids]
+            else:
+                if seq_len > 1:
+                    assert pos == 0, "Chunked prefill not supported"
+                cos = self.cos[pos : pos + seq_len]
+                sin = self.sin[pos : pos + seq_len]
+
+            if padding_mask is not None or position_ids is not None:
                 kv_len = pos + seq_len
                 if seq_len > 1:
                     mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
                     mask = mask.expand(batch_size, -1, -1, -1).clone()
                 else:
                     mask = torch.zeros(batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device)
-                pad_mask = ~padding_mask[:, None, None, :kv_len]
-                mask.masked_fill_(pad_mask, float("-inf"))
+                if padding_mask is not None:
+                    pad_mask = ~padding_mask[:, None, None, :kv_len]
+                    mask.masked_fill_(pad_mask, float("-inf"))
             else:
                 mask = (
                     None if seq_len == 1 else causal_mask(seq_len, dtype=x.dtype, device=x.device)
@@ -206,7 +219,7 @@ class LlamaModel(nn.Module):
 
         if kv_cache is not None:
             kv_cache.advance(seq_len)
-            if padding_mask is None:
+            if padding_mask is None and position_ids is None:
                 x = x[:, -1:, :]
 
         x = self.norm(x)

@@ -28,8 +28,8 @@ from torch import Tensor
 def _rope_kernel(
     Q,  # [batch, num_heads, seq_len, head_dim]
     K,  # [batch, num_kv_heads, seq_len, head_dim]
-    COS,  # [seq_len, head_dim]
-    SIN,  # [seq_len, head_dim]
+    COS,  # [seq_len, head_dim] or [batch, seq_len, head_dim]
+    SIN,  # [seq_len, head_dim] or [batch, seq_len, head_dim]
     Q_OUT,
     K_OUT,
     stride_q_batch,
@@ -44,6 +44,7 @@ def _rope_kernel(
     stride_ko_batch,
     stride_ko_head,
     stride_ko_seq,
+    stride_cos_batch,  # 0 for 2D cos/sin (broadcast), real stride for 3D
     stride_cos_seq,
     seq_len,
     num_q_heads,
@@ -80,7 +81,7 @@ def _rope_kernel(
         IN = K
         OUT = K_OUT
 
-    cos_offset = seq_idx * stride_cos_seq
+    cos_offset = batch_idx * stride_cos_batch + seq_idx * stride_cos_seq
 
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < HALF_DIM
@@ -117,8 +118,9 @@ def triton_apply_rope(
     Args:
         q: Query tensor ``[batch, num_heads, seq_len, head_dim]``.
         k: Key tensor ``[batch, num_kv_heads, seq_len, head_dim]``.
-        cos: Cosine table ``[seq_len, head_dim]``.
-        sin: Sine table ``[seq_len, head_dim]``.
+        cos: Cosine table ``[seq_len, head_dim]`` (broadcast across batch)
+            or ``[batch, seq_len, head_dim]`` (per-sequence positions).
+        sin: Sine table, same shape options as ``cos``.
 
     Returns:
         ``(q_rotated, k_rotated)`` with the same shapes and dtypes as inputs.
@@ -127,15 +129,21 @@ def triton_apply_rope(
         raise ValueError(f"q must be 4-D [batch, heads, seq, head_dim], got shape {q.shape}")
     if k.ndim != 4:
         raise ValueError(f"k must be 4-D [batch, heads, seq, head_dim], got shape {k.shape}")
-    if cos.ndim != 2:
+    if cos.ndim == 2:
+        # Phase 4 path: [seq_len, head_dim], broadcast across batch.
+        stride_cos_batch = 0
+    elif cos.ndim == 3:
+        # Phase 5 path: [batch, seq_len, head_dim], per-sequence positions.
+        stride_cos_batch = cos.stride(0)
+    else:
         raise ValueError(
-            f"cos must be 2-D [seq_len, head_dim], got shape {cos.shape}. "
-            "Did you forget to squeeze the batch dimension?"
+            f"cos must be 2-D [seq_len, head_dim] or 3-D [batch, seq_len, head_dim], "
+            f"got shape {cos.shape}"
         )
-    if sin.ndim != 2:
+    if sin.ndim != cos.ndim:
         raise ValueError(
-            f"sin must be 2-D [seq_len, head_dim], got shape {sin.shape}. "
-            "Did you forget to squeeze the batch dimension?"
+            f"cos and sin must have the same number of dimensions, "
+            f"got cos {cos.shape} and sin {sin.shape}"
         )
     if q.stride(-1) != 1:
         raise ValueError(
@@ -178,7 +186,8 @@ def triton_apply_rope(
         k_out.stride(0),
         k_out.stride(1),
         k_out.stride(2),
-        cos.stride(0),
+        stride_cos_batch,
+        cos.stride(-2),  # stride_cos_seq: works for both 2D (dim 0) and 3D (dim 1)
         seq_len,
         num_heads,
         total_heads,
