@@ -76,10 +76,31 @@ class TestEngineConfigValidation:
         cfg = EngineConfig(model="m", batching_mode="continuous")
         assert cfg.batching_mode == "continuous"
 
-    def test_paged_kv_cache_backend_rejected(self) -> None:
-        """Phase 6 value is not yet supported."""
-        with pytest.raises(ValueError, match="kv_cache_backend"):
-            EngineConfig(model="m", kv_cache_backend="paged")
+    def test_paged_kv_cache_backend_accepted(self) -> None:
+        cfg = EngineConfig(model="m", kv_cache_backend="paged", batching_mode="continuous")
+        assert cfg.kv_cache_backend == "paged"
+
+    def test_paged_requires_continuous_batching(self) -> None:
+        with pytest.raises(ValueError, match="batching_mode='continuous'"):
+            EngineConfig(model="m", kv_cache_backend="paged", batching_mode="static")
+
+    def test_paged_invalid_block_size(self) -> None:
+        with pytest.raises(ValueError, match="block_size must be >= 1"):
+            EngineConfig(
+                model="m",
+                kv_cache_backend="paged",
+                batching_mode="continuous",
+                block_size=0,
+            )
+
+    def test_paged_invalid_num_gpu_blocks(self) -> None:
+        with pytest.raises(ValueError, match="num_gpu_blocks must be >= 1"):
+            EngineConfig(
+                model="m",
+                kv_cache_backend="paged",
+                batching_mode="continuous",
+                num_gpu_blocks=0,
+            )
 
     def test_invalid_dtype(self) -> None:
         with pytest.raises(ValueError, match="dtype"):

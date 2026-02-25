@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 _VALID_BATCHING_MODES = {"static", "continuous"}
 _VALID_SCHEDULER_POLICIES = {"fcfs"}
-_VALID_KV_CACHE_BACKENDS = {"contiguous"}  # Phase 6 adds "paged"
+_VALID_KV_CACHE_BACKENDS = {"contiguous", "paged"}
 _VALID_DTYPES = {"bfloat16", "float16"}
 
 
@@ -41,8 +41,12 @@ class EngineConfig:
     scheduler_policy: str = "fcfs"
     batch_wait_timeout_s: float = 0.05
 
-    # KV cache backend — Phase 6 adds "paged".
+    # KV cache backend.
     kv_cache_backend: str = "contiguous"
+
+    # Paged backend configuration.
+    block_size: int = 16  # tokens per KV cache block (paged backend only)
+    num_gpu_blocks: int | None = None  # total blocks; None = auto-compute
 
     def __post_init__(self) -> None:
         self.validate()
@@ -76,3 +80,10 @@ class EngineConfig:
             raise ValueError(f"max_seq_len must be >= 1, got {self.max_seq_len}")
         if self.batch_wait_timeout_s < 0:
             raise ValueError(f"batch_wait_timeout_s must be >= 0, got {self.batch_wait_timeout_s}")
+        if self.kv_cache_backend == "paged":
+            if self.batching_mode != "continuous":
+                raise ValueError("Paged KV cache requires batching_mode='continuous'")
+            if self.block_size < 1:
+                raise ValueError(f"block_size must be >= 1, got {self.block_size}")
+            if self.num_gpu_blocks is not None and self.num_gpu_blocks < 1:
+                raise ValueError(f"num_gpu_blocks must be >= 1, got {self.num_gpu_blocks}")

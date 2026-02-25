@@ -1,10 +1,12 @@
-"""Model runner for continuous batching with slotted KV cache."""
+"""Model runner for continuous batching (slotted and paged KV cache)."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
+from infer.cache.paged import PagedKVCachePool
+from infer.cache.protocol import CachePoolProtocol
 from infer.cache.slotted import SlottedKVCache
 from infer.engine.config import EngineConfig
 from infer.engine.request import Request, RequestState, StepOutput
@@ -20,8 +22,8 @@ from infer.loader.tokenizer import Tokenizer
 class ContinuousRunner:
     """Executes forward passes for continuous batching.
 
-    Manages a pre-allocated :class:`SlottedKVCache` pool.  Each engine step
-    runs:
+    Manages a :class:`CachePoolProtocol`-typed pool (slotted or paged).
+    Each engine step runs:
 
     1. Batched decode for all active decode requests.
     2. Individual prefill for each newly admitted request.
@@ -43,17 +45,30 @@ class ContinuousRunner:
         self.config = config
         self.dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[config.dtype]
 
-        # Pre-allocate cache pool at startup.
         model_config = getattr(model, "config", None)
         if model_config is None:
             raise TypeError("model must have a .config attribute")
-        self.cache_pool = SlottedKVCache.from_model_config(
-            model_config,
-            max_seq_len=config.max_seq_len,
-            max_batch_size=config.max_batch_size,
-            dtype=self.dtype,
-            device=config.device,
-        )
+
+        # Dispatch cache pool creation based on backend.
+        if config.kv_cache_backend == "paged":
+            num_gpu_blocks = config.num_gpu_blocks
+            if num_gpu_blocks is None:
+                num_gpu_blocks = config.max_batch_size * config.max_seq_len // config.block_size
+            self.cache_pool: CachePoolProtocol = PagedKVCachePool.from_model_config(
+                model_config,
+                total_blocks=num_gpu_blocks,
+                block_size=config.block_size,
+                dtype=self.dtype,
+                device=config.device,
+            )
+        else:
+            self.cache_pool = SlottedKVCache.from_model_config(
+                model_config,
+                max_seq_len=config.max_seq_len,
+                max_batch_size=config.max_batch_size,
+                dtype=self.dtype,
+                device=config.device,
+            )
 
         # Per-request text tracking, keyed by request_id.
         self._prev_text_lens: dict[str, int] = {}
@@ -87,12 +102,16 @@ class ContinuousRunner:
         return outputs
 
     def free_slot(self, slot_idx: int) -> None:
-        """Release a cache slot and clean up tracking state."""
+        """Release a cache slot and clean up associated resources."""
         self.cache_pool.free_slot(slot_idx)
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request tracking state."""
         self._prev_text_lens.pop(request_id, None)
+
+    def free_kv_tokens(self) -> int | None:
+        """Return available token capacity, or None for contiguous backend."""
+        return self.cache_pool.free_token_capacity()
 
     @torch.inference_mode()
     def _prefill_one(self, req: Request) -> StepOutput:
@@ -100,7 +119,7 @@ class ContinuousRunner:
         device = self.config.device
 
         # Allocate a cache slot.
-        slot = self.cache_pool.allocate_slot()
+        slot = self.cache_pool.allocate_slot(initial_tokens=len(req.prompt_token_ids))
         req.slot_idx = slot
 
         # Build input tensor [1, prompt_len].
@@ -148,7 +167,7 @@ class ContinuousRunner:
         # Allocate cache slots for all requests.
         slots: list[int] = []
         for req in requests:
-            slot = self.cache_pool.allocate_slot()
+            slot = self.cache_pool.allocate_slot(initial_tokens=len(req.prompt_token_ids))
             req.slot_idx = slot
             slots.append(slot)
 

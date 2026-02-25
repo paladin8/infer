@@ -9,7 +9,9 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from infer.cache.paged import PagedKVCachePool
 from infer.cache.protocol import KVCacheProtocol
+from infer.cache.slotted import SlottedKVCache
 from infer.engine.config import EngineConfig
 from infer.engine.continuous_runner import ContinuousRunner
 from infer.engine.request import Request, RequestState
@@ -577,6 +579,7 @@ class TestCachePoolInit:
         runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
 
         assert runner.cache_pool.free_slot_count() == 4
+        assert isinstance(runner.cache_pool, SlottedKVCache)
         assert runner.cache_pool.k.shape[1] == 4  # max_batch_size
         assert runner.cache_pool.k.shape[3] == 64  # max_seq_len
 
@@ -764,8 +767,8 @@ class TestBatchedPrefill:
         # seq_lens should be actual prompt lengths, not padded (3).
         assert r1.slot_idx is not None
         assert r2.slot_idx is not None
-        assert runner.cache_pool.seq_lens[r1.slot_idx] == 3
-        assert runner.cache_pool.seq_lens[r2.slot_idx] == 2
+        assert runner.cache_pool.get_seq_len(r1.slot_idx) == 3
+        assert runner.cache_pool.get_seq_len(r2.slot_idx) == 2
 
     def test_single_prefill_uses_individual_path(self) -> None:
         """Single request still uses individual prefill (no padding overhead)."""
@@ -858,3 +861,230 @@ class TestBatchedPrefill:
         pos = model.last_position_ids.squeeze(1).tolist()
         assert pos[0] == 3
         assert pos[1] == 5
+
+
+# ---------------------------------------------------------------------------
+# Paged backend dispatch and integration
+# ---------------------------------------------------------------------------
+
+
+def _make_paged_config(**overrides: object) -> EngineConfig:
+    defaults: dict[str, object] = {
+        "model": "test-model",
+        "device": "cpu",
+        "dtype": "float16",
+        "max_seq_len": 128,
+        "max_batch_size": 8,
+        "batching_mode": "continuous",
+        "kv_cache_backend": "paged",
+        "block_size": 8,
+    }
+    defaults.update(overrides)
+    return EngineConfig(**defaults)  # type: ignore[arg-type]
+
+
+class TestPagedBackendDispatch:
+    def test_paged_creates_paged_pool(self) -> None:
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert isinstance(runner.cache_pool, PagedKVCachePool)
+        assert runner.cache_pool.is_paged() is True
+
+    def test_contiguous_creates_slotted_pool(self) -> None:
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert isinstance(runner.cache_pool, SlottedKVCache)
+        assert runner.cache_pool.is_paged() is False
+
+    def test_auto_compute_blocks(self) -> None:
+        """num_gpu_blocks=None auto-computes from max_batch_size * max_seq_len // block_size."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=None
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert isinstance(runner.cache_pool, PagedKVCachePool)
+        # 4 * 64 // 8 = 32 blocks → 32 * 8 = 256 tokens capacity
+        assert runner.cache_pool.free_token_capacity() == 256
+
+    def test_explicit_num_gpu_blocks(self) -> None:
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=10
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert isinstance(runner.cache_pool, PagedKVCachePool)
+        # 10 blocks * 8 tokens/block = 80 tokens
+        assert runner.cache_pool.free_token_capacity() == 80
+
+
+class TestFreeKvTokens:
+    def test_contiguous_returns_none(self) -> None:
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_config()
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert runner.free_kv_tokens() is None
+
+    def test_paged_returns_int(self) -> None:
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=10
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        cap = runner.free_kv_tokens()
+        assert isinstance(cap, int)
+        assert cap == 80  # 10 blocks * 8 tokens
+
+    def test_paged_capacity_decreases_after_prefill(self) -> None:
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=10
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        initial_cap = runner.free_kv_tokens()
+        assert initial_cap is not None
+
+        req = _make_request("r1", [1, 2, 3, 4, 5])  # 5 tokens → ceil(5/8)=1 block
+        runner.step(prefill=[req], decode=[])
+
+        after_cap = runner.free_kv_tokens()
+        assert after_cap is not None
+        assert after_cap < initial_cap
+
+
+class TestPagedInitialTokens:
+    def test_prefill_one_allocates_blocks(self) -> None:
+        """Single prefill with paged backend eagerly allocates blocks."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=20
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert isinstance(runner.cache_pool, PagedKVCachePool)
+        initial_free = runner.cache_pool.allocator.num_free()
+
+        # Prompt of 10 tokens → ceil(10/8) = 2 blocks allocated.
+        req = _make_request("r1", list(range(10)))
+        runner.step(prefill=[req], decode=[])
+
+        assert runner.cache_pool.allocator.num_free() == initial_free - 2
+
+    def test_prefill_batch_allocates_blocks(self) -> None:
+        """Batched prefill with paged backend eagerly allocates blocks per request."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=20
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        assert isinstance(runner.cache_pool, PagedKVCachePool)
+        initial_free = runner.cache_pool.allocator.num_free()
+
+        # r1: 10 tokens → 2 blocks, r2: 3 tokens → 1 block → 3 blocks total.
+        r1 = _make_request("r1", list(range(10)))
+        r2 = _make_request("r2", list(range(3)))
+        runner.step(prefill=[r1, r2], decode=[])
+
+        assert runner.cache_pool.allocator.num_free() == initial_free - 3
+
+
+class TestPagedPrefillAndDecode:
+    def test_basic_prefill_then_decode(self) -> None:
+        """Full prefill → decode cycle with paged backend."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=20
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        req = _make_request("r1", [1, 2, 3], max_new_tokens=3)
+        outputs = runner.step(prefill=[req], decode=[])
+        assert len(outputs) == 1
+        _, out = outputs[0]
+        assert out.token_id == 7
+        assert req.state is RequestState.DECODE
+
+        # Decode step.
+        outputs = runner.step(prefill=[], decode=[req])
+        assert len(outputs) == 1
+        _, out = outputs[0]
+        assert out.token_id == 7
+
+    def test_batched_prefill_then_decode(self) -> None:
+        """Batched prefill → batched decode with paged backend."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=20
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        r1 = _make_request("r1", [1, 2, 3], max_new_tokens=3)
+        r2 = _make_request("r2", [4, 5], max_new_tokens=3)
+        runner.step(prefill=[r1, r2], decode=[])
+
+        assert r1.state is RequestState.DECODE
+        assert r2.state is RequestState.DECODE
+
+        outputs = runner.step(prefill=[], decode=[r1, r2])
+        assert len(outputs) == 2
+        for _, out in outputs:
+            assert out.token_id == 7
+
+    def test_seq_lens_correct_after_paged_prefill(self) -> None:
+        """Paged pool tracks seq_lens correctly after prefill."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=20
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        r1 = _make_request("r1", [1, 2, 3])  # 3 tokens
+        r2 = _make_request("r2", [4, 5])  # 2 tokens
+        runner.step(prefill=[r1, r2], decode=[])
+
+        assert r1.slot_idx is not None
+        assert r2.slot_idx is not None
+        assert runner.cache_pool.get_seq_len(r1.slot_idx) == 3
+        assert runner.cache_pool.get_seq_len(r2.slot_idx) == 2
+
+    def test_free_slot_restores_capacity(self) -> None:
+        """Freeing a paged slot returns blocks to the allocator."""
+        model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        tokenizer = MockTokenizer()
+        config = _make_paged_config(
+            max_batch_size=4, max_seq_len=64, block_size=8, num_gpu_blocks=20
+        )
+        runner = ContinuousRunner(model, tokenizer, config)  # type: ignore[arg-type]
+
+        initial_cap = runner.free_kv_tokens()
+        assert initial_cap is not None
+
+        req = _make_request("r1", list(range(10)))
+        runner.step(prefill=[req], decode=[])
+        assert runner.free_kv_tokens() < initial_cap  # type: ignore[operator]
+
+        assert req.slot_idx is not None
+        runner.free_slot(req.slot_idx)
+        assert runner.free_kv_tokens() == initial_cap

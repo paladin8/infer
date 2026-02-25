@@ -1445,7 +1445,7 @@ src/infer/
 │   │                           #           is_paged() to all slotted views
 │   └── paged.py                # NEW: BlockAllocator, PagedKVCachePool, paged views
 ├── engine/
-│   ├── __init__.py             # MODIFIED: export updated types
+│   ├── __init__.py             # UNCHANGED
 │   ├── config.py               # MODIFIED: add block_size, num_gpu_blocks, "paged" backend
 │   ├── request.py              # UNCHANGED
 │   ├── scheduler.py            # MODIFIED: add retire/admit/decode_requests methods
@@ -1482,7 +1482,8 @@ tests/
 │   ├── test_paged_attention_kernel.py  # NEW (optional): Triton kernel correctness
 │   ├── test_continuous_scheduler.py    # MODIFIED: test retire/admit/decode_requests
 │   ├── test_continuous_runner.py       # MODIFIED: test paged backend path
-│   └── test_engine_config.py   # MODIFIED: test paged backend validation
+│   ├── test_engine_config.py   # MODIFIED: test paged backend validation
+│   └── test_engine.py          # MODIFIED: test paged engine, mixed error handling
 ├── integration/
 │   ├── test_api.py             # MODIFIED: add paged backend API tests
 │   └── test_logits_parity.py   # MODIFIED: verify paged cache doesn't break parity

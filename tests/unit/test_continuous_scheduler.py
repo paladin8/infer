@@ -265,6 +265,218 @@ class TestEmptyScheduleOutput:
         assert out.decode == []
 
 
+class TestSplitInterface:
+    """Tests for the retire() → admit() → decode_requests() split interface."""
+
+    def test_retire_returns_finished(self) -> None:
+        sched = ContinuousScheduler(_make_config(max_batch_size=4))
+        a, b = _make_request("a"), _make_request("b")
+        for r in [a, b]:
+            sched.add_request(r)
+        sched.schedule()  # admit both
+        a.state = RequestState.DECODE
+        b.state = RequestState.DECODE
+
+        a.state = RequestState.FINISHED
+        retired = sched.retire()
+        assert [r.request_id for r in retired] == ["a"]
+        assert len(sched.active) == 1
+
+    def test_admit_no_budget_contiguous(self) -> None:
+        """admit(free_kv_tokens=None) checks only compute budget."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=2))
+        a, b, c = _make_request("a"), _make_request("b"), _make_request("c")
+        for r in [a, b, c]:
+            sched.add_request(r)
+
+        new = sched.admit(free_kv_tokens=None)
+        assert [r.request_id for r in new] == ["a", "b"]
+        assert len(sched.waiting) == 1
+
+    def test_admit_with_block_budget(self) -> None:
+        """admit(free_kv_tokens=N) limits by 80% of available tokens."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=10))
+        # Request with prompt_len=3 tokens each.
+        a = _make_request("a", prompt_len=3)
+        b = _make_request("b", prompt_len=3)
+        c = _make_request("c", prompt_len=3)
+        for r in [a, b, c]:
+            sched.add_request(r)
+
+        # 10 free tokens → 80% = 8 usable → admits a (3) and b (3), 2 remaining.
+        new = sched.admit(free_kv_tokens=10)
+        assert [r.request_id for r in new] == ["a", "b"]
+        assert len(sched.waiting) == 1
+
+    def test_admit_budget_too_small_for_first(self) -> None:
+        """If the first request exceeds the budget, nothing is admitted."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=10))
+        a = _make_request("a", prompt_len=10)
+        sched.add_request(a)
+
+        # 10 free tokens → 80% = 8, but prompt is 10.
+        new = sched.admit(free_kv_tokens=10)
+        assert new == []
+        assert len(sched.waiting) == 1
+
+    def test_decode_requests_returns_only_decode_state(self) -> None:
+        sched = ContinuousScheduler(_make_config(max_batch_size=4))
+        a, b = _make_request("a"), _make_request("b")
+        for r in [a, b]:
+            sched.add_request(r)
+        sched.admit()  # admit both (WAITING state)
+
+        # Only a is in DECODE state.
+        a.state = RequestState.DECODE
+
+        decode = sched.decode_requests()
+        assert [r.request_id for r in decode] == ["a"]
+
+    def test_split_matches_combined_for_contiguous(self) -> None:
+        """Split interface produces same results as combined schedule()."""
+        sched1 = ContinuousScheduler(_make_config(max_batch_size=4))
+        sched2 = ContinuousScheduler(_make_config(max_batch_size=4))
+        a1, b1 = _make_request("a"), _make_request("b")
+        a2 = _make_request("a")
+        b2 = _make_request("b")
+        a2.prompt_token_ids = a1.prompt_token_ids
+        b2.prompt_token_ids = b1.prompt_token_ids
+
+        for r in [a1, b1]:
+            sched1.add_request(r)
+        for r in [a2, b2]:
+            sched2.add_request(r)
+
+        # Combined.
+        out = sched1.schedule()
+
+        # Split.
+        retired = sched2.retire()
+        prefill = sched2.admit(free_kv_tokens=None)
+        decode = sched2.decode_requests()
+
+        assert [r.request_id for r in out.retired] == [r.request_id for r in retired]
+        assert [r.request_id for r in out.prefill] == [r.request_id for r in prefill]
+        assert [r.request_id for r in out.decode] == [r.request_id for r in decode]
+
+    def test_full_retire_free_admit_cycle(self) -> None:
+        """Simulate the full retire → free → admit cycle the engine uses."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=2))
+        a, b, c = _make_request("a"), _make_request("b"), _make_request("c", prompt_len=5)
+        for r in [a, b, c]:
+            sched.add_request(r)
+
+        # Step 1: admit a, b.
+        sched.retire()
+        prefill = sched.admit(free_kv_tokens=None)
+        assert [r.request_id for r in prefill] == ["a", "b"]
+        a.state = RequestState.DECODE
+        b.state = RequestState.DECODE
+
+        # Step 2: a finishes, c admitted with budget.
+        a.state = RequestState.FINISHED
+        retired = sched.retire()
+        assert [r.request_id for r in retired] == ["a"]
+
+        # Simulate: engine frees a's blocks, queries budget.
+        new = sched.admit(free_kv_tokens=100)
+        assert [r.request_id for r in new] == ["c"]
+
+        decode = sched.decode_requests()
+        assert [r.request_id for r in decode] == ["b"]
+
+
+class TestSplitInterfaceBoundary:
+    """Boundary conditions for the split interface methods."""
+
+    def test_admit_zero_budget_admits_nothing(self) -> None:
+        """free_kv_tokens=0 → 80% of 0 = 0 → no request can fit."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=10))
+        sched.add_request(_make_request("a", prompt_len=1))
+
+        new = sched.admit(free_kv_tokens=0)
+        assert new == []
+        assert len(sched.waiting) == 1
+
+    def test_admit_exact_budget_exhaustion(self) -> None:
+        """Budget exactly consumed — next request blocked."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=10))
+        # 10 free tokens → 80% = 8 usable. Two requests of 4 each = exactly 8.
+        a = _make_request("a", prompt_len=4)
+        b = _make_request("b", prompt_len=4)
+        c = _make_request("c", prompt_len=1)
+        for r in [a, b, c]:
+            sched.add_request(r)
+
+        new = sched.admit(free_kv_tokens=10)
+        assert [r.request_id for r in new] == ["a", "b"]
+        assert len(sched.waiting) == 1  # c still waiting
+
+    def test_head_of_line_blocking(self) -> None:
+        """A large first request blocks smaller ones behind it."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=10))
+        big = _make_request("big", prompt_len=20)
+        small = _make_request("small", prompt_len=1)
+        for r in [big, small]:
+            sched.add_request(r)
+
+        # 10 tokens → 80% = 8, big needs 20 → blocks, small not admitted either.
+        new = sched.admit(free_kv_tokens=10)
+        assert new == []
+        assert len(sched.waiting) == 2
+
+    def test_retire_empty_active(self) -> None:
+        """retire() on empty active list returns empty."""
+        sched = ContinuousScheduler(_make_config())
+        assert sched.retire() == []
+
+    def test_retire_all_non_terminal(self) -> None:
+        """retire() when all active are DECODE returns empty, active unchanged."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=4))
+        a, b = _make_request("a"), _make_request("b")
+        for r in [a, b]:
+            sched.add_request(r)
+        sched.admit()
+        a.state = RequestState.DECODE
+        b.state = RequestState.DECODE
+
+        retired = sched.retire()
+        assert retired == []
+        assert len(sched.active) == 2
+
+    def test_decode_requests_empty_active(self) -> None:
+        sched = ContinuousScheduler(_make_config())
+        assert sched.decode_requests() == []
+
+    def test_decode_requests_excludes_prefill_and_finished(self) -> None:
+        """Only DECODE state passes through, not PREFILL/WAITING/FINISHED."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=4))
+        a, b, c = _make_request("a"), _make_request("b"), _make_request("c")
+        for r in [a, b, c]:
+            sched.add_request(r)
+        sched.admit()
+
+        a.state = RequestState.DECODE
+        b.state = RequestState.PREFILL
+        c.state = RequestState.FINISHED
+
+        decode = sched.decode_requests()
+        assert [r.request_id for r in decode] == ["a"]
+
+    def test_admit_allows_exactly_one_when_budget_tight(self) -> None:
+        """Budget allows precisely one request, blocks the next."""
+        sched = ContinuousScheduler(_make_config(max_batch_size=10))
+        a = _make_request("a", prompt_len=3)
+        b = _make_request("b", prompt_len=3)
+        for r in [a, b]:
+            sched.add_request(r)
+
+        # 5 tokens → 80% = 4 usable. a needs 3 → fits, b needs 3 → 1 remaining < 3.
+        new = sched.admit(free_kv_tokens=5)
+        assert [r.request_id for r in new] == ["a"]
+        assert len(sched.waiting) == 1
+
+
 class TestMultipleRetireInOneStep:
     def test_multiple_retirements(self) -> None:
         sched = ContinuousScheduler(_make_config(max_batch_size=4))

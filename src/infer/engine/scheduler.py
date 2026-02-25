@@ -108,15 +108,12 @@ class ScheduleOutput:
 class ContinuousScheduler:
     """Per-step scheduler for continuous batching.
 
-    Each ``schedule()`` call:
-
-    1. Retires finished/failed requests from the active set.
-    2. Counts available capacity (``max_batch_size - active``).
-    3. Admits new requests from the waiting queue up to capacity (FCFS).
-    4. Returns the prefill list, decode list, and retired list.
-
-    No bounded wait timer: requests are admitted immediately when slots are
-    available.  No preemption: active requests run to completion.
+    Phase 6 splits the monolithic ``schedule()`` into ``retire()``,
+    ``admit()``, and ``decode_requests()`` to support the
+    retire → free-blocks → admit-with-budget ordering needed for
+    paged allocation.  Both backends use the split interface.
+    The combined ``schedule()`` is retained for backward compatibility
+    in existing Phase 5 tests.
     """
 
     def __init__(self, config: EngineConfig) -> None:
@@ -134,28 +131,63 @@ class ContinuousScheduler:
         self.waiting.append(request)
         return True
 
-    def schedule(self) -> ScheduleOutput:
-        """Run one scheduling step.
+    def retire(self) -> list[Request]:
+        """Remove finished/failed requests from the active set.
 
-        1. Retire finished/failed requests from the active set.
-        2. Admit up to free capacity from the waiting queue (FCFS).
-        3. Return prefill, decode, and retired lists.
+        Returns the retired list so the engine can free their cache resources
+        before admitting new requests.
         """
-        # 1. Retire finished.
         retired = [r for r in self.active if r.state in _TERMINAL_STATES]
         self.active = [r for r in self.active if r.state not in _TERMINAL_STATES]
+        return retired
 
-        # 2. Admit new requests.
+    def admit(self, free_kv_tokens: int | None = None) -> list[Request]:
+        """Admit new requests from the waiting queue.
+
+        Checks two admission constraints:
+        1. Compute budget: ``len(active) < max_batch_size``.
+        2. Memory budget: cumulative prompt tokens of admitted requests
+           must not exceed 80% of ``free_kv_tokens`` (when provided).
+
+        When ``free_kv_tokens is None`` (contiguous backend), only the
+        compute budget is checked — identical to Phase 5 behavior.
+
+        Returns the list of newly admitted requests (need prefill).
+        """
         capacity = self.config.max_batch_size - len(self.active)
         new: list[Request] = []
+        remaining_tokens = int(free_kv_tokens * 0.8) if free_kv_tokens is not None else None
+
         while self.waiting and len(new) < capacity:
+            req = self.waiting[0]
+            if remaining_tokens is not None:
+                prompt_len = len(req.prompt_token_ids)
+                if prompt_len > remaining_tokens:
+                    break
+                remaining_tokens -= prompt_len
             new.append(self.waiting.popleft())
+
         self.active.extend(new)
+        return new
 
-        # 3. Partition active into decode (already prefilled) and prefill (new).
-        decode = [r for r in self.active if r.state == RequestState.DECODE]
+    def decode_requests(self) -> list[Request]:
+        """Return active requests in DECODE state."""
+        return [r for r in self.active if r.state == RequestState.DECODE]
 
-        return ScheduleOutput(prefill=new, decode=decode, retired=retired)
+    def schedule(self) -> ScheduleOutput:
+        """Combined retire + admit + decode (backward-compatible convenience).
+
+        Equivalent to ``retire()`` then ``admit(free_kv_tokens=None)`` then
+        ``decode_requests()``. Does NOT pass a block budget — only safe for
+        the contiguous backend where token budget is not applicable.
+
+        Retained for backward compatibility with existing Phase 5 tests.
+        The engine always uses the split interface.
+        """
+        retired = self.retire()
+        prefill = self.admit(free_kv_tokens=None)
+        decode = self.decode_requests()
+        return ScheduleOutput(prefill=prefill, decode=decode, retired=retired)
 
     def has_work(self) -> bool:
         """True if there are active or waiting requests."""

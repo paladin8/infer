@@ -155,32 +155,44 @@ class Engine:
             self.runner.clear_batch()
 
     # ------------------------------------------------------------------
-    # Continuous batching step (Phase 5)
+    # Continuous batching step (Phase 5+6)
     # ------------------------------------------------------------------
 
     def _step_continuous(self) -> None:
+        """Engine step for continuous batching (contiguous and paged backends)."""
         assert isinstance(self.scheduler, ContinuousScheduler)
         assert isinstance(self.runner, ContinuousRunner)
 
-        schedule = self.scheduler.schedule()
+        # Phase 1: Retire finished requests.
+        retired = self.scheduler.retire()
 
-        # Free retired slots.
-        for req in schedule.retired:
+        # Phase 2: Free cache resources for retired requests.
+        for req in retired:
             if req.slot_idx is not None:
                 self.runner.free_slot(req.slot_idx)
             self.runner.cleanup_request(req.request_id)
 
-        if not schedule.prefill and not schedule.decode:
+        # Phase 3: Query available memory budget (None for contiguous).
+        free_kv_tokens = self.runner.free_kv_tokens()
+
+        # Phase 4: Admit new requests with budget check.
+        prefill = self.scheduler.admit(free_kv_tokens=free_kv_tokens)
+
+        # Phase 5: Identify decode requests.
+        decode = self.scheduler.decode_requests()
+
+        if not prefill and not decode:
             return
 
+        # Phase 6: Execute forward passes.
         try:
-            outputs = self.runner.step(schedule.prefill, schedule.decode)
+            outputs = self.runner.step(prefill, decode)
             for req, output in outputs:
                 if req.output_queue is not None:
                     req.output_queue.put_nowait(output)
 
         except Exception as exc:
-            for req in schedule.prefill + schedule.decode:
+            for req in prefill + decode:
                 req.state = RequestState.FAILED
                 req.error = str(exc)
                 if req.output_queue is not None:

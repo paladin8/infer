@@ -539,3 +539,168 @@ class TestContinuousErrorHandling:
         # Request should be FAILED.
         assert isinstance(engine.scheduler, ContinuousScheduler)
         assert engine.scheduler.active[0].state is RequestState.FAILED
+
+    def test_mixed_prefill_decode_error_fails_all(self) -> None:
+        """When a forward pass fails with both prefill and decode requests,
+        all requests are marked FAILED and get error output."""
+
+        class FailOnSecondCallModel(nn.Module):
+            """Succeeds on first forward (prefill r1), fails on second (which
+            includes both decode r1 and prefill r2)."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = _MOCK_CONFIG
+                self._dummy = nn.Parameter(torch.zeros(1))
+                self._call_count = 0
+
+            def forward(
+                self,
+                input_ids: Tensor,
+                kv_cache: KVCacheProtocol | None = None,
+                padding_mask: Tensor | None = None,
+                position_ids: Tensor | None = None,
+            ) -> Tensor:
+                self._call_count += 1
+                if self._call_count >= 3:
+                    raise RuntimeError("mock failure on mixed step")
+                batch, seq_len = input_ids.shape
+                if kv_cache is not None:
+                    kv_cache.advance(seq_len)
+                    out_len = 1 if padding_mask is None else seq_len
+                else:
+                    out_len = seq_len
+                logits = torch.zeros(batch, out_len, self.config.vocab_size)
+                logits[:, :, 7] = 10.0
+                return logits
+
+        model = FailOnSecondCallModel()
+        engine = _make_continuous_engine(model=model, max_batch_size=4)
+        q1: asyncio.Queue[StepOutput] = asyncio.Queue()
+        q2: asyncio.Queue[StepOutput] = asyncio.Queue()
+        params = SamplingParams(temperature=0.0, max_new_tokens=5)
+
+        engine.add_request("r1", [1, 2, 3], params, q1)
+        engine.step()  # prefill r1 (call 1 succeeds)
+        out1 = q1.get_nowait()
+        assert out1.finished is False
+
+        # Add r2 so next step has decode(r1) + prefill(r2).
+        engine.add_request("r2", [4, 5], params, q2)
+        engine.step()  # decode r1 (call 2), prefill r2 (call 3 fails)
+
+        # Both should get error output.
+        all_outputs: list[StepOutput] = []
+        while not q1.empty():
+            all_outputs.append(q1.get_nowait())
+        while not q2.empty():
+            all_outputs.append(q2.get_nowait())
+
+        error_outputs = [o for o in all_outputs if o.error is not None]
+        assert len(error_outputs) >= 1
+        assert "mock failure on mixed step" in error_outputs[0].error  # type: ignore[operator]
+
+        # Both requests should be FAILED.
+        assert isinstance(engine.scheduler, ContinuousScheduler)
+        for req in engine.scheduler.active:
+            assert req.state is RequestState.FAILED
+
+
+class TestContinuousPagedEngine:
+    """Engine integration tests with paged KV cache backend."""
+
+    def _make_paged_engine(
+        self,
+        model: nn.Module | None = None,
+        tokenizer: MockTokenizer | None = None,
+        **config_overrides: object,
+    ) -> Engine:
+        if model is None:
+            model = ContinuousMockModel(vocab_size=100, fixed_next_token=7)
+        if tokenizer is None:
+            tokenizer = MockTokenizer()
+        defaults: dict[str, object] = {
+            "kv_cache_backend": "paged",
+            "block_size": 8,
+            "num_gpu_blocks": 20,
+        }
+        defaults.update(config_overrides)
+        config = _make_engine_config(batching_mode="continuous", **defaults)
+        return Engine.from_components(config, model, tokenizer)
+
+    def test_paged_prefill_then_decode(self) -> None:
+        engine = self._make_paged_engine()
+        queue: asyncio.Queue[StepOutput] = asyncio.Queue()
+        params = SamplingParams(temperature=0.0, max_new_tokens=3)
+        engine.add_request("r1", [1, 2, 3], params, queue)
+
+        engine.step()  # prefill
+        out = queue.get_nowait()
+        assert out.token_id == 7
+        assert out.finished is False
+
+        engine.step()  # decode
+        out = queue.get_nowait()
+        assert out.token_id == 7
+
+    def test_paged_completion_frees_blocks(self) -> None:
+        engine = self._make_paged_engine(num_gpu_blocks=20)
+        assert isinstance(engine.runner, ContinuousRunner)
+        initial_cap = engine.runner.free_kv_tokens()
+        assert initial_cap is not None
+
+        queue: asyncio.Queue[StepOutput] = asyncio.Queue()
+        params = SamplingParams(temperature=0.0, max_new_tokens=1)
+        engine.add_request("r1", [1, 2, 3], params, queue)
+
+        engine.step()  # prefill → finishes
+        out = queue.get_nowait()
+        assert out.finished is True
+
+        # Blocks should be allocated (capacity decreased).
+        mid_cap = engine.runner.free_kv_tokens()
+        assert mid_cap is not None
+        assert mid_cap < initial_cap
+
+        engine.step()  # retire → free blocks
+        after_cap = engine.runner.free_kv_tokens()
+        assert after_cap == initial_cap
+
+    def test_paged_retire_admit_cycle(self) -> None:
+        """Paged backend: retire frees blocks, enabling admission of new request."""
+        engine = self._make_paged_engine(max_batch_size=1, num_gpu_blocks=4, block_size=8)
+        q1: asyncio.Queue[StepOutput] = asyncio.Queue()
+        q2: asyncio.Queue[StepOutput] = asyncio.Queue()
+        params = SamplingParams(temperature=0.0, max_new_tokens=1)
+
+        engine.add_request("r1", [1, 2], params, q1)
+        engine.step()  # prefill r1 → finishes
+        assert q1.get_nowait().finished is True
+
+        engine.add_request("r2", [3, 4], params, q2)
+        engine.step()  # retire r1, admit r2, prefill r2
+        out2 = q2.get_nowait()
+        assert out2.request_id == "r2"
+        assert out2.finished is True
+
+    def test_paged_multiple_retire_frees_slots(self) -> None:
+        engine = self._make_paged_engine(max_batch_size=2, num_gpu_blocks=20)
+        q1: asyncio.Queue[StepOutput] = asyncio.Queue()
+        q2: asyncio.Queue[StepOutput] = asyncio.Queue()
+        params = SamplingParams(temperature=0.0, max_new_tokens=1)
+
+        engine.add_request("r1", [1, 2], params, q1)
+        engine.add_request("r2", [3, 4], params, q2)
+        engine.step()  # prefill both → both finish
+
+        assert q1.get_nowait().finished is True
+        assert q2.get_nowait().finished is True
+
+        assert isinstance(engine.runner, ContinuousRunner)
+        initial_cap = engine.runner.free_kv_tokens()
+
+        engine.step()  # retire both → free all blocks
+        after_cap = engine.runner.free_kv_tokens()
+        assert after_cap is not None
+        assert initial_cap is not None
+        assert after_cap > initial_cap
