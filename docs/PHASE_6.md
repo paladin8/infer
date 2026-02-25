@@ -163,11 +163,17 @@ Add `is_paged()` so the Attention class can dispatch to the Triton kernel withou
 
 ```python
 class KVCacheProtocol(Protocol):
-    seq_len: int
+    @property
+    def seq_len(self) -> int:
+        """Current sequence length (read by model for mask width)."""
+        ...
+
     def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]: ...
     def advance(self, n: int) -> None: ...
     def is_paged(self) -> bool: ...  # NEW
 ```
+
+Note: `seq_len` is declared as a read-only `@property` in the protocol rather than a plain `seq_len: int` attribute. This allows implementations to use either a regular attribute (`self.seq_len: int = 0` in prefill views) or a computed `@property` (`DecodeCacheView` computes it as the max of active slot seq_lens). A plain `seq_len: int` protocol member would require a writable attribute, which `@property` without a setter does not satisfy for mypy's structural checking.
 
 All existing cache views (`PrefillCacheView`, `BatchedPrefillCacheView`, `DecodeCacheView`) must add `is_paged() -> bool` returning `False`. The paged views return `True`.
 
@@ -579,6 +585,9 @@ class PagedPrefillCacheView:
         self.seq_id = seq_id
         self.seq_len: int = 0
 
+    def is_paged(self) -> bool:
+        return True
+
     def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Scatter-write K/V to blocks, return input directly.
 
@@ -781,6 +790,9 @@ class PagedBatchedPrefillCacheView:
         self.seq_ids = seq_ids
         self.prompt_lens = prompt_lens
         self.seq_len: int = 0
+
+    def is_paged(self) -> bool:
+        return True
 
     def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Scatter-write K/V to per-sequence blocks, return input directly.
@@ -1427,7 +1439,7 @@ src/infer/
 ├── cache/
 │   ├── __init__.py             # MODIFIED: export CachePoolProtocol, PagedKVCachePool, paged views
 │   ├── protocol.py             # MODIFIED: add CachePoolProtocol, add is_paged() to KVCacheProtocol
-│   ├── simple.py               # UNCHANGED
+│   ├── simple.py               # MODIFIED: add is_paged() returning False
 │   ├── slotted.py              # MODIFIED: add initial_tokens param, get_seq_len(),
 │   │                           #           free_token_capacity(), is_paged(); add
 │   │                           #           is_paged() to all slotted views

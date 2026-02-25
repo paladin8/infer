@@ -54,8 +54,12 @@ class SlottedKVCache:
         v = torch.zeros(shape, dtype=dtype, device=device)
         return SlottedKVCache(k, v, max_batch_size)
 
-    def allocate_slot(self) -> int:
-        """Claim a free slot. Raises RuntimeError if none available."""
+    def allocate_slot(self, initial_tokens: int = 0) -> int:
+        """Claim a free slot. Raises RuntimeError if none available.
+
+        The ``initial_tokens`` parameter is accepted for protocol
+        compatibility but ignored — slots have fixed pre-allocated capacity.
+        """
         if not self._free_slots:
             raise RuntimeError("No free cache slots available")
         return self._free_slots.pop()
@@ -83,6 +87,18 @@ class SlottedKVCache:
         """Return a multi-slot view for batched decode."""
         return DecodeCacheView(self, active_slots)
 
+    def get_seq_len(self, slot: int) -> int:
+        """Return the current sequence length for a slot."""
+        return self.seq_lens[slot]
+
+    def free_token_capacity(self) -> int | None:
+        """Not applicable for contiguous backend."""
+        return None
+
+    def is_paged(self) -> bool:
+        """Contiguous backend is not paged."""
+        return False
+
 
 class PrefillCacheView:
     """KVCacheProtocol-compatible view for single-slot prefill.
@@ -96,6 +112,9 @@ class PrefillCacheView:
         self.pool = pool
         self.slot = slot
         self.seq_len: int = 0  # starts at 0 for new request
+
+    def is_paged(self) -> bool:
+        return False
 
     def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Store K/V at this slot's position and return the valid cache.
@@ -136,6 +155,9 @@ class BatchedPrefillCacheView:
         self.slots = slots
         self.prompt_lens = prompt_lens
         self.seq_len: int = 0  # starts at 0 for new requests
+
+    def is_paged(self) -> bool:
+        return False
 
     def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Scatter-write K/V to pool slots and return for attention.
@@ -183,6 +205,9 @@ class DecodeCacheView:
         self._seq_len = max(self.slot_seq_lens) if active_slots else 0
         # Pre-compute slot index tensor to avoid per-layer allocation.
         self._slot_idx: Tensor | None = None
+
+    def is_paged(self) -> bool:
+        return False
 
     @property
     def seq_len(self) -> int:

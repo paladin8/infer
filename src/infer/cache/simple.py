@@ -110,6 +110,10 @@ class KVCache:
         """
         self.seq_len += n
 
+    def is_paged(self) -> bool:
+        """Simple cache is not paged."""
+        return False
+
     @property
     def memory_bytes(self) -> int:
         """Total GPU memory used by cache tensors in bytes."""

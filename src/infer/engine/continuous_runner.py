@@ -214,7 +214,7 @@ class ContinuousRunner:
         input_ids = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(1)  # [batch, 1]
 
         # Build position_ids: each sequence's current position.
-        positions = [self.cache_pool.seq_lens[slot] for slot in slots]
+        positions = [self.cache_pool.get_seq_len(slot) for slot in slots]
         position_ids = torch.tensor(positions, dtype=torch.long, device=device).unsqueeze(
             1
         )  # [batch, 1]
@@ -224,7 +224,7 @@ class ContinuousRunner:
         max_kv_len = decode_view.seq_len + 1  # +1 for the token about to be written
         padding_mask = torch.zeros(batch_size, max_kv_len, dtype=torch.bool, device=device)
         for i, slot in enumerate(slots):
-            padding_mask[i, : self.cache_pool.seq_lens[slot]] = True
+            padding_mask[i, : self.cache_pool.get_seq_len(slot)] = True
 
         # Forward pass with position_ids for per-sequence RoPE.
         logits = self.model(
