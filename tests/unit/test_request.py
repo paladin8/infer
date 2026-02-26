@@ -114,6 +114,36 @@ class TestRequestState:
         req.output_queue = queue
         assert req.output_queue is queue
 
+    def test_prefill_progress_default(self) -> None:
+        req = Request(
+            request_id="r1",
+            prompt_token_ids=[1, 2, 3],
+            sampling_params=SamplingParams(),
+            arrival_time_s=0.0,
+        )
+        assert req.prefill_progress == 0
+
+    def test_prefill_progress_increments(self) -> None:
+        """Simulate chunked prefill: progress increments each step."""
+        req = Request(
+            request_id="r1",
+            prompt_token_ids=list(range(10)),
+            sampling_params=SamplingParams(),
+            arrival_time_s=0.0,
+        )
+        chunk_size = 4
+        # First chunk: 0..3
+        req.prefill_progress = chunk_size
+        assert req.prefill_progress == 4
+
+        # Second chunk: 4..7
+        req.prefill_progress += chunk_size
+        assert req.prefill_progress == 8
+
+        # Final chunk: 8..9
+        req.prefill_progress = len(req.prompt_token_ids)
+        assert req.prefill_progress == 10
+
 
 class TestStepOutput:
     def test_basic_construction(self) -> None:

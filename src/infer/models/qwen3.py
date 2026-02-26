@@ -193,16 +193,25 @@ class Qwen3Model(nn.Module):
                 cos = self.cos[position_ids]  # [batch, seq_len, head_dim]
                 sin = self.sin[position_ids]
             else:
-                if seq_len > 1:
-                    assert pos == 0, "Chunked prefill not supported"
                 cos = self.cos[pos : pos + seq_len]
                 sin = self.sin[pos : pos + seq_len]
 
             if padding_mask is not None or position_ids is not None:
                 kv_len = pos + seq_len
                 if seq_len > 1:
-                    mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
-                    mask = mask.expand(batch_size, -1, -1, -1).clone()
+                    if position_ids is not None:
+                        # Per-element causal mask from position_ids.
+                        # position_ids: [batch, q_len] with absolute positions.
+                        # KV positions: [0, 1, ..., kv_len - 1].
+                        kv_positions = torch.arange(kv_len, device=x.device)
+                        mask = torch.where(
+                            kv_positions[None, None, :] <= position_ids[:, :, None],
+                            torch.tensor(0.0, dtype=x.dtype, device=x.device),
+                            torch.tensor(float("-inf"), dtype=x.dtype, device=x.device),
+                        ).unsqueeze(1)  # [batch, 1, q_len, kv_len]
+                    else:
+                        mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
+                        mask = mask.expand(batch_size, -1, -1, -1).clone()
                 else:
                     mask = torch.zeros(batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device)
                 if padding_mask is not None:

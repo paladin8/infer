@@ -109,3 +109,71 @@ class TestEngineConfigValidation:
     def test_float16_dtype_accepted(self) -> None:
         cfg = EngineConfig(model="m", dtype="float16")
         assert cfg.dtype == "float16"
+
+
+class TestChunkedPrefillConfig:
+    def test_defaults(self) -> None:
+        cfg = EngineConfig(model="m", batching_mode="continuous")
+        assert cfg.use_chunked_prefill is False
+        assert cfg.prefill_chunk_size == 512
+        assert cfg.max_prefill_chunks_per_step is None
+
+    def test_chunked_prefill_accepted(self) -> None:
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="continuous",
+            use_chunked_prefill=True,
+            prefill_chunk_size=256,
+        )
+        assert cfg.use_chunked_prefill is True
+        assert cfg.prefill_chunk_size == 256
+
+    def test_chunked_requires_continuous(self) -> None:
+        with pytest.raises(ValueError, match="batching_mode='continuous'"):
+            EngineConfig(model="m", batching_mode="static", use_chunked_prefill=True)
+
+    def test_chunk_size_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="prefill_chunk_size must be >= 1"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                use_chunked_prefill=True,
+                prefill_chunk_size=0,
+            )
+
+    def test_max_chunks_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="max_prefill_chunks_per_step must be >= 1 or None"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                use_chunked_prefill=True,
+                max_prefill_chunks_per_step=0,
+            )
+
+    def test_max_chunks_none_accepted(self) -> None:
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="continuous",
+            use_chunked_prefill=True,
+            max_prefill_chunks_per_step=None,
+        )
+        assert cfg.max_prefill_chunks_per_step is None
+
+    def test_max_chunks_positive_accepted(self) -> None:
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="continuous",
+            use_chunked_prefill=True,
+            max_prefill_chunks_per_step=4,
+        )
+        assert cfg.max_prefill_chunks_per_step == 4
+
+    def test_disabled_skips_validation(self) -> None:
+        """When use_chunked_prefill=False, invalid chunk params don't raise."""
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="static",
+            use_chunked_prefill=False,
+            prefill_chunk_size=0,
+        )
+        assert cfg.prefill_chunk_size == 0

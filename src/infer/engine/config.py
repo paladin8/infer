@@ -26,6 +26,9 @@ class EngineConfig:
         scheduler_policy: ``"fcfs"`` (Phase 5 adds more).
         batch_wait_timeout_s: Max seconds to wait for a batch to fill before dispatching.
         kv_cache_backend: ``"contiguous"`` (Phase 3) or ``"paged"`` (Phase 6).
+        use_chunked_prefill: Split long prefills into chunks (Phase 7).
+        prefill_chunk_size: Tokens per prefill chunk.
+        max_prefill_chunks_per_step: Cap on chunks per step (``None`` = no cap).
     """
 
     model: str
@@ -43,6 +46,11 @@ class EngineConfig:
 
     # KV cache backend.
     kv_cache_backend: str = "contiguous"
+
+    # Chunked prefill.
+    use_chunked_prefill: bool = False
+    prefill_chunk_size: int = 512
+    max_prefill_chunks_per_step: int | None = None  # None = no cap (batch all)
 
     # Paged backend configuration.
     block_size: int = 16  # tokens per KV cache block (paged backend only)
@@ -80,6 +88,19 @@ class EngineConfig:
             raise ValueError(f"max_seq_len must be >= 1, got {self.max_seq_len}")
         if self.batch_wait_timeout_s < 0:
             raise ValueError(f"batch_wait_timeout_s must be >= 0, got {self.batch_wait_timeout_s}")
+        if self.use_chunked_prefill:
+            if self.batching_mode != "continuous":
+                raise ValueError("Chunked prefill requires batching_mode='continuous'")
+            if self.prefill_chunk_size < 1:
+                raise ValueError(f"prefill_chunk_size must be >= 1, got {self.prefill_chunk_size}")
+            if (
+                self.max_prefill_chunks_per_step is not None
+                and self.max_prefill_chunks_per_step < 1
+            ):
+                raise ValueError(
+                    f"max_prefill_chunks_per_step must be >= 1 or None, "
+                    f"got {self.max_prefill_chunks_per_step}"
+                )
         if self.kv_cache_backend == "paged":
             if self.batching_mode != "continuous":
                 raise ValueError("Paged KV cache requires batching_mode='continuous'")

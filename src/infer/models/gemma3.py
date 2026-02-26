@@ -277,8 +277,6 @@ class Gemma3Model(nn.Module):
                 global_cos = self.global_cos[position_ids]
                 global_sin = self.global_sin[position_ids]
             else:
-                if seq_len > 1:
-                    assert pos == 0, "Chunked prefill not supported"
                 # RoPE tables: offset by current cache position.
                 local_cos = self.local_cos[pos : pos + seq_len]
                 local_sin = self.local_sin[pos : pos + seq_len]
@@ -288,19 +286,39 @@ class Gemma3Model(nn.Module):
             if padding_mask is not None or position_ids is not None:
                 kv_len = pos + seq_len
                 if seq_len > 1:
-                    # Prefill: expand masks to batch dimension, then add padding.
-                    local_mask = (
-                        sliding_window_causal_mask(
-                            seq_len, self.sliding_window, dtype=x.dtype, device=x.device
+                    if position_ids is not None:
+                        # Per-element dual masks from position_ids.
+                        kv_positions = torch.arange(kv_len, device=x.device)
+                        causal = (
+                            kv_positions[None, None, :] <= position_ids[:, :, None]
+                        )  # [batch, q_len, kv_len]
+                        in_window = (
+                            position_ids[:, :, None] - kv_positions[None, None, :]
+                        ) < self.sliding_window
+                        global_mask = torch.where(
+                            causal,
+                            torch.tensor(0.0, dtype=x.dtype, device=x.device),
+                            torch.tensor(float("-inf"), dtype=x.dtype, device=x.device),
+                        ).unsqueeze(1)  # [batch, 1, q_len, kv_len]
+                        local_mask = torch.where(
+                            causal & in_window,
+                            torch.tensor(0.0, dtype=x.dtype, device=x.device),
+                            torch.tensor(float("-inf"), dtype=x.dtype, device=x.device),
+                        ).unsqueeze(1)
+                    else:
+                        # Existing path: all sequences start at pos=0.
+                        local_mask = (
+                            sliding_window_causal_mask(
+                                seq_len, self.sliding_window, dtype=x.dtype, device=x.device
+                            )
+                            .expand(batch_size, -1, -1, -1)
+                            .clone()
                         )
-                        .expand(batch_size, -1, -1, -1)
-                        .clone()
-                    )
-                    global_mask = (
-                        causal_mask(seq_len, dtype=x.dtype, device=x.device)
-                        .expand(batch_size, -1, -1, -1)
-                        .clone()
-                    )
+                        global_mask = (
+                            causal_mask(seq_len, dtype=x.dtype, device=x.device)
+                            .expand(batch_size, -1, -1, -1)
+                            .clone()
+                        )
                 else:
                     # Decode: start from zeros, add sliding window cutoff to local.
                     global_mask = torch.zeros(

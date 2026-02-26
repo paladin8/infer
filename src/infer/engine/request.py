@@ -74,5 +74,9 @@ class Request:
     # Cache pool slot — assigned during prefill, freed on retire (continuous batching).
     slot_idx: int | None = field(default=None, repr=False)
 
+    # Chunked prefill progress — number of prompt tokens prefilled so far.
+    # 0 means not yet started. Equal to len(prompt_token_ids) means complete.
+    prefill_progress: int = field(default=0, repr=False)
+
     # Output channel — set by the server when the request is enqueued.
     output_queue: asyncio.Queue[StepOutput] | None = field(default=None, repr=False)
