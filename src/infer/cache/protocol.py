@@ -88,6 +88,20 @@ class CachePoolProtocol(Protocol):
         """Return a multi-slot view for batched prefill."""
         ...
 
+    def batched_chunked_prefill_view(
+        self,
+        slots: list[int],
+        start_positions: list[int],
+        chunk_lens: list[int],
+    ) -> KVCacheProtocol:
+        """Return a multi-slot view for batched chunked prefill.
+
+        Each slot writes K/V at ``[start_pos, start_pos + chunk_len)`` and
+        the view returns gathered KV padded to ``max(start_pos + chunk_len)``
+        for batched attention.
+        """
+        ...
+
     def is_paged(self) -> bool:
         """Whether this pool uses paged block allocation."""
         ...

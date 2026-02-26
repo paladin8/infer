@@ -285,6 +285,15 @@ class PagedKVCachePool:
         """Return a multi-sequence view for batched prefill."""
         return PagedBatchedPrefillCacheView(self, seq_ids, prompt_lens)
 
+    def batched_chunked_prefill_view(
+        self,
+        seq_ids: list[int],
+        start_positions: list[int],
+        chunk_lens: list[int],
+    ) -> PagedBatchedChunkedPrefillCacheView:
+        """Return a multi-sequence view for batched chunked prefill."""
+        return PagedBatchedChunkedPrefillCacheView(self, seq_ids, start_positions, chunk_lens)
+
 
 class PagedPrefillCacheView:
     """Single-sequence paged cache view for prefill.
@@ -593,3 +602,114 @@ class PagedBatchedPrefillCacheView:
         self.seq_len += n
         for i, seq_id in enumerate(self.seq_ids):
             self.pool.seq_lens[seq_id] = self.prompt_lens[i]
+
+
+class PagedBatchedChunkedPrefillCacheView:
+    """Multi-sequence paged view for batched chunked prefill.
+
+    Handles sequences at different prefill progress levels. For each sequence:
+    - Scatter-writes the chunk KV to blocks at [start_pos, start_pos + chunk_len).
+    - Gathers all KV from [0, start_pos + chunk_len).
+    - Pads to max_kv_len for batching.
+
+    Returns [batch, heads, max_kv_len, dim] for SDPA.
+    """
+
+    def __init__(
+        self,
+        pool: PagedKVCachePool,
+        seq_ids: list[int],
+        start_positions: list[int],
+        chunk_lens: list[int],
+    ) -> None:
+        self.pool = pool
+        self.seq_ids = seq_ids
+        self.start_positions = start_positions
+        self.chunk_lens = chunk_lens
+        self.kv_lens = [s + c for s, c in zip(start_positions, chunk_lens, strict=True)]
+        self.max_kv_len = max(self.kv_lens)
+        self.max_chunk_len = max(self.chunk_lens)
+        self._seq_len = self.max_kv_len - self.max_chunk_len
+
+        # Lazy cached indices (built once on first update, reused across layers).
+        self._indices_built = False
+        self._scatter_block_ids: list[Tensor] = []
+        self._scatter_offsets: list[Tensor] = []
+        self._gather_block_ids: Tensor | None = None  # [batch, max_kv_len]
+        self._gather_offsets: Tensor | None = None
+
+    @property
+    def seq_len(self) -> int:
+        return self._seq_len
+
+    def is_paged(self) -> bool:
+        return True
+
+    def _build_indices(self, device: torch.device | str) -> None:
+        """Build scatter and gather indices (once per view, reused across layers)."""
+        if self._indices_built:
+            return
+        batch_size = len(self.seq_ids)
+
+        # Per-sequence scatter indices.
+        for i, seq_id in enumerate(self.seq_ids):
+            blocks = self.pool.page_tables[seq_id]
+            block_ids = torch.tensor(blocks, dtype=torch.long, device=device)
+            positions = torch.arange(self.start_positions[i], self.kv_lens[i], device=device)
+            self._scatter_block_ids.append(block_ids[positions // self.pool.block_size])
+            self._scatter_offsets.append(positions % self.pool.block_size)
+
+        # Batched gather indices: [batch, max_kv_len], zero-padded.
+        # Positions beyond kv_lens[i] index block 0, offset 0 (zeros).
+        # The padding_mask ensures these values are ignored by attention.
+        gather_bids = torch.zeros(batch_size, self.max_kv_len, dtype=torch.long, device=device)
+        gather_offs = torch.zeros(batch_size, self.max_kv_len, dtype=torch.long, device=device)
+        for i, seq_id in enumerate(self.seq_ids):
+            kv_len = self.kv_lens[i]
+            blocks = self.pool.page_tables[seq_id]
+            block_ids = torch.tensor(blocks, dtype=torch.long, device=device)
+            positions = torch.arange(kv_len, device=device)
+            gather_bids[i, :kv_len] = block_ids[positions // self.pool.block_size]
+            gather_offs[i, :kv_len] = positions % self.pool.block_size
+
+        self._gather_block_ids = gather_bids
+        self._gather_offsets = gather_offs
+        self._indices_built = True
+
+    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Scatter-write chunks to blocks, gather full KV padded to max_kv_len.
+
+        k, v: [batch, num_kv_heads, max_chunk_len, head_dim].
+        Returns: [batch, num_kv_heads, max_kv_len, head_dim] (zero-padded).
+        """
+        device = k.device
+        self._build_indices(device)
+
+        # Scatter-write per sequence.
+        for i, _seq_id in enumerate(self.seq_ids):
+            chunk_len = self.chunk_lens[i]
+            k_flat = k[i, :, :chunk_len, :].permute(1, 0, 2)  # [chunk_len, heads, dim]
+            v_flat = v[i, :, :chunk_len, :].permute(1, 0, 2)
+            self.pool.k[layer_idx, self._scatter_block_ids[i], :, self._scatter_offsets[i], :] = (
+                k_flat
+            )
+            self.pool.v[layer_idx, self._scatter_block_ids[i], :, self._scatter_offsets[i], :] = (
+                v_flat
+            )
+
+        # Batched gather: [batch, max_kv_len, heads, dim].
+        assert self._gather_block_ids is not None
+        cached_k = self.pool.k[layer_idx, self._gather_block_ids, :, self._gather_offsets, :]
+        cached_v = self.pool.v[layer_idx, self._gather_block_ids, :, self._gather_offsets, :]
+
+        # Permute to [batch, heads, max_kv_len, dim] for SDPA.
+        return cached_k.permute(0, 2, 1, 3), cached_v.permute(0, 2, 1, 3)
+
+    def advance(self, n: int) -> None:
+        """Set per-sequence seq_lens to actual kv_len (not padded).
+
+        The ``n`` parameter is accepted for KVCacheProtocol conformance but
+        not used; per-sequence seq_lens are set to the precomputed ``kv_lens[i]``.
+        """
+        for i, seq_id in enumerate(self.seq_ids):
+            self.pool.seq_lens[seq_id] = self.kv_lens[i]

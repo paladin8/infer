@@ -85,6 +85,15 @@ class TestSlottedSatisfiesProtocol:
         assert callable(view.is_paged)
         assert view.is_paged() is False
 
+    def test_batched_chunked_prefill_view(self, slotted: SlottedKVCache) -> None:
+        slot = slotted.allocate_slot()
+        view = slotted.batched_chunked_prefill_view([slot], [0], [4])
+        assert hasattr(view, "seq_len")
+        assert callable(view.update)
+        assert callable(view.advance)
+        assert callable(view.is_paged)
+        assert view.is_paged() is False
+
 
 class TestPagedSatisfiesProtocol:
     def test_allocate_slot(self, paged: PagedKVCachePool) -> None:
@@ -130,6 +139,15 @@ class TestPagedSatisfiesProtocol:
     def test_batched_prefill_view(self, paged: PagedKVCachePool) -> None:
         slot = paged.allocate_slot(initial_tokens=8)
         view = paged.batched_prefill_view([slot], [8])
+        assert hasattr(view, "seq_len")
+        assert callable(view.update)
+        assert callable(view.advance)
+        assert callable(view.is_paged)
+        assert view.is_paged() is True
+
+    def test_batched_chunked_prefill_view(self, paged: PagedKVCachePool) -> None:
+        slot = paged.allocate_slot(initial_tokens=8)
+        view = paged.batched_chunked_prefill_view([slot], [0], [4])
         assert hasattr(view, "seq_len")
         assert callable(view.update)
         assert callable(view.advance)

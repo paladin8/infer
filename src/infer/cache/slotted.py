@@ -83,6 +83,15 @@ class SlottedKVCache:
         """Return a multi-slot view for batched prefill."""
         return BatchedPrefillCacheView(self, slots, prompt_lens)
 
+    def batched_chunked_prefill_view(
+        self,
+        slots: list[int],
+        start_positions: list[int],
+        chunk_lens: list[int],
+    ) -> BatchedChunkedPrefillCacheView:
+        """Return a multi-slot view for batched chunked prefill."""
+        return BatchedChunkedPrefillCacheView(self, slots, start_positions, chunk_lens)
+
     def decode_view(self, active_slots: list[int]) -> DecodeCacheView:
         """Return a multi-slot view for batched decode."""
         return DecodeCacheView(self, active_slots)
@@ -239,3 +248,69 @@ class DecodeCacheView:
             self.pool.seq_lens[slot] += n
             self.slot_seq_lens[i] += n
         self._seq_len += n
+
+
+class BatchedChunkedPrefillCacheView:
+    """Multi-slot view for batched chunked prefill (slotted backend).
+
+    Handles sequences at different prefill progress levels. Each batch
+    element's chunk is written to its slot, then the full KV
+    [0, start_pos + chunk_len) is read back and zero-padded to max_kv_len.
+    """
+
+    def __init__(
+        self,
+        pool: SlottedKVCache,
+        slots: list[int],
+        start_positions: list[int],
+        chunk_lens: list[int],
+    ) -> None:
+        self.pool = pool
+        self.slots = slots
+        self.start_positions = start_positions
+        self.chunk_lens = chunk_lens
+        self.kv_lens = [s + c for s, c in zip(start_positions, chunk_lens, strict=True)]
+        self.max_kv_len = max(self.kv_lens)
+        self.max_chunk_len = max(self.chunk_lens)
+        # Model computes kv_len = pos + seq_len. Input seq_len = max_chunk_len.
+        # So pos = max_kv_len - max_chunk_len makes kv_len = max_kv_len.
+        self._seq_len = self.max_kv_len - self.max_chunk_len
+        self._slot_idx: Tensor | None = None
+
+    @property
+    def seq_len(self) -> int:
+        return self._seq_len
+
+    def is_paged(self) -> bool:
+        return False
+
+    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Write chunk KV to slots, gather full KV padded to max_kv_len.
+
+        k, v: [batch, num_kv_heads, max_chunk_len, head_dim].
+        Returns: [batch, num_kv_heads, max_kv_len, head_dim] (zero-padded).
+        """
+        # Write each element's chunk to its slot.
+        for i, slot in enumerate(self.slots):
+            chunk_len = self.chunk_lens[i]
+            start = self.start_positions[i]
+            self.pool.k[layer_idx, slot, :, start : start + chunk_len, :] = k[i, :, :chunk_len, :]
+            self.pool.v[layer_idx, slot, :, start : start + chunk_len, :] = v[i, :, :chunk_len, :]
+
+        # Gather full KV [0, kv_len_i) per element, padded to max_kv_len.
+        if self._slot_idx is None:
+            self._slot_idx = torch.tensor(self.slots, device=k.device)
+        cached_k = self.pool.k[layer_idx, self._slot_idx, :, : self.max_kv_len, :]
+        cached_v = self.pool.v[layer_idx, self._slot_idx, :, : self.max_kv_len, :]
+        # Positions beyond kv_lens[i] contain stale/zero data but are masked
+        # out by padding_mask in the model's attention, so this is safe.
+        return cached_k, cached_v
+
+    def advance(self, n: int) -> None:
+        """Set per-slot seq_lens to actual kv_len (not padded).
+
+        The ``n`` parameter is accepted for KVCacheProtocol conformance but
+        not used; per-slot seq_lens are set to the precomputed ``kv_lens[i]``.
+        """
+        for i, slot in enumerate(self.slots):
+            self.pool.seq_lens[slot] = self.kv_lens[i]
