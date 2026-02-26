@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from infer.kernels.activation import triton_fused_gated_activation
+from infer.kernels.paged_attention import triton_paged_attention
 from infer.kernels.rms_norm import triton_rms_norm
 from infer.kernels.rope import triton_apply_rope
 
@@ -252,29 +253,51 @@ class Attention(nn.Module):
         # Rotary position embeddings.
         q, k = apply_rope(q, k, cos, sin)
 
-        # KV cache: store new K/V and retrieve full cached K/V.
-        if kv_cache is not None:
-            k, v = kv_cache.update(layer_idx, k, v)
-
-        # GQA: expand K/V heads to match Q heads (zero-copy broadcast).
-        if self.num_kv_heads < self.num_heads:
-            n_rep = self.num_heads // self.num_kv_heads
-            bsz, _, seq, hd = k.shape
-            k = (
-                k[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, n_rep, seq, hd)
-                .reshape(bsz, -1, seq, hd)
-                .contiguous()
+        # Paged attention decode: write K/V to blocks, Triton kernel reads
+        # directly from the pool.  Applies to full-attention decode only
+        # (mask is None); sliding-window layers fall back to gather + SDPA.
+        # The write_only check distinguishes decode views from prefill views.
+        if (
+            kv_cache is not None
+            and kv_cache.is_paged()
+            and seq_len == 1
+            and mask is None
+            and hasattr(kv_cache, "write_only")
+        ):
+            paged_view: Any = kv_cache
+            paged_view.write_only(layer_idx, k, v)
+            out = triton_paged_attention(
+                q,
+                paged_view.pool.k[layer_idx],
+                paged_view.pool.v[layer_idx],
+                paged_view.page_table_tensor,
+                paged_view.seq_lens_tensor,
+                scale=self.scale,
+                max_num_blocks=paged_view.page_table_tensor.shape[1],
             )
-            v = (
-                v[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, n_rep, seq, hd)
-                .reshape(bsz, -1, seq, hd)
-                .contiguous()
-            )
+        else:
+            # Standard path: cache update + GQA expansion + SDPA.
+            if kv_cache is not None:
+                k, v = kv_cache.update(layer_idx, k, v)
 
-        # Scaled dot-product attention.
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
+            # GQA: expand K/V heads to match Q heads (zero-copy broadcast).
+            if self.num_kv_heads < self.num_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                bsz, _, seq, hd = k.shape
+                k = (
+                    k[:, :, None, :, :]
+                    .expand(bsz, self.num_kv_heads, n_rep, seq, hd)
+                    .reshape(bsz, -1, seq, hd)
+                    .contiguous()
+                )
+                v = (
+                    v[:, :, None, :, :]
+                    .expand(bsz, self.num_kv_heads, n_rep, seq, hd)
+                    .reshape(bsz, -1, seq, hd)
+                    .contiguous()
+                )
+
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
 
         # Reshape back to [batch, seq_len, num_heads * head_dim] and project.
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)

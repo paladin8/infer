@@ -345,11 +345,14 @@ class PagedDecodeCacheView:
     """Multi-sequence paged cache view for batched decode.
 
     Each sequence's new K/V token is written to its current block. The full
-    K/V cache is gathered from scattered blocks for attention via SDPA.
+    K/V cache is either gathered for SDPA (``update()``) or read directly
+    by the Triton paged attention kernel (``write_only()``).
 
-    Gather indices are computed once at construction time and reused across
-    all layers, reducing the per-layer cost to a single GPU advanced-index
-    operation.
+    Supports mixed-layer dispatch: some layers can use the Triton kernel
+    (``write_only()`` + ``triton_paged_attention``) while others use
+    gather + SDPA (``update()``).  Block allocation, gather indices, and
+    kernel tensors are each computed lazily on first use and reused across
+    all layers.
     """
 
     def __init__(self, pool: PagedKVCachePool, seq_ids: list[int]) -> None:
@@ -358,9 +361,15 @@ class PagedDecodeCacheView:
         self.slot_seq_lens = [pool.seq_lens[sid] for sid in seq_ids]
         self._seq_len = max(self.slot_seq_lens) if seq_ids else 0
 
-        # Pre-computed gather indices (set on first update call).
+        self._blocks_allocated = False
+
+        # Lazy gather indices (for update / SDPA path).
         self._gather_block_ids: Tensor | None = None
         self._gather_offsets: Tensor | None = None
+
+        # Lazy kernel tensors (for write_only / Triton path).
+        self._page_table_tensor: Tensor | None = None
+        self._seq_lens_tensor: Tensor | None = None
 
     def is_paged(self) -> bool:
         return True
@@ -370,92 +379,108 @@ class PagedDecodeCacheView:
         """Max of active sequence lengths (used for mask width)."""
         return self._seq_len
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_blocks_allocated(self) -> None:
+        """Allocate new blocks for sequences that need them (once per step).
+
+        NOTE: if allocation succeeds for sequences 0..k but fails at k+1,
+        sequences 0..k have new blocks in their page tables that haven't
+        been written to yet.  The engine error handler frees all slots on
+        failure, so no leak occurs, but the blocks contain stale data.
+        """
+        if self._blocks_allocated:
+            return
+        for i, seq_id in enumerate(self.seq_ids):
+            pos = self.slot_seq_lens[i]
+            block_idx = pos // self.pool.block_size
+            if block_idx >= len(self.pool.page_tables[seq_id]):
+                new_block = self.pool.allocator.allocate(1, owner=seq_id)
+                self.pool.page_tables[seq_id].extend(new_block)
+        self._blocks_allocated = True
+
+    def _write_token(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
+        """Write one new decode token per sequence to the pool."""
+        for i, seq_id in enumerate(self.seq_ids):
+            pos = self.slot_seq_lens[i]
+            block_idx = pos // self.pool.block_size
+            offset = pos % self.pool.block_size
+            block_id = self.pool.page_tables[seq_id][block_idx]
+            self.pool.k[layer_idx, block_id, :, offset, :] = k[i, :, 0, :]
+            self.pool.v[layer_idx, block_id, :, offset, :] = v[i, :, 0, :]
+
+    def _ensure_gather_indices(self, device: torch.device | str) -> None:
+        """Build flat gather indices for SDPA path (lazy, once per step).
+
+        Zero-initialized, so positions beyond a sequence's actual length
+        gather from block 0, offset 0.  The attention padding mask ensures
+        these values are ignored by SDPA.
+        """
+        if self._gather_block_ids is not None:
+            return
+        max_len = self._seq_len + 1
+        batch_size = len(self.seq_ids)
+        gather_block_ids = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        gather_offsets = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+
+        for i, seq_id in enumerate(self.seq_ids):
+            seq_len_i = self.slot_seq_lens[i] + 1
+            positions = torch.arange(seq_len_i, device=device)
+            block_indices = positions // self.pool.block_size
+            offsets = positions % self.pool.block_size
+            blocks = torch.tensor(
+                self.pool.page_tables[seq_id],
+                dtype=torch.long,
+                device=device,
+            )
+            gather_block_ids[i, :seq_len_i] = blocks[block_indices]
+            gather_offsets[i, :seq_len_i] = offsets
+
+        self._gather_block_ids = gather_block_ids
+        self._gather_offsets = gather_offsets
+
+    def _ensure_kernel_tensors(self, device: torch.device | str) -> None:
+        """Build page-table and seq-lens GPU tensors for the Triton kernel.
+
+        Lazy, once per step.  ``seq_lens`` includes +1 for the token being
+        written in the current step.
+        """
+        if self._page_table_tensor is not None:
+            return
+        batch_size = len(self.seq_ids)
+        max_blocks = max(
+            (len(self.pool.page_tables[sid]) for sid in self.seq_ids),
+            default=0,
+        )
+        page_table = torch.zeros(batch_size, max_blocks, dtype=torch.int32, device=device)
+        seq_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+        for i, seq_id in enumerate(self.seq_ids):
+            blocks = self.pool.page_tables[seq_id]
+            page_table[i, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=device)
+            seq_lens[i] = self.slot_seq_lens[i] + 1
+
+        self._page_table_tensor = page_table
+        self._seq_lens_tensor = seq_lens
+
+    # ------------------------------------------------------------------
+    # Public API — SDPA path (gather + F.scaled_dot_product_attention)
+    # ------------------------------------------------------------------
+
     def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Write new tokens to blocks, gather full cache for attention.
 
         k, v shape: ``[batch, num_kv_heads, 1, head_dim]``.
 
-        On the first layer (``layer_idx == 0``), allocates a new block for
-        any sequence whose current block is full and computes gather indices
-        for all layers. Subsequent layers reuse the cached indices.
-
         Returns gathered K/V of shape
         ``[batch, num_kv_heads, max_seq_len + 1, head_dim]``.
         """
-        device = k.device
+        self._ensure_blocks_allocated()
+        self._write_token(layer_idx, k, v)
+        self._ensure_gather_indices(k.device)
 
-        if layer_idx == 0:
-            # Allocate new blocks if needed (once per step).
-            # NOTE: if allocation succeeds for sequences 0..k but fails at k+1,
-            # sequences 0..k have new blocks in their page tables that haven't
-            # been written to yet. The engine error handler frees all slots on
-            # failure, so no leak occurs, but the blocks contain stale data.
-            for i, seq_id in enumerate(self.seq_ids):
-                pos = self.slot_seq_lens[i]
-                block_idx = pos // self.pool.block_size
-                if block_idx >= len(self.pool.page_tables[seq_id]):
-                    new_block = self.pool.allocator.allocate(1, owner=seq_id)
-                    self.pool.page_tables[seq_id].extend(new_block)
-
-            # Write new token per sequence.
-            for i, seq_id in enumerate(self.seq_ids):
-                pos = self.slot_seq_lens[i]
-                block_idx = pos // self.pool.block_size
-                offset = pos % self.pool.block_size
-                block_id = self.pool.page_tables[seq_id][block_idx]
-                self.pool.k[layer_idx, block_id, :, offset, :] = k[i, :, 0, :]
-                self.pool.v[layer_idx, block_id, :, offset, :] = v[i, :, 0, :]
-
-            # Build flat gather indices for all sequences (reused across layers).
-            # NOTE: zero-initialized, so positions beyond a sequence's actual
-            # length gather from block 0, offset 0.  The attention padding mask
-            # ensures these values are ignored by SDPA.
-            max_len = self._seq_len + 1
-            batch_size = len(self.seq_ids)
-            gather_block_ids = torch.zeros(
-                batch_size,
-                max_len,
-                dtype=torch.long,
-                device=device,
-            )
-            gather_offsets = torch.zeros(
-                batch_size,
-                max_len,
-                dtype=torch.long,
-                device=device,
-            )
-
-            for i, seq_id in enumerate(self.seq_ids):
-                seq_len_i = self.slot_seq_lens[i] + 1
-                positions = torch.arange(seq_len_i, device=device)
-                block_indices = positions // self.pool.block_size
-                offsets = positions % self.pool.block_size
-                blocks = torch.tensor(
-                    self.pool.page_tables[seq_id],
-                    dtype=torch.long,
-                    device=device,
-                )
-                gather_block_ids[i, :seq_len_i] = blocks[block_indices]
-                gather_offsets[i, :seq_len_i] = offsets
-
-            self._gather_block_ids = gather_block_ids
-            self._gather_offsets = gather_offsets
-        else:
-            # Write new token on layers > 0 (indices already computed).
-            for i, seq_id in enumerate(self.seq_ids):
-                pos = self.slot_seq_lens[i]
-                block_idx = pos // self.pool.block_size
-                offset = pos % self.pool.block_size
-                block_id = self.pool.page_tables[seq_id][block_idx]
-                self.pool.k[layer_idx, block_id, :, offset, :] = k[i, :, 0, :]
-                self.pool.v[layer_idx, block_id, :, offset, :] = v[i, :, 0, :]
-
-        # Vectorized flat gather: single GPU advanced-index operation.
-        # pool.k[layer] shape: [total_blocks, kv_heads, block_size, head_dim]
-        # gather_block_ids shape: [batch, max_len] — indexes dim 0 (blocks)
-        # gather_offsets shape: [batch, max_len] — indexes dim 2 (block_size)
-        # Result shape: [batch, max_len, kv_heads, head_dim] (advanced indices
-        # are separated by a slice, so their dimensions come first).
         assert self._gather_block_ids is not None
         cached_k = self.pool.k[
             layer_idx, self._gather_block_ids, :, self._gather_offsets, :
@@ -464,6 +489,37 @@ class PagedDecodeCacheView:
 
         # Permute to [batch, kv_heads, max_len, head_dim] for SDPA.
         return cached_k.permute(0, 2, 1, 3), cached_v.permute(0, 2, 1, 3)
+
+    # ------------------------------------------------------------------
+    # Public API — Triton paged attention path
+    # ------------------------------------------------------------------
+
+    def write_only(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
+        """Write new tokens to blocks without gathering.
+
+        Used with ``triton_paged_attention`` which reads K/V directly from
+        the pool via the page table.  Block allocation and kernel tensor
+        construction happen lazily on first call.
+
+        k, v shape: ``[batch, num_kv_heads, 1, head_dim]``.
+        """
+        self._ensure_blocks_allocated()
+        self._write_token(layer_idx, k, v)
+        self._ensure_kernel_tensors(k.device)
+
+    @property
+    def page_table_tensor(self) -> Tensor:
+        """Padded page table ``[batch, max_blocks]``, int32."""
+        assert self._page_table_tensor is not None, "Call write_only() first"
+        return self._page_table_tensor
+
+    @property
+    def seq_lens_tensor(self) -> Tensor:
+        """Per-sequence token counts ``[batch]``, int32 (includes +1 for new token)."""
+        assert self._seq_lens_tensor is not None, "Call write_only() first"
+        return self._seq_lens_tensor
+
+    # ------------------------------------------------------------------
 
     def advance(self, n: int) -> None:
         """Advance all active sequences by n positions."""

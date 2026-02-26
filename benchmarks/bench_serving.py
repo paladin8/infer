@@ -496,14 +496,25 @@ def _gen_continuous_batching(n: int, rng: random.Random) -> list[RequestSpec]:
 
 
 def _gen_paged_attention(n: int, rng: random.Random) -> list[RequestSpec]:
-    """Bursty arrivals, bimodal lengths."""
-    delays = burst_delays(n, burst_size=8, burst_interval_s=0.5)
+    """Single burst of moderate-length requests — saturates batch slots.
+
+    Designed to show the benefit of paged attention: with the same total KV
+    memory budget, paged can admit more concurrent requests because it doesn't
+    pre-reserve max_seq_len per slot.
+
+    Fair comparison (same ~3.5 GB KV memory for Llama 3.2 3B):
+      contiguous: --max-batch-size 8  (8 slots x 4096 tokens = 32,768 tokens)
+      paged:      --max-batch-size 24 --num-gpu-blocks 2048  (2048 x 16 = 32,768 tokens)
+
+    With ~300 tokens per request, contiguous queues behind 8 slots while paged
+    fits 24 concurrent requests in the same memory.
+    """
     specs: list[RequestSpec] = []
-    for i in range(n):
-        target_tokens = rng.randint(32, 128) if rng.random() < 0.5 else rng.randint(512, 1024)
-        max_tokens = rng.randint(128, 512)
+    for _ in range(n):
+        target_tokens = rng.randint(128, 384)
+        max_tokens = rng.randint(128, 256)
         prompt = make_prompt(target_tokens, seed=rng.randint(0, 2**31))
-        specs.append(RequestSpec(prompt=prompt, max_tokens=max_tokens, send_delay_s=delays[i]))
+        specs.append(RequestSpec(prompt=prompt, max_tokens=max_tokens, send_delay_s=0.0))
     return specs
 
 
@@ -548,7 +559,7 @@ WORKLOADS: dict[str, WorkloadDef] = {
     ),
     "paged_attention": WorkloadDef(
         name="paged_attention",
-        description="Bursty arrivals, bimodal lengths (expose memory waste from contiguous KV)",
+        description="Single burst, moderate lengths (paged admits more per memory budget)",
         generator=_gen_paged_attention,
         default_num_requests=48,
         default_warmup_requests=2,

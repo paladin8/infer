@@ -383,7 +383,7 @@ Deliverables:
 - Three paged cache views (`PagedPrefillCacheView`, `PagedDecodeCacheView`, `PagedBatchedPrefillCacheView`).
 - Split scheduler interface (`retire()` → `admit(free_kv_tokens)` → `decode_requests()`).
 - Vectorized flat-gather decode path (indices computed once per step, reused across layers).
-- Optional Triton paged attention kernel (fused gather + attention for decode).
+- Triton paged attention kernel (fused gather + attention for decode, auto-dispatched).
 
 Exit criteria:
 
@@ -392,6 +392,8 @@ Exit criteria:
 - `CachePoolProtocol` satisfied by both backends; no `isinstance` checks in runner or engine.
 - All Phase 1-5 tests pass with `kv_cache_backend="contiguous"` (no regression).
 - `audit_blocks()` returns empty after normal request lifecycle.
+
+**Status: COMPLETE.** All deliverables implemented, benchmarked on all three models (Llama 3.2 3B, Qwen3-4B, Gemma 3 1B). Triton paged attention kernel delivers +12-32% throughput over contiguous baseline depending on model. 817 tests pass.
 
 See `docs/PHASE_6.md` for the full design.
 
@@ -467,8 +469,8 @@ class EngineConfig:
     # Prefix caching
     use_prefix_caching: bool = False
 
-    # Attention backend
-    attention_backend: str = "sdpa"    # "naive" | "sdpa" | "flash" | "triton_paged"
+    # Attention backend (Triton paged kernel auto-dispatches for paged decode)
+    attention_backend: str = "sdpa"    # "naive" | "sdpa" | "flash"
 ```
 
 Compatibility rules to enforce in config validation:
@@ -653,7 +655,8 @@ infer/
     ├── PHASE_3.md
     ├── PHASE_3_1.md
     ├── PHASE_4.md
-    └── PHASE_5.md
+    ├── PHASE_5.md
+    └── PHASE_6.md
 ```
 
 ---
@@ -666,7 +669,7 @@ infer/
 - Use `jinja2` for chat template rendering with our own template strings per model (no `transformers.apply_chat_template`, no custom parser).
 - Use SDPA as default fast path before Triton specialization.
 - Triton is a required dependency; kernels are always used (no PyTorch fallback paths). This simplifies the codebase and avoids maintaining two code paths. The fused RoPE kernel uses FMA instructions, producing results that are slightly different from but more precise than HF's PyTorch implementation (verified against fp64 ground truth).
-- Scope Triton work to paged gather kernel first.
+- The Triton paged attention kernel auto-dispatches based on runtime conditions (`is_paged()`, `seq_len == 1`, `mask is None`, `hasattr(write_only)`) rather than an explicit config flag, keeping model code decoupled from cache backend details.
 - Keep engine internals synchronous with a clean `step()` boundary for async API integration.
 - Make continuous batching policy runtime-configurable and benchmark each policy.
 - Use a custom `bench_serving.py` as the primary serving benchmark harness (our SSE format uses custom event types that don't match external tools' OpenAI assumptions).

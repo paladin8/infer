@@ -28,6 +28,24 @@ def main() -> None:
         choices=["static", "continuous"],
         help="batching strategy (default: static)",
     )
+    parser.add_argument(
+        "--kv-cache-backend",
+        default="contiguous",
+        choices=["contiguous", "paged"],
+        help="KV cache backend (default: contiguous). Paged requires --batching-mode continuous.",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=16,
+        help="tokens per KV cache block, paged backend only (default: 16)",
+    )
+    parser.add_argument(
+        "--num-gpu-blocks",
+        type=int,
+        default=None,
+        help="total KV cache blocks, paged backend only (default: auto-compute)",
+    )
     args = parser.parse_args()
 
     config = EngineConfig(
@@ -40,6 +58,9 @@ def main() -> None:
         seed=args.seed,
         batch_wait_timeout_s=args.batch_wait_timeout,
         batching_mode=args.batching_mode,
+        kv_cache_backend=args.kv_cache_backend,
+        block_size=args.block_size,
+        num_gpu_blocks=args.num_gpu_blocks,
     )
 
     app = create_app(config)

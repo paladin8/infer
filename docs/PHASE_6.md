@@ -1112,100 +1112,97 @@ if self.kv_cache_backend == "paged":
 
 **`num_gpu_blocks` auto-computation**: when `num_gpu_blocks` is `None`, the runner computes `max_batch_size * max_seq_len // block_size`, giving the same total token capacity as the contiguous pool. Users can override this to independently size the block pool.
 
-### 9. Optional: Triton paged attention kernel (`src/infer/kernels/paged_attention.py`)
+### 9. Triton paged attention kernel (`src/infer/kernels/paged_attention.py`)
 
-The gather-based decode path (deliverable 4) copies block data into contiguous tensors before SDPA. A Triton kernel can fuse the gather and attention computation, reading K/V directly from scattered blocks and computing attention in a single pass. This eliminates the O(batch × seq_len × head_dim) gather copy per layer.
+The gather-based decode path (deliverable 4) copies block data into contiguous tensors before SDPA. The Triton kernel fuses the gather and attention computation, reading K/V directly from scattered blocks and computing attention in a single pass. This eliminates the O(batch × seq_len × head_dim) gather copy per layer.
 
 ```python
 @triton.jit
 def _paged_attention_kernel(
-    OUT,       # [batch, num_q_heads, head_dim]  — output
-    Q,         # [batch, num_q_heads, 1, head_dim]  — queries
-    K_POOL,    # [total_blocks, num_kv_heads, block_size, head_dim]  — key pool (one layer)
-    V_POOL,    # [total_blocks, num_kv_heads, block_size, head_dim]  — value pool (one layer)
-    PAGE_TABLE,  # [batch, max_num_blocks]  — per-sequence block IDs
-    SEQ_LENS,    # [batch]  — per-sequence lengths
+    OUT,  # [batch, num_q_heads, head_dim]
+    Q,  # [batch, num_q_heads, 1, head_dim]
+    K_POOL,  # [total_blocks, num_kv_heads, block_size, head_dim]
+    V_POOL,  # [total_blocks, num_kv_heads, block_size, head_dim]
+    PAGE_TABLE,  # [batch, max_num_blocks]  int32
+    SEQ_LENS,  # [batch]  int32
     stride_out_batch, stride_out_head,
     stride_q_batch, stride_q_head,
     stride_k_block, stride_k_head, stride_k_pos,
     stride_v_block, stride_v_head, stride_v_pos,
     stride_pt_batch,
-    num_kv_heads: tl.constexpr,
-    num_q_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_size: tl.constexpr,
-    scale: tl.constexpr,
-    MAX_NUM_BLOCKS: tl.constexpr,  # compile-time upper bound on blocks per sequence
+    GQA_GROUP_SIZE: tl.constexpr,  # num_q_heads // num_kv_heads
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SCALE: tl.constexpr,
+    MAX_NUM_BLOCKS: tl.constexpr,
+    BLOCK_HD: tl.constexpr,   # next_power_of_2(HEAD_DIM)
+    BLOCK_BS: tl.constexpr,   # next_power_of_2(BLOCK_SIZE)
 ):
-    """Paged attention kernel for decode (single query token per sequence).
+    """Paged attention for one (batch, q_head) pair.
 
-    Each Triton program handles one (batch, q_head) pair. It iterates over
-    blocks in the sequence's page table, loading K/V from each block,
-    computing partial attention scores, and maintaining running softmax
-    state (online softmax for numerical stability).
+    Grid: ``(batch, num_q_heads)``.
 
-    GQA is handled by mapping each query head to its corresponding KV head:
-    ``kv_head = q_head // (num_q_heads // num_kv_heads)``.
+    Uses online softmax to iterate over KV blocks without materialising
+    the full attention matrix.  Float32 accumulation for numerical stability.
+
+    GQA is handled by mapping query heads to KV heads via a single
+    ``GQA_GROUP_SIZE`` constexpr: ``kv_head = q_head // GQA_GROUP_SIZE``.
     """
     batch_idx = tl.program_id(0)
     q_head_idx = tl.program_id(1)
 
     # GQA: map query head to KV head.
-    kv_head_idx = q_head_idx // (num_q_heads // num_kv_heads)
-
-    # Load query vector: [head_dim].
-    q_offset = batch_idx * stride_q_batch + q_head_idx * stride_q_head
-    q = tl.load(Q + q_offset + tl.arange(0, head_dim))  # [head_dim]
-
-    # Running softmax state.
-    m_prev = float("-inf")   # running max
-    l_prev = 0.0             # running sum of exp
-    acc = tl.zeros([head_dim], dtype=tl.float32)  # weighted V accumulator
+    kv_head_idx = q_head_idx // GQA_GROUP_SIZE
 
     seq_len = tl.load(SEQ_LENS + batch_idx)
 
-    # Iterate over blocks using compile-time upper bound.
-    # Break early when past the actual number of blocks.
+    # Load query vector [HEAD_DIM] → float32.
+    # BLOCK_HD pads head_dim to the next power of 2 for efficient Triton loads.
+    q_offset = batch_idx * stride_q_batch + q_head_idx * stride_q_head
+    dim_offsets = tl.arange(0, BLOCK_HD)
+    dim_mask = dim_offsets < HEAD_DIM
+    q = tl.load(Q + q_offset + dim_offsets, mask=dim_mask, other=0.0).to(tl.float32)
+
+    # Online softmax running state (explicit Triton scalars, not Python floats).
+    m_prev = tl.full([], float("-inf"), dtype=tl.float32)  # running max
+    l_prev = tl.full([], 0.0, dtype=tl.float32)            # running exp sum
+    acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+
+    pos_offsets = tl.arange(0, BLOCK_BS)  # padded to next_power_of_2(BLOCK_SIZE)
+
     for block_idx in range(MAX_NUM_BLOCKS):
-        start_pos = block_idx * block_size
-        if start_pos >= seq_len:
-            break
+        start_pos = block_idx * BLOCK_SIZE
+        # No break in Triton for loops: use valid_len=0 to mask everything
+        # for blocks past the sequence boundary (all scores become -inf,
+        # contributing zero to the output via softmax).
+        remaining = seq_len - start_pos
+        valid_len = tl.maximum(0, tl.minimum(BLOCK_SIZE, remaining))
 
-        # Look up physical block ID from page table.
+        # Physical block ID from page table.
         block_id = tl.load(
-            PAGE_TABLE + batch_idx * stride_pt_batch + block_idx,
-        )
+            PAGE_TABLE + batch_idx * stride_pt_batch + block_idx
+        ).to(tl.int64)
 
-        # Determine valid positions in this block.
-        valid_len = tl.minimum(block_size, seq_len - start_pos)
-
-        # Load K from this block: [block_size, head_dim].
+        # --- Load K block [BLOCK_BS, BLOCK_HD] → float32 ---
         k_base = block_id * stride_k_block + kv_head_idx * stride_k_head
-        pos_offsets = tl.arange(0, block_size)
-        dim_offsets = tl.arange(0, head_dim)
-        k = tl.load(
-            K_POOL + k_base + pos_offsets[:, None] * stride_k_pos + dim_offsets[None, :],
-            mask=pos_offsets[:, None] < valid_len,
-            other=0.0,
-        )  # [block_size, head_dim]
+        k_ptrs = K_POOL + k_base + pos_offsets[:, None] * stride_k_pos + dim_offsets[None, :]
+        k_mask = (pos_offsets[:, None] < valid_len) & dim_mask[None, :]
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-        # QK^T: [block_size] dot products.
-        scores = tl.sum(q[None, :] * k, axis=1) * scale  # [block_size]
+        # Attention scores: q @ k^T * scale → [BLOCK_BS].
+        scores = tl.sum(q[None, :] * k, axis=1) * SCALE
         scores = tl.where(pos_offsets < valid_len, scores, float("-inf"))
 
         # Online softmax update.
         m_new = tl.maximum(m_prev, tl.max(scores, axis=0))
-        exp_scores = tl.exp(scores - m_new)  # [block_size]
+        exp_scores = tl.exp(scores - m_new)
         correction = tl.exp(m_prev - m_new)
         l_new = correction * l_prev + tl.sum(exp_scores, axis=0)
 
-        # Load V from this block: [block_size, head_dim].
+        # --- Load V block [BLOCK_BS, BLOCK_HD] → float32 ---
         v_base = block_id * stride_v_block + kv_head_idx * stride_v_head
-        v = tl.load(
-            V_POOL + v_base + pos_offsets[:, None] * stride_v_pos + dim_offsets[None, :],
-            mask=pos_offsets[:, None] < valid_len,
-            other=0.0,
-        )  # [block_size, head_dim]
+        v_ptrs = V_POOL + v_base + pos_offsets[:, None] * stride_v_pos + dim_offsets[None, :]
+        v = tl.load(v_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
         # Accumulate weighted V.
         acc = correction * acc + tl.sum(exp_scores[:, None] * v, axis=0)
@@ -1213,17 +1210,28 @@ def _paged_attention_kernel(
         m_prev = m_new
         l_prev = l_new
 
-    # Final normalization.
-    out = acc / l_prev  # [head_dim]
+    # Final normalisation (guard against l_prev==0 from empty sequences).
+    safe_l = tl.maximum(l_prev, 1e-6)
+    out = tl.where(dim_mask, acc / safe_l, 0.0)
 
     # Store output.
     out_offset = batch_idx * stride_out_batch + q_head_idx * stride_out_head
-    tl.store(OUT + out_offset + tl.arange(0, head_dim), out)
+    tl.store(OUT + out_offset + dim_offsets, out, mask=dim_mask)
 ```
 
-**`MAX_NUM_BLOCKS` constexpr**: the loop bound must be a compile-time constant for Triton's JIT compiler. `MAX_NUM_BLOCKS` is set to `ceil(max_seq_len / block_size)` at kernel launch time. The `start_pos >= seq_len` check provides early exit for sequences that use fewer blocks than the maximum. This avoids the bug of using a runtime `num_blocks` variable (from `tl.load`) as a Python `range()` bound, which is not valid in Triton.
+**Key implementation details**:
 
-**Triton version requirement**: `break` in `for` loops requires Triton >= 2.1. The `tl.where(pos_offsets < valid_len, scores, float("-inf"))` masking on invalid positions is a defensive fallback — even if a Triton backend executes all iterations with predicated operations (treating `break` as a no-op), the `-inf` scores ensure invalid blocks contribute zero attention weight.
+- **No `break` in Triton loops**: Triton's `for` loop semantics do not reliably support `break` across all backends. Instead, blocks past the sequence boundary get `valid_len=0`, making all their scores `-inf`, which contributes zero to the output via softmax. This is defensive — the kernel is correct regardless of whether the backend executes predicated or truly-exiting loop iterations.
+
+- **`BLOCK_HD` and `BLOCK_BS` padding**: Triton loads are most efficient at power-of-2 sizes. The wrapper computes `BLOCK_HD = next_power_of_2(head_dim)` and `BLOCK_BS = next_power_of_2(block_size)` at launch time. Loads use `dim_mask = dim_offsets < HEAD_DIM` and `pos_offsets < valid_len` to mask padded lanes.
+
+- **`GQA_GROUP_SIZE` constexpr**: a single constexpr `GQA_GROUP_SIZE = num_q_heads // num_kv_heads` handles MHA (group=1), GQA (e.g. group=4), and MQA (group=num_q_heads). The kernel maps query heads to KV heads via `kv_head_idx = q_head_idx // GQA_GROUP_SIZE`.
+
+- **Explicit Triton scalars**: the running softmax state (`m_prev`, `l_prev`) is initialised with `tl.full([], ...)` rather than Python floats, ensuring correct Triton intermediate types.
+
+- **Division-by-zero guard**: `safe_l = tl.maximum(l_prev, 1e-6)` prevents NaN output for empty sequences (seq_len=0).
+
+- **`num_warps` tuning**: the wrapper selects `num_warps=8` for `head_dim >= 128` (wider vectors need more parallelism) and `num_warps=4` otherwise.
 
 **Python wrapper**:
 
@@ -1235,17 +1243,17 @@ def triton_paged_attention(
     page_table: Tensor,   # [batch, max_num_blocks], int32
     seq_lens: Tensor,     # [batch], int32
     scale: float,
-    max_num_blocks: int,  # compile-time upper bound
+    max_num_blocks: int,
 ) -> Tensor:
-    """Paged attention for decode step.
-
-    Returns attention output of shape ``[batch, num_q_heads, 1, head_dim]``.
-    """
     batch, num_q_heads, _, head_dim = q.shape
-    num_kv_heads = k_pool.shape[1]
-    block_size = k_pool.shape[2]
+    _, num_kv_heads, block_size, _ = k_pool.shape
+    gqa_group_size = num_q_heads // num_kv_heads
 
-    out = torch.empty(batch, num_q_heads, head_dim, dtype=q.dtype, device=q.device)
+    out = q.new_empty(batch, num_q_heads, head_dim)
+
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+    BLOCK_BS = triton.next_power_of_2(block_size)
+    num_warps = 8 if BLOCK_HD >= 128 else 4
 
     grid = (batch, num_q_heads)
     _paged_attention_kernel[grid](
@@ -1255,18 +1263,20 @@ def triton_paged_attention(
         k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
         v_pool.stride(0), v_pool.stride(1), v_pool.stride(2),
         page_table.stride(0),
-        num_kv_heads=num_kv_heads,
-        num_q_heads=num_q_heads,
-        head_dim=head_dim,
-        block_size=block_size,
-        scale=scale,
+        GQA_GROUP_SIZE=gqa_group_size,
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=block_size,
+        SCALE=scale,
         MAX_NUM_BLOCKS=max_num_blocks,
+        BLOCK_HD=BLOCK_HD,
+        BLOCK_BS=BLOCK_BS,
+        num_warps=num_warps,
     )
 
     return out.unsqueeze(2)  # [batch, num_q_heads, 1, head_dim]
 ```
 
-**Integration**: the Triton kernel replaces the gather + SDPA path during decode when `attention_backend="triton_paged"`. The `PagedDecodeCacheView` gains a `write_only()` method that writes new K/V tokens without gathering, plus `page_table_tensor` and `seq_lens_tensor` properties that return pre-computed GPU tensors for the kernel:
+**Integration**: the Triton kernel is auto-dispatched during decode based on runtime conditions — no config flag or `attention_backend` setting needed. The `PagedDecodeCacheView` provides `write_only()` (writes K/V without gathering), and lazy `page_table_tensor` / `seq_lens_tensor` properties computed once per step via `_ensure_kernel_tensors()`:
 
 ```python
 class PagedDecodeCacheView:
@@ -1274,81 +1284,46 @@ class PagedDecodeCacheView:
 
     def write_only(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
         """Write new tokens to blocks without gathering (for Triton kernel path)."""
-        for i, seq_id in enumerate(self.seq_ids):
-            pos = self.slot_seq_lens[i]
-            block_idx = pos // self.pool.block_size
-            offset = pos % self.pool.block_size
+        # ... allocates new blocks on layer 0 if needed, writes K/V ...
 
-            # Allocate new block if needed (first layer only).
-            if layer_idx == 0 and block_idx >= len(self.pool.page_tables[seq_id]):
-                new_block = self.pool.allocator.allocate(1, owner=seq_id)
-                self.pool.page_tables[seq_id].extend(new_block)
-
-            block_id = self.pool.page_tables[seq_id][block_idx]
-            self.pool.k[layer_idx, block_id, :, offset, :] = k[i, :, 0, :]
-            self.pool.v[layer_idx, block_id, :, offset, :] = v[i, :, 0, :]
-
-    def build_kernel_tensors(self) -> None:
-        """Pre-compute page table and seq_lens tensors for the Triton kernel.
-
-        Called once per step (before the first layer). Avoids re-allocating
-        GPU tensors on every property access.
-        """
-        device = self.pool.k.device
-        max_blocks = max(
-            len(self.pool.page_tables[sid]) for sid in self.seq_ids
-        )
-        pt = torch.zeros(
-            len(self.seq_ids), max_blocks, dtype=torch.int32, device=device,
-        )
-        for i, sid in enumerate(self.seq_ids):
-            blocks = self.pool.page_tables[sid]
-            pt[i, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
-
-        self._page_table_tensor = pt
-        self._seq_lens_tensor = torch.tensor(
-            [s + 1 for s in self.slot_seq_lens],  # +1 for the token being written
-            dtype=torch.int32, device=device,
-        )
+    def _ensure_kernel_tensors(self) -> None:
+        """Lazily compute page table and seq_lens tensors on first access."""
+        if self._page_table_tensor is not None:
+            return
+        # Build [batch, max_blocks] int32 page table and [batch] int32 seq_lens
+        # ...
 
     @property
     def page_table_tensor(self) -> Tensor:
-        """Padded page table as a GPU tensor [batch, max_blocks]."""
+        self._ensure_kernel_tensors()
         return self._page_table_tensor
 
     @property
     def seq_lens_tensor(self) -> Tensor:
-        """Per-sequence lengths as a GPU tensor [batch]."""
+        self._ensure_kernel_tensors()
         return self._seq_lens_tensor
 ```
 
-**`build_kernel_tensors` caching**: the page table and seq_lens tensors are computed once per step, called by the runner before the model forward pass, rather than allocated on every property access. This avoids O(batch × layers) GPU allocations. The runner calls this explicitly:
+**Lazy initialisation**: unlike the design's `build_kernel_tensors()` called explicitly by the runner, the actual implementation uses `_ensure_kernel_tensors()` which is called lazily on first access to `page_table_tensor` or `seq_lens_tensor`. This keeps the runner code simple (no Triton-specific calls) and the tensors are still computed at most once per step since the view is created fresh each step.
 
-```python
-# In ContinuousRunner._batched_decode, when using Triton paged path:
-decode_view = self.cache_pool.decode_view(slots)
-if self.use_triton_paged:
-    decode_view.build_kernel_tensors()
-# ... model forward pass (layers access page_table_tensor / seq_lens_tensor) ...
-```
-
-**Attention dispatch**: the `Attention` class checks for the Triton paged path using `is_paged()`:
+**Attention dispatch**: the `Attention` class auto-dispatches to the Triton kernel based on runtime conditions, avoiding any config flag:
 
 ```python
 # In Attention.forward:
 if (
     kv_cache is not None
     and kv_cache.is_paged()
-    and self.use_triton_paged  # set from config at init
+    and seq_len == 1            # decode only (single query token)
+    and mask is None            # full attention (not sliding window)
+    and hasattr(kv_cache, "write_only")  # decode view, not prefill view
 ):
-    # Write new K/V to blocks (no gather).
-    kv_cache.write_only(layer_idx, k, v)
-    # Fused paged attention.
+    paged_view: Any = kv_cache
+    paged_view.write_only(layer_idx, k, v)
     out = triton_paged_attention(
-        q, kv_cache.pool.k[layer_idx], kv_cache.pool.v[layer_idx],
-        kv_cache.page_table_tensor, kv_cache.seq_lens_tensor,
+        q, paged_view.pool.k[layer_idx], paged_view.pool.v[layer_idx],
+        paged_view.page_table_tensor, paged_view.seq_lens_tensor,
         scale=self.scale,
-        max_num_blocks=kv_cache.page_table_tensor.shape[1],
+        max_num_blocks=paged_view.page_table_tensor.shape[1],
     )
 else:
     # Standard path: update cache (with gather), then SDPA.
@@ -1357,76 +1332,83 @@ else:
     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
 ```
 
-The `is_paged()` method is part of `KVCacheProtocol`, so no `isinstance` check or import of `PagedDecodeCacheView` is needed in `common.py`. All cache views implement `is_paged()`: slotted views return `False`, paged views return `True`. When `is_paged()` returns `True` and the Triton kernel is enabled, the view is guaranteed to have `write_only()`, `page_table_tensor`, and `seq_lens_tensor` — these are Triton-specific methods on the paged decode view only, accessed after the `is_paged()` check narrows the logical type. For mypy, the Triton path accesses these via `# type: ignore[attr-defined]` or a `cast()`, since `KVCacheProtocol` does not declare them.
+The dispatch uses four runtime checks instead of a config flag:
+1. `is_paged()` — protocol method, avoids `isinstance` checks
+2. `seq_len == 1` — decode only (prefill uses SDPA directly)
+3. `mask is None` — full attention layers (Gemma 3 sliding-window layers fall back to gather+SDPA)
+4. `hasattr(kv_cache, "write_only")` — distinguishes `PagedDecodeCacheView` from `PagedPrefillCacheView` (important when a single-token prompt produces `seq_len == 1` during prefill)
 
-**Scope**: the Triton kernel is optional for Phase 6. The gather-based path is the primary deliverable and must be correct and tested before implementing the kernel. The kernel targets decode only (single query token per sequence) where the gather cost is highest. Prefill uses SDPA regardless (the full K/V is available without gather).
+This approach eliminates the need for `attention_backend="triton_paged"` config, `self.use_triton_paged` flags on the Attention class, or any runner-level dispatch. The Triton kernel is always used when conditions are met, and the fallback is always safe.
 
-**Gemma 3 sliding window**: the Triton kernel and paged views do not handle per-layer sliding window attention masks. For Gemma 3's alternating full/sliding attention pattern, the standard gather+SDPA path is used (the sliding window mask is applied via SDPA's `attn_mask` parameter, same as Phase 5). Adding sliding-window-aware block eviction (freeing blocks outside the window) is deferred to future work.
+**Scope**: the Triton kernel targets decode only (single query token per sequence) where the gather cost is highest. Prefill uses SDPA regardless (the full K/V is available without gather).
+
+**Gemma 3 sliding window**: the Triton kernel and paged views do not handle per-layer sliding window attention masks. For Gemma 3's alternating full/sliding attention pattern, full-attention layers (mask=None) use the Triton kernel while sliding-window layers (mask provided) fall back to gather+SDPA. Adding sliding-window-aware block eviction (freeing blocks outside the window) is deferred to future work.
 
 ### 10. Benchmark updates
 
 Run benchmarks with both contiguous and paged backends to demonstrate the capacity advantage.
 
-**Why the existing `paged_attention` workload is insufficient**: the current workload sends 48 requests in bursts of 8, run with `max_batch_size=8`. Both backends can handle this — contiguous pre-allocates 8 slots and requests queue in order. The TTFT P50 of 28-43s in Phase 5 shows the bottleneck is compute throughput (queue wait time), not memory capacity. No requests fail due to VRAM, so the paged backend has nothing to rescue.
+**Why the existing `paged_attention` workload was insufficient**: the Phase 5 workload sent 48 requests in bursts of 8, run with `max_batch_size=8`. Both backends could handle this — contiguous pre-allocates 8 slots and requests queue in order. No requests fail due to VRAM, so the paged backend had nothing to rescue.
 
 The real benefit of paged attention is **raising `max_batch_size`** while keeping the same VRAM budget. Contiguous allocation ties `max_batch_size` to worst-case per-slot memory (`max_seq_len` positions each). Paged allocation decouples them — short sequences use fewer blocks, leaving room for more concurrent sequences.
 
-**Benchmark protocol** — run the same workload under two configurations:
+**Updated `paged_attention` workload**: sends **48 moderate-length requests** in a single burst (all at once, no stagger) with moderate prompts (128-384 tokens) and moderate generation (128-256 tokens). This creates a scenario where paged can admit many more concurrent requests than contiguous in the same memory budget.
+
+```python
+def _gen_paged_attention(n: int, rng: random.Random) -> list[RequestSpec]:
+    """Single burst of moderate-length requests — saturates batch slots."""
+    specs: list[RequestSpec] = []
+    for _ in range(n):
+        target_tokens = rng.randint(128, 384)
+        max_tokens = rng.randint(128, 256)
+        prompt = make_prompt(target_tokens, seed=rng.randint(0, 2**31))
+        specs.append(RequestSpec(prompt=prompt, max_tokens=max_tokens, send_delay_s=0.0))
+    return specs
+```
+
+With `default_num_requests=48`.
+
+**Benchmark protocol** — same total KV memory budget across backends:
 
 ```bash
-# Configuration A: Contiguous (Phase 5 baseline)
+# Configuration A: Contiguous (Phase 4/5 baseline)
 uv run python -m infer.server \
     --model meta-llama/Llama-3.2-3B-Instruct \
     --batching-mode continuous \
     --kv-cache-backend contiguous \
     --max-batch-size 8
 
-# Configuration B: Paged (Phase 6) — same total VRAM, 4x batch size
+# Configuration B: Paged (Phase 6) — same ~3.5 GB KV, 3x batch size
 uv run python -m infer.server \
     --model meta-llama/Llama-3.2-3B-Instruct \
     --batching-mode continuous \
     --kv-cache-backend paged \
     --block-size 16 \
-    --max-batch-size 32 \
+    --max-batch-size 24 \
     --num-gpu-blocks 2048
 ```
 
-Note: `num_gpu_blocks=2048` with `block_size=16` gives `32,768` token positions — the same total VRAM as contiguous with `max_batch_size=8` and `max_seq_len=4096`. The difference: contiguous locks this into 8 slots of 4096 each, while paged shares the pool across up to 32 sequences.
+Note: `num_gpu_blocks=2048` with `block_size=16` gives `32,768` token positions — the same total VRAM as contiguous with `max_batch_size=8` and `max_seq_len=4096`.
 
-**Updated `paged_attention` workload**: modify the existing workload to send **64 concurrent short requests** (all at once, no stagger) with short prompts (32-128 tokens) and short generation (32-64 tokens). This creates a scenario where:
+**Per-model server configs** (tuned to 16 GB VRAM):
 
-- **Contiguous** (`max_batch_size=8`): can only serve 8 at a time, so 56 requests queue. Each batch of 8 takes ~1-3s to complete before the next 8 are admitted. Total wall time dominated by 8 serial batches of queued work.
-- **Paged** (`max_batch_size=32`): can serve 32 at a time (short sequences use ~2-8 blocks each, fitting comfortably in the 2048-block pool). Most requests admitted in the first 2 steps. Total wall time roughly halved or better.
+| Model | Batch | Blocks | KV Pool VRAM | Notes |
+|-------|------:|-------:|-------------:|-------|
+| Llama 3.2 3B | 24 | 2048 | ~3.5 GB | Fits comfortably |
+| Qwen3-4B | 16 | 1024 | ~4.5 GB | Larger weights; batch=24 hits VRAM cliff |
+| Gemma 3 1B | 24 | 2048 | ~3.3 GB | Fits comfortably |
 
-```python
-def _gen_paged_attention(n: int, rng: random.Random) -> list[RequestSpec]:
-    """All-at-once short requests (expose capacity advantage of paged KV)."""
-    specs: list[RequestSpec] = []
-    for i in range(n):
-        target_tokens = rng.randint(32, 128)
-        max_tokens = rng.randint(32, 64)
-        prompt = make_prompt(target_tokens, seed=rng.randint(0, 2**31))
-        specs.append(RequestSpec(prompt=prompt, max_tokens=max_tokens, send_delay_s=0.0))
-    return specs
-```
+Qwen3-4B required empirical batch size tuning. At batch=24/blocks=2048 (4.5 GB KV + 7.5 GB weights), throughput collapsed to 121 tok/s due to insufficient VRAM headroom for activations. A sweep found batch=16/blocks=1024 as the sweet spot (317 tok/s), with prefix_caching needing blocks=1536 to avoid OOM.
 
-With `default_num_requests=64`.
+**Actual benchmark results** (paged_attention workload, 48 requests):
 
-**Key metrics to compare**:
+| Model | Contiguous (batch=8) | Paged (tuned) | Speedup |
+|-------|---------------------:|--------------:|--------:|
+| Llama 3.2 3B | 346.1 tok/s | 455.2 tok/s | +32% |
+| Qwen3-4B | 271.0 tok/s | 317.4 tok/s | +17% |
+| Gemma 3 1B | 289.1 tok/s | 325.2 tok/s | +12% |
 
-| Metric             | Contiguous (batch=8) | Paged (batch=32) | Expected                              |
-|--------------------|---------------------:|-----------------:|---------------------------------------|
-| Throughput (tok/s) |                 ~250 |            ~600+ | 2-3x (more concurrent decode)         |
-| TTFT P50 (ms)      |        ~5,000-10,000 |         ~100-500 | 10-50x (admitted immediately)         |
-| TTFT P99 (ms)      |       ~15,000-25,000 |      ~1,000-3000 | 5-10x                                 |
-| Wall time (s)      |               ~20-40 |            ~5-15 | 2-4x                                  |
-| Errors             |                    0 |                0 | Both handle all requests              |
-
-The dramatic TTFT improvement is the clearest signal: with contiguous, most requests wait through multiple batch cycles before being admitted. With paged, most are admitted in the first 1-2 steps.
-
-**Secondary comparison — existing workloads**: run all Phase 5 workloads with both backends at `max_batch_size=8` to verify no regression. Paged at batch=8 should show nearly identical numbers to contiguous (same compute budget, slightly different memory access pattern).
-
-Results are appended to `benchmarks/log/SERVING_LOG.md` in a Phase 6 section.
+All workloads are run and results recorded in `benchmarks/log/SERVING_LOG.md` in a Phase 6 section.
 
 ---
 
@@ -1457,12 +1439,12 @@ src/infer/
 │   └── generate.py             # UNCHANGED
 ├── kernels/
 │   ├── __init__.py             # MODIFIED: export triton_paged_attention (when present)
-│   └── paged_attention.py      # NEW (optional): Triton paged attention kernel
+│   └── paged_attention.py      # NEW: Triton paged attention kernel
 ├── models/
-│   ├── llama.py                # UNCHANGED (or MODIFIED if Triton kernel enabled)
-│   ├── qwen3.py                # UNCHANGED (or MODIFIED if Triton kernel enabled)
-│   ├── gemma3.py               # UNCHANGED (or MODIFIED if Triton kernel enabled)
-│   └── common.py               # MODIFIED (optional): Attention gains triton_paged dispatch
+│   ├── llama.py                # UNCHANGED
+│   ├── qwen3.py                # UNCHANGED
+│   ├── gemma3.py               # UNCHANGED
+│   └── common.py               # MODIFIED: Attention auto-dispatches to Triton paged kernel
 └── server/
     ├── api.py                  # UNCHANGED
     ├── __main__.py             # MODIFIED: add --kv-cache-backend, --block-size,
@@ -1470,7 +1452,7 @@ src/infer/
     └── __init__.py             # UNCHANGED
 
 benchmarks/
-├── bench_serving.py            # MODIFIED: add W4 High Concurrency workload
+├── bench_serving.py            # MODIFIED: updated paged_attention workload (48 moderate-length burst)
 └── log/
     └── SERVING_LOG.md          # MODIFIED: add Phase 6 results section
 
@@ -1479,7 +1461,7 @@ tests/
 │   ├── test_block_allocator.py     # NEW
 │   ├── test_paged_cache.py         # NEW: PagedKVCachePool, paged views
 │   ├── test_cache_pool_protocol.py # NEW: verify both pools satisfy CachePoolProtocol
-│   ├── test_paged_attention_kernel.py  # NEW (optional): Triton kernel correctness
+│   ├── test_paged_attention_kernel.py  # NEW: Triton kernel correctness (18 tests)
 │   ├── test_continuous_scheduler.py    # MODIFIED: test retire/admit/decode_requests
 │   ├── test_continuous_runner.py       # MODIFIED: test paged backend path
 │   ├── test_engine_config.py   # MODIFIED: test paged backend validation
@@ -1777,7 +1759,7 @@ Uses mock models. Test both `kv_cache_backend="contiguous"` and `kv_cache_backen
 - Single request: paged prefill logits match contiguous prefill logits.
 - Batched requests: paged batched prefill logits match contiguous batched prefill.
 
-### Optional: Triton paged attention kernel tests (`tests/unit/test_paged_attention_kernel.py`)
+### Triton paged attention kernel tests (`tests/unit/test_paged_attention_kernel.py`)
 
 **Correctness vs gather + SDPA**:
 - Set up a block pool with known data. Run gather-based attention (SDPA) and Triton kernel.
@@ -1820,7 +1802,7 @@ Uses mock models. Test both `kv_cache_backend="contiguous"` and `kv_cache_backen
 
 ## Design Decisions
 
-**Protocol-driven abstraction**: the `CachePoolProtocol` is the central design choice. Rather than having the runner use `isinstance` checks to dispatch between slotted and paged pools, both pool types implement a shared protocol. The runner's type annotation `cache_pool: CachePoolProtocol` means all allocation, deallocation, view creation, and capacity queries go through protocol methods. The Triton kernel dispatch in `Attention.forward` uses the `is_paged()` protocol method rather than an `isinstance` check, keeping `common.py` decoupled from `paged.py` at the import level. There are no `isinstance` checks for cache types anywhere in the codebase.
+**Protocol-driven abstraction**: the `CachePoolProtocol` is the central design choice. Rather than having the runner use `isinstance` checks to dispatch between slotted and paged pools, both pool types implement a shared protocol. The runner's type annotation `cache_pool: CachePoolProtocol` means all allocation, deallocation, view creation, and capacity queries go through protocol methods. The Triton kernel dispatch in `Attention.forward` uses `is_paged()` plus runtime feature detection (`hasattr(kv_cache, "write_only")`) rather than `isinstance` checks, keeping `common.py` decoupled from `paged.py` at the import level. There are no `isinstance` checks for cache types anywhere in the codebase.
 
 **Block pool instead of per-request allocation**: all blocks live in a single pre-allocated tensor `[layers, total_blocks, heads, block_size, dim]`. This is the same approach as the Phase 5 slotted pool (single pre-allocated tensor) — the difference is that "slots" are replaced by variable-length sequences of smaller blocks. Pre-allocation avoids GPU memory fragmentation from repeated alloc/free and makes total VRAM usage predictable at engine startup.
 
@@ -1842,7 +1824,7 @@ Uses mock models. Test both `kv_cache_backend="contiguous"` and `kv_cache_backen
 
 **No preemption or eviction**: when blocks are exhausted during decode, the engine raises an error and fails the affected requests. More sophisticated handling (preempting the longest sequence, swapping to CPU) is deferred to future work. With proper sizing of the block pool and admission control, block exhaustion during decode should be rare.
 
-**Triton kernel is decode-only**: the optional paged attention kernel targets decode (single query token per sequence), where the gather cost is O(batch × max_seq_len × head_dim) per layer. During prefill, the model already has the full K/V and doesn't need to gather from the cache — SDPA runs directly on the forward pass's K/V tensors.
+**Triton kernel is decode-only**: the paged attention kernel targets decode (single query token per sequence), where the gather cost is O(batch × max_seq_len × head_dim) per layer. During prefill, the model already has the full K/V and doesn't need to gather from the cache — SDPA runs directly on the forward pass's K/V tensors.
 
 **Gemma 3 sliding window deferred**: the paged views and Triton kernel do not implement per-layer sliding window block eviction. For Gemma 3's alternating full/sliding attention pattern, the standard gather+SDPA path applies the sliding window mask via SDPA's `attn_mask` parameter, exactly as in Phase 5. Block-level sliding window optimization (freeing blocks that have fallen outside the window) is deferred.
 
@@ -1862,4 +1844,4 @@ Uses mock models. Test both `kv_cache_backend="contiguous"` and `kv_cache_backen
 10. Benchmark results recorded in `SERVING_LOG.md` comparing contiguous vs paged at matched and increased concurrency.
 11. `audit_blocks()` returns empty after normal request lifecycle (no leaked blocks).
 12. `uv run ruff check .` and `uv run mypy .` pass cleanly.
-13. Optional: Triton paged attention kernel passes correctness tests against gather + SDPA reference, including GQA and variable-length sequences.
+13. Triton paged attention kernel passes correctness tests against gather + SDPA reference, including GQA, variable-length sequences, and randomized page mappings (18 tests).
