@@ -170,6 +170,31 @@ class ContinuousScheduler:
         self.active.extend(new)
         return new
 
+    def prefill_requests(self, max_chunks: int | None = None) -> list[Request]:
+        """Return active requests that need prefill work this step.
+
+        Includes both in-progress chunked prefills (PREFILL state with
+        ``prefill_progress < len(prompt_token_ids)``) and newly admitted
+        requests (WAITING state).
+
+        In-progress prefills are returned first (resume before starting
+        new), then newly admitted requests. The total is capped at
+        ``max_chunks`` to limit the batched prefill size.
+
+        Only meaningful when ``use_chunked_prefill=True``.
+        """
+        continuing: list[Request] = []
+        new: list[Request] = []
+        for r in self.active:
+            if r.state == RequestState.PREFILL and r.prefill_progress < len(r.prompt_token_ids):
+                continuing.append(r)
+            elif r.state == RequestState.WAITING:
+                new.append(r)
+        result = continuing + new
+        if max_chunks is not None:
+            result = result[:max_chunks]
+        return result
+
     def decode_requests(self) -> list[Request]:
         """Return active requests in DECODE state."""
         return [r for r in self.active if r.state == RequestState.DECODE]

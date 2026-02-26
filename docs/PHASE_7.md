@@ -762,8 +762,8 @@ The central advantage of batched chunked prefill is weight-loading amortization.
 ```text
 Approach                   N chunks   Forward passes   Weight reads (Llama 3B, ~6 GB)
 -------------------------  --------   --------------   ------------------------------
-Serial (one per chunk)          4               4   24 GB
-Batched                         4               1    6 GB
+Serial (one per chunk)          4                4      24 GB
+Batched                         4                1       6 GB
 ```
 
 Per step, the engine runs 2 forward passes total: 1 decode + 1 batched prefill. With serial processing, this would be 1 + N. The batched approach eliminates `N - 1` full weight reads.

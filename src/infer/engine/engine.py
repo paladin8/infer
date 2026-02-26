@@ -176,15 +176,23 @@ class Engine:
         free_kv_tokens = self.runner.free_kv_tokens()
 
         # Phase 4: Admit new requests with budget check.
-        prefill = self.scheduler.admit(free_kv_tokens=free_kv_tokens)
+        if self.config.use_chunked_prefill:
+            self.scheduler.admit(free_kv_tokens=free_kv_tokens)
+            # Phase 5a: Gather prefill work (all chunks batched together).
+            prefill = self.scheduler.prefill_requests(
+                max_chunks=self.config.max_prefill_chunks_per_step
+            )
+        else:
+            # Phase 5b: Only newly admitted requests (Phase 5/6 behavior).
+            prefill = self.scheduler.admit(free_kv_tokens=free_kv_tokens)
 
-        # Phase 5: Identify decode requests.
+        # Phase 6: Identify decode requests.
         decode = self.scheduler.decode_requests()
 
         if not prefill and not decode:
             return
 
-        # Phase 6: Execute forward passes.
+        # Phase 7: Execute forward passes.
         try:
             outputs = self.runner.step(prefill, decode)
             for req, output in outputs:
