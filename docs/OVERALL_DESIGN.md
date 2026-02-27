@@ -431,13 +431,16 @@ Goal:
 Deliverables:
 
 - Radix/prefix tree keyed by token ids.
-- Block refcounting and eviction policy.
-- Scheduler hook for prefix-hit short-circuit in prefill.
+- Block refcounting and LRU eviction policy.
+- Prefix-aware allocation and free in `PagedKVCachePool`.
+- Full-hit optimization (single last-token forward pass when entire prefix is cached).
 
 Exit criteria:
 
 - TTFT improvement on shared-prefix workload.
+- Correctness: identical output with/without prefix caching (greedy decode).
 - Cache correctness tests for refcount + eviction edge cases.
+- No regression when disabled.
 
 ---
 
@@ -483,7 +486,7 @@ class EngineConfig:
 Compatibility rules to enforce in config validation:
 
 - `use_chunked_prefill=True` requires `batching_mode="continuous"`.
-- `use_prefix_caching=True` requires `kv_cache_backend="paged"`.
+- `use_prefix_caching=True` requires `kv_cache_backend="paged"` and `use_chunked_prefill=True`.
 
 Benchmark matrix baseline:
 
