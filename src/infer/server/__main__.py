@@ -46,6 +46,24 @@ def main() -> None:
         default=None,
         help="total KV cache blocks, paged backend only (default: auto-compute)",
     )
+    parser.add_argument(
+        "--chunked-prefill",
+        action="store_true",
+        default=False,
+        help="enable chunked prefill (requires --batching-mode continuous)",
+    )
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=512,
+        help="tokens per prefill chunk (default: 512)",
+    )
+    parser.add_argument(
+        "--max-prefill-chunks-per-step",
+        type=int,
+        default=None,
+        help="cap on prefill chunks per step (default: no cap)",
+    )
     args = parser.parse_args()
 
     config = EngineConfig(
@@ -61,6 +79,9 @@ def main() -> None:
         kv_cache_backend=args.kv_cache_backend,
         block_size=args.block_size,
         num_gpu_blocks=args.num_gpu_blocks,
+        use_chunked_prefill=args.chunked_prefill,
+        prefill_chunk_size=args.prefill_chunk_size,
+        max_prefill_chunks_per_step=args.max_prefill_chunks_per_step,
     )
 
     app = create_app(config)
