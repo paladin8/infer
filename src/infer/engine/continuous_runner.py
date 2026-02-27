@@ -60,6 +60,7 @@ class ContinuousRunner:
                 block_size=config.block_size,
                 dtype=self.dtype,
                 device=config.device,
+                use_prefix_caching=config.use_prefix_caching,
             )
         else:
             self.cache_pool = SlottedKVCache.from_model_config(
@@ -230,15 +231,56 @@ class ContinuousRunner:
 
         Returns StepOutput for each request that completes prefill (last chunk),
         None for requests with intermediate chunks.
+
+        When prefix caching is enabled, newly admitted requests use
+        ``allocate_slot_with_prefix()`` to reuse cached KV blocks. If all
+        complete blocks are cached (full hit on a block-aligned prompt),
+        the request is handled via a single last-token forward pass instead
+        of the normal chunked path.
         """
         device = self.config.device
         chunk_size = self.config.prefill_chunk_size
+
+        # Allocate slots for first chunks.
+        for req in requests:
+            if req.prefill_progress == 0:
+                if self.config.use_prefix_caching:
+                    assert isinstance(self.cache_pool, PagedKVCachePool)
+                    slot, matched = self.cache_pool.allocate_slot_with_prefix(req.prompt_token_ids)
+                    req.slot_idx = slot
+                    req.prefill_progress = matched  # Skip cached prefix
+                else:
+                    slot = self.cache_pool.allocate_slot(initial_tokens=len(req.prompt_token_ids))
+                    req.slot_idx = slot
+                req.state = RequestState.PREFILL
+
+        # Separate full-hit requests (all complete blocks cached, block-aligned
+        # prompt) from requests that need normal chunked prefill.
+        outputs: list[StepOutput | None] = [None] * len(requests)
+        chunk_indices: list[int] = []
+
+        for i, req in enumerate(requests):
+            if req.prefill_progress == len(req.prompt_token_ids):
+                # Full hit: single last-token forward pass.
+                outputs[i] = self._prefill_full_hit(req)
+            else:
+                assert req.prefill_progress < len(req.prompt_token_ids), (
+                    f"prefill_progress ({req.prefill_progress}) exceeds "
+                    f"prompt_len ({len(req.prompt_token_ids)})"
+                )
+                chunk_indices.append(i)
+
+        if not chunk_indices:
+            return outputs
+
+        # Normal chunked prefill for remaining requests.
+        chunk_requests = [requests[i] for i in chunk_indices]
 
         # Compute per-request chunk bounds.
         start_positions: list[int] = []
         chunk_lens: list[int] = []
         chunk_ends: list[int] = []
-        for req in requests:
+        for req in chunk_requests:
             progress = req.prefill_progress
             prompt_len = len(req.prompt_token_ids)
             chunk_end = min(progress + chunk_size, prompt_len)
@@ -248,40 +290,33 @@ class ContinuousRunner:
 
         max_chunk_len = max(chunk_lens)
         max_kv_len = max(s + c for s, c in zip(start_positions, chunk_lens, strict=True))
-        batch_size = len(requests)
-
-        # Allocate slots for first chunks.
-        for req in requests:
-            if req.prefill_progress == 0:
-                slot = self.cache_pool.allocate_slot(initial_tokens=len(req.prompt_token_ids))
-                req.slot_idx = slot
-                req.state = RequestState.PREFILL
+        batch_size = len(chunk_requests)
 
         # Build padded input_ids [batch, max_chunk_len].
         padded_tokens: list[list[int]] = []
-        for i, req in enumerate(requests):
-            chunk_tokens = req.prompt_token_ids[start_positions[i] : chunk_ends[i]]
+        for j, req in enumerate(chunk_requests):
+            chunk_tokens = req.prompt_token_ids[start_positions[j] : chunk_ends[j]]
             padded_tokens.append(chunk_tokens + [0] * (max_chunk_len - len(chunk_tokens)))
         input_ids = torch.tensor(padded_tokens, dtype=torch.long, device=device)
 
         # Build position_ids [batch, max_chunk_len].
         # Real positions: [start_pos, start_pos + chunk_len). Padded positions: 0.
         position_ids = torch.zeros(batch_size, max_chunk_len, dtype=torch.long, device=device)
-        for i in range(batch_size):
-            position_ids[i, : chunk_lens[i]] = torch.arange(
-                start_positions[i],
-                start_positions[i] + chunk_lens[i],
+        for j in range(batch_size):
+            position_ids[j, : chunk_lens[j]] = torch.arange(
+                start_positions[j],
+                start_positions[j] + chunk_lens[j],
                 device=device,
             )
 
         # Build padding_mask [batch, max_kv_len]: True for valid KV positions.
         padding_mask = torch.zeros(batch_size, max_kv_len, dtype=torch.bool, device=device)
-        for i in range(batch_size):
-            kv_len = start_positions[i] + chunk_lens[i]
-            padding_mask[i, :kv_len] = True
+        for j in range(batch_size):
+            kv_len = start_positions[j] + chunk_lens[j]
+            padding_mask[j, :kv_len] = True
 
         # Cache view.
-        slots: list[int] = [req.slot_idx for req in requests]  # type: ignore[misc]
+        slots: list[int] = [req.slot_idx for req in chunk_requests]  # type: ignore[misc]
         assert all(s is not None for s in slots)
         view = self.cache_pool.batched_chunked_prefill_view(slots, start_positions, chunk_lens)
 
@@ -295,18 +330,22 @@ class ContinuousRunner:
         # logits: [batch, max_chunk_len, vocab_size]
 
         # Update progress and handle last chunks.
-        outputs: list[StepOutput | None] = []
-        for i, req in enumerate(requests):
-            req.prefill_progress = chunk_ends[i]
-            is_last = chunk_ends[i] == len(req.prompt_token_ids)
+        for j, req in enumerate(chunk_requests):
+            req.prefill_progress = chunk_ends[j]
+            is_last = chunk_ends[j] == len(req.prompt_token_ids)
 
             if not is_last:
-                outputs.append(None)
                 continue
 
+            # Insert prefix blocks into tree after last chunk.
+            if self.config.use_prefix_caching:
+                assert isinstance(self.cache_pool, PagedKVCachePool)
+                assert req.slot_idx is not None
+                self.cache_pool.insert_prefix(req.slot_idx, req.prompt_token_ids)
+
             # Last chunk: sample first token at actual last position.
-            last_pos = chunk_lens[i] - 1
-            next_logits = logits[i, last_pos, :]
+            last_pos = chunk_lens[j] - 1
+            next_logits = logits[j, last_pos, :]
             context = req.prompt_token_ids
             token = sample_token(next_logits, context, req.sampling_params, req.generator)
             req.generated_token_ids.append(token)
@@ -325,9 +364,67 @@ class ContinuousRunner:
                 if reason == "stop":
                     text_delta = truncate_at_stop(text, 0, req)
 
-            outputs.append(make_step_output(req, token, text_delta, finished, reason))
+            outputs[chunk_indices[j]] = make_step_output(req, token, text_delta, finished, reason)
 
         return outputs
+
+    @torch.inference_mode()
+    def _prefill_full_hit(self, req: Request) -> StepOutput:
+        """Handle a full prefix cache hit with a single last-token forward pass.
+
+        When all complete blocks of a block-aligned prompt are cached,
+        only one forward pass with the last prompt token is needed to
+        produce logits. The chunked prefill view gathers the full cached
+        KV for attention.
+        """
+        device = self.config.device
+        assert isinstance(self.cache_pool, PagedKVCachePool)
+        assert req.slot_idx is not None
+        slot = req.slot_idx
+        prompt_len = len(req.prompt_token_ids)
+
+        # input_ids: just the last prompt token.
+        input_ids = torch.tensor([[req.prompt_token_ids[-1]]], dtype=torch.long, device=device)
+        # position_ids: last prompt position.
+        position_ids = torch.tensor([[prompt_len - 1]], dtype=torch.long, device=device)
+        # Cache view: start_pos = prompt_len - 1, chunk_len = 1.
+        # Gathers all cached KV from [0, prompt_len) for attention.
+        view = self.cache_pool.batched_chunked_prefill_view([slot], [prompt_len - 1], [1])
+        # Padding mask: all positions valid.
+        padding_mask = torch.ones(1, prompt_len, dtype=torch.bool, device=device)
+
+        logits = self.model(
+            input_ids,
+            kv_cache=view,
+            padding_mask=padding_mask,
+            position_ids=position_ids,
+        )
+
+        # Insert prefix blocks into tree (no-op for full hit since all
+        # blocks were already in the tree from the prior match).
+        self.cache_pool.insert_prefix(slot, req.prompt_token_ids)
+
+        # Sample first token.
+        next_logits = logits[0, -1, :]
+        context = req.prompt_token_ids
+        token = sample_token(next_logits, context, req.sampling_params, req.generator)
+        req.generated_token_ids.append(token)
+        req.state = RequestState.DECODE
+
+        # Initialize text tracking.
+        text = self.tokenizer.decode(req.generated_token_ids, skip_special_tokens=True)
+        text_delta = text
+        self._prev_text_lens[req.request_id] = len(text)
+
+        # Check stop conditions.
+        finished, reason = check_stop(req, token, self.tokenizer)
+        if finished:
+            req.state = RequestState.FINISHED
+            req.finish_reason = reason
+            if reason == "stop":
+                text_delta = truncate_at_stop(text, 0, req)
+
+        return make_step_output(req, token, text_delta, finished, reason)
 
     @torch.inference_mode()
     def _batched_decode(self, requests: list[Request]) -> list[StepOutput]:

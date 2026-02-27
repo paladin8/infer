@@ -177,3 +177,48 @@ class TestChunkedPrefillConfig:
             prefill_chunk_size=0,
         )
         assert cfg.prefill_chunk_size == 0
+
+
+class TestPrefixCachingConfig:
+    def test_default_disabled(self) -> None:
+        cfg = EngineConfig(model="m")
+        assert cfg.use_prefix_caching is False
+
+    def test_prefix_caching_accepted(self) -> None:
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="continuous",
+            kv_cache_backend="paged",
+            use_chunked_prefill=True,
+            use_prefix_caching=True,
+        )
+        assert cfg.use_prefix_caching is True
+
+    def test_prefix_requires_paged(self) -> None:
+        with pytest.raises(ValueError, match="kv_cache_backend='paged'"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                kv_cache_backend="contiguous",
+                use_chunked_prefill=True,
+                use_prefix_caching=True,
+            )
+
+    def test_prefix_requires_chunked_prefill(self) -> None:
+        with pytest.raises(ValueError, match="use_chunked_prefill=True"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                kv_cache_backend="paged",
+                use_chunked_prefill=False,
+                use_prefix_caching=True,
+            )
+
+    def test_disabled_skips_validation(self) -> None:
+        """When use_prefix_caching=False, backend/chunked requirements don't apply."""
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="static",
+            use_prefix_caching=False,
+        )
+        assert cfg.use_prefix_caching is False

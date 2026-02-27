@@ -64,6 +64,12 @@ def main() -> None:
         default=None,
         help="cap on prefill chunks per step (default: no cap)",
     )
+    parser.add_argument(
+        "--prefix-caching",
+        action="store_true",
+        default=False,
+        help="enable prefix caching (requires --kv-cache-backend paged and --chunked-prefill)",
+    )
     args = parser.parse_args()
 
     config = EngineConfig(
@@ -82,6 +88,7 @@ def main() -> None:
         use_chunked_prefill=args.chunked_prefill,
         prefill_chunk_size=args.prefill_chunk_size,
         max_prefill_chunks_per_step=args.max_prefill_chunks_per_step,
+        use_prefix_caching=args.prefix_caching,
     )
 
     app = create_app(config)

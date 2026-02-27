@@ -29,6 +29,8 @@ class EngineConfig:
         use_chunked_prefill: Split long prefills into chunks (Phase 7).
         prefill_chunk_size: Tokens per prefill chunk.
         max_prefill_chunks_per_step: Cap on chunks per step (``None`` = no cap).
+        use_prefix_caching: Cache KV blocks for shared prefixes (Phase 8).
+            Requires ``kv_cache_backend="paged"`` and ``use_chunked_prefill=True``.
     """
 
     model: str
@@ -51,6 +53,9 @@ class EngineConfig:
     use_chunked_prefill: bool = False
     prefill_chunk_size: int = 512
     max_prefill_chunks_per_step: int | None = None  # None = no cap (batch all)
+
+    # Prefix caching.
+    use_prefix_caching: bool = False
 
     # Paged backend configuration.
     block_size: int = 16  # tokens per KV cache block (paged backend only)
@@ -108,3 +113,8 @@ class EngineConfig:
                 raise ValueError(f"block_size must be >= 1, got {self.block_size}")
             if self.num_gpu_blocks is not None and self.num_gpu_blocks < 1:
                 raise ValueError(f"num_gpu_blocks must be >= 1, got {self.num_gpu_blocks}")
+        if self.use_prefix_caching:
+            if self.kv_cache_backend != "paged":
+                raise ValueError("Prefix caching requires kv_cache_backend='paged'")
+            if not self.use_chunked_prefill:
+                raise ValueError("Prefix caching requires use_chunked_prefill=True")
