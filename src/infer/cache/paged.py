@@ -902,6 +902,12 @@ class GraphPagedDecodeCacheView:
         self.pool.k[layer_idx][self._write_block_ids, :, self._write_offsets, :] = k_new
         self.pool.v[layer_idx][self._write_block_ids, :, self._write_offsets, :] = v_new
 
+    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Not supported. Use ``write_only()`` for CUDA graph decode."""
+        raise NotImplementedError(
+            "GraphPagedDecodeCacheView does not support update(); use write_only()"
+        )
+
     def advance(self, n: int) -> None:
         """No-op. CPU state is updated by CUDAGraphRunner after replay."""
 

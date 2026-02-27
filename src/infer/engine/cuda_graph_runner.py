@@ -84,8 +84,12 @@ class CUDAGraphRunner:
         activation memory is reused (only one graph runs at a time).
         """
         # Reserve a scratch block for padding slot writes.
+        # Use a sentinel sequence ID (-1) in page_tables so the block
+        # is not flagged as leaked by audit_blocks().
         scratch_blocks = self.cache_pool.allocator.allocate(1)
         self._scratch_block = scratch_blocks[0]
+        self.cache_pool.page_tables[-1] = [self._scratch_block]
+        self.cache_pool.seq_lens[-1] = 0
 
         for bucket in _BATCH_BUCKETS:
             if bucket > self.config.max_batch_size:
@@ -95,7 +99,8 @@ class CUDAGraphRunner:
     def _capture_for_batch_size(self, batch_size: int) -> CapturedGraph:
         """Capture a CUDA graph for the given batch size."""
         device = self.config.device
-        max_blocks = self.config.max_seq_len // self.cache_pool.block_size
+        block_size = self.cache_pool.block_size
+        max_blocks = (self.config.max_seq_len + block_size - 1) // block_size
 
         # Pre-allocate static tensors.
         input_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
@@ -174,7 +179,10 @@ class CUDAGraphRunner:
         int_slots: list[int] = slots  # type: ignore[assignment]
 
         # 1. Block allocation (Python, before graph).
-        _ = cache_pool.decode_view(int_slots)  # triggers _ensure_blocks_allocated
+        # PagedDecodeCacheView.__init__ does NOT allocate blocks; allocation is
+        # lazy inside update()/write_only(). We must trigger it explicitly.
+        tmp_view = cache_pool.decode_view(int_slots)
+        tmp_view._ensure_blocks_allocated()
 
         # 2. Prepare inputs.
         tokens = [req.generated_token_ids[-1] for req in requests]
