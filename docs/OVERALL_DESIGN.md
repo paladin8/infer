@@ -466,10 +466,12 @@ Deliverables:
 
 - `CUDAGraphRunner` wrapper that captures and replays the decode forward pass.
 - Pre-allocated placeholder tensors for all graph inputs/outputs (fixed memory addresses required by CUDA graphs).
-- Graph pool keyed by batch size — record a graph for each batch size on first encounter, reuse on subsequent steps.
-- Padding strategy for batch sizes that don't have a cached graph (pad up to the nearest recorded size or record on demand with a cap).
+- `GraphPagedDecodeCacheView` with static GPU tensors for page tables, sequence lengths, and KV write indices.
+- Graph pool keyed by batch size — power-of-2 buckets (1, 2, 4, 8, 16, 32) pre-captured at startup, with padding to nearest bucket.
+- Model forward change: skip mask creation for decode when `padding_mask=None`, enabling Triton paged attention dispatch and graph capture.
+- Triton paged attention kernel extended with `window_size` parameter for Gemma 3 sliding-window layers.
 - Integration with `ContinuousRunner`: intercept only the decode path (prefill stays eager since shapes vary per request).
-- Warmup phase on server startup to pre-record graphs for common batch sizes.
+- Eager warmup at server startup to pre-record graphs for all power-of-2 batch sizes up to `max_batch_size`. Batch sizes exceeding the largest bucket fall back to eager mode.
 - `use_cuda_graphs: bool` flag in `EngineConfig` (default `False`).
 
 Constraints:
@@ -649,7 +651,7 @@ Compatibility rules to enforce in config validation:
 
 - `use_chunked_prefill=True` requires `batching_mode="continuous"`.
 - `use_prefix_caching=True` requires `kv_cache_backend="paged"` and `use_chunked_prefill=True`.
-- `use_cuda_graphs=True` requires `batching_mode="continuous"`.
+- `use_cuda_graphs=True` requires `batching_mode="continuous"` and `kv_cache_backend="paged"`.
 - `use_speculative_decoding=True` requires `draft_model` to be set.
 - `quantization` must be `None`, `"int8"`, or `"int4"`.
 
@@ -874,7 +876,7 @@ infer/
 
 ## 15. Open Questions
 
-- Phase 9: Should CUDA graphs be recorded lazily (on first encounter of each batch size) or eagerly (pre-record a fixed set at startup)? Lazy is simpler but adds latency on first encounter; eager requires knowing the batch size set in advance.
+- ~~Phase 9: Should CUDA graphs be recorded lazily (on first encounter of each batch size) or eagerly (pre-record a fixed set at startup)?~~ **Resolved in Phase 9 design:** Eager warmup at startup for power-of-2 batch sizes (1, 2, 4, 8, 16, 32). This avoids first-encounter latency during serving while keeping the number of captured graphs bounded. Batch sizes exceeding the largest bucket fall back to eager mode. See `docs/PHASE_9.md` for details.
 - Phase 10: Prioritize pre-quantized checkpoint loading (AWQ/GPTQ) or on-the-fly quantization from bf16? Pre-quantized is more practical but requires checkpoint-format parsing; on-the-fly is simpler but slower to load.
 - Phase 11: What draft/target model pairs to benchmark? Llama-1B/Llama-3B is the natural pair, but Qwen3-1.7B/Qwen3-4B is also viable. Need to verify tokenizer compatibility.
 - Phase 12: Build the FSM compiler from scratch or use an existing library (e.g. `outlines-core`)? Building from scratch is more educational but significantly more work.
