@@ -36,17 +36,22 @@ Phases 6-8 are advanced extensions, not required for v1.
 
 To keep implementation tractable, phases are grouped into milestones:
 
-| Milestone | Phases | Outcome |
-|----------|--------|---------|
-| M1 Core Inference | 1a-3.1 | Single-request generation with KV cache + Triton kernels |
-| M2 Serving MVP | 4-5 | Multi-request serving with continuous batching + SSE |
-| M3 Advanced Memory/Scheduling | 6-8 | Paged attention, chunked prefill, prefix caching |
+| Milestone                      | Phases | Outcome                                                     |
+|--------------------------------|--------|-------------------------------------------------------------|
+| M1 Core Inference              | 1a-3.1 | Single-request generation with KV cache + Triton kernels    |
+| M2 Serving MVP                 | 4-5    | Multi-request serving with continuous batching + SSE        |
+| M3 Advanced Memory/Scheduling  | 6-8    | Paged attention, chunked prefill, prefix caching            |
+| M4 Execution Efficiency        | 9-10   | CUDA graphs for decode, weight quantization for larger models |
+| M5 Advanced Decoding           | 11-12  | Speculative decoding, structured output                     |
 
 Guardrails:
 
 - Do not start M2 until Phase 3 correctness and speedup checks are complete.
 - Do not start M3 until M2 benchmarks and API stability checks are complete.
 - M3 features remain optional feature flags and must not regress M2 behavior when disabled.
+- Do not start M4 until M3 benchmarks are complete.
+- M4 and M5 features remain optional feature flags and must not regress M3 behavior when disabled.
+- M5 phases (11-12) are independent of each other and can be implemented in either order.
 
 ---
 
@@ -447,6 +452,147 @@ Exit criteria:
 
 See `docs/PHASE_8.md` for the full design.
 
+### Phase 9: CUDA Graphs
+
+Goal:
+
+- Eliminate CPU-side kernel launch overhead during decode by capturing the decode forward pass into a CUDA graph and replaying it each step.
+
+Background:
+
+During decode, each step executes the same sequence of GPU kernels with the same shapes — only the tensor contents change. Normally the CPU submits each kernel individually, and for small/fast decode kernels the GPU can finish before the CPU has submitted the next one, leaving the GPU idle between launches. A Llama-3B decode step has ~100+ kernel launches at 5-15us each, adding 0.5-1.5ms of pure CPU overhead per step against ~10-15ms of GPU compute. CUDA graphs capture the full kernel sequence once, then replay it with a single CPU call, eliminating the gaps.
+
+Deliverables:
+
+- `CUDAGraphRunner` wrapper that captures and replays the decode forward pass.
+- Pre-allocated placeholder tensors for all graph inputs/outputs (fixed memory addresses required by CUDA graphs).
+- Graph pool keyed by batch size — record a graph for each batch size on first encounter, reuse on subsequent steps.
+- Padding strategy for batch sizes that don't have a cached graph (pad up to the nearest recorded size or record on demand with a cap).
+- Integration with `ContinuousRunner`: intercept only the decode path (prefill stays eager since shapes vary per request).
+- Warmup phase on server startup to pre-record graphs for common batch sizes.
+- `use_cuda_graphs: bool` flag in `EngineConfig` (default `False`).
+
+Constraints:
+
+- All tensors touched by the graph must remain at fixed addresses between replays. Intermediate activation buffers must be pre-allocated, not dynamically created.
+- No Python-level control flow inside the captured region. The decode path must be branch-free (already the case — decode is always `seq_len == 1` per sequence).
+- Paged attention compatibility: the page table tensor stays at a fixed address; its contents are updated before replay.
+- KV cache writes must land in the same backing storage (already satisfied by paged/slotted pools).
+
+Exit criteria:
+
+- Measurable decode throughput improvement (expect 5-15%) on baseline and continuous_batching workloads.
+- No correctness regression: greedy decode output identical with and without CUDA graphs.
+- No regression when disabled.
+- Graph memory overhead documented (VRAM for placeholder tensors + graph capture).
+
+### Phase 10: Weight Quantization
+
+Goal:
+
+- Support INT8 and INT4 weight quantization to reduce memory footprint, enabling larger models (7-8B class) on 16 GB VRAM and improving memory-bandwidth-bound decode throughput.
+
+Background:
+
+Unquantized bf16 weights for a 7B model require ~14 GB, leaving almost no room for KV cache on a 16 GB card. INT8 halves weight memory to ~7 GB, and INT4 quarters it to ~3.5 GB, making 7-8B models practical. Decode throughput is memory-bandwidth-bound (reading weights dominates), so smaller weights directly translate to faster decode — in theory 2x for INT8 and up to 4x for INT4 (in practice limited by dequantization overhead).
+
+Deliverables:
+
+- Quantization-aware weight loader: detect quantized checkpoints (AWQ, GPTQ formats) and load pre-quantized weights, or quantize bf16 weights at load time.
+- `QuantizedLinear` module replacing `nn.Linear` for quantized layers, storing packed integer weights and scale/zero-point tensors.
+- Triton dequantizing matmul kernels for INT8 and INT4 (fused weight dequantization + GEMM to avoid materializing full fp16 weights).
+- Per-architecture support: quantize all linear layers in attention (Q/K/V/O projections) and MLP (gate/up/down projections). Norms and embeddings stay in original precision.
+- `quantization: str | None` config field in `EngineConfig` (`None`, `"int8"`, `"int4"`).
+- Model registry integration: `load_model` auto-detects quantization format from checkpoint metadata or applies quantization based on config.
+
+Constraints:
+
+- Quality impact must be measured: compare perplexity or generation quality of quantized vs full-precision models on a fixed set of prompts.
+- INT4 groupwise quantization (group size 128) to limit accuracy loss.
+- Pre-quantized checkpoint support (AWQ format) takes priority over on-the-fly quantization.
+
+Exit criteria:
+
+- Successfully load and serve a 7-8B model (e.g. `Llama-3.1-8B-Instruct`) on 16 GB VRAM with INT4 quantization.
+- Measurable decode throughput improvement from reduced weight memory bandwidth.
+- Generation quality sanity check: quantized model produces coherent, reasonable output on standard prompts.
+- All existing tests pass with `quantization=None` (no regression).
+- Benchmark report comparing bf16 vs INT8 vs INT4 on throughput, VRAM usage, and output quality.
+
+### Phase 11: Speculative Decoding
+
+Goal:
+
+- Accelerate decode by using a smaller draft model to propose multiple tokens per step, verified in a single forward pass of the target model.
+
+Background:
+
+Autoregressive decode is sequential — one forward pass per token. Speculative decoding breaks this by running a fast draft model (e.g. Llama-1B) to generate K candidate tokens, then verifying all K in one forward pass of the target model (e.g. Llama-3B). If the target model agrees with N of the K candidates, you get N+1 tokens for the cost of one target forward pass plus K cheap draft passes. At high acceptance rates (70-90% for well-matched draft/target pairs), this yields 2-3x effective decode speedup without any change to output distribution.
+
+Deliverables:
+
+- `DraftTargetRunner` that orchestrates the draft-then-verify loop.
+- Draft model loading: load a second, smaller model alongside the target model. Both models share the same tokenizer.
+- Draft generation loop: run the draft model autoregressively for K steps (configurable `spec_length`, default 5), producing K candidate token IDs and their log-probabilities.
+- Target verification pass: run the target model on all K candidates in a single forward pass, compare target log-probabilities against draft log-probabilities to determine acceptance.
+- Rejection sampling: use the standard speculative decoding acceptance criterion (accept token i if `target_prob[i] >= draft_prob[i]`, otherwise accept with probability `target_prob[i] / draft_prob[i]`) to guarantee the output distribution is identical to pure target-model sampling.
+- KV cache management: draft model gets its own lightweight KV cache. On rejection, roll back both draft and target KV caches to the last accepted position.
+- Integration with continuous batching: speculative decoding applies per-sequence within the existing scheduler. Sequences using speculation coexist with non-speculative sequences in the same batch.
+- `use_speculative_decoding: bool` and `draft_model: str | None` fields in `EngineConfig`.
+
+Constraints:
+
+- Output distribution must be provably identical to non-speculative decoding (this is the key property of speculative decoding — it's lossless).
+- Draft model must share the same tokenizer/vocabulary as the target model.
+- VRAM budget must account for both models: draft model weights + draft KV cache + target model weights + target KV cache. This favors small draft models (1B class).
+- Greedy decode shortcut: under greedy sampling (`temperature=0`), acceptance simplifies to exact token match (no rejection sampling needed).
+
+Exit criteria:
+
+- Measurable tokens-per-second improvement on single-request decode (expect 1.5-2.5x depending on draft/target pair and acceptance rate).
+- Correctness: output is statistically identical to non-speculative sampling (verified via greedy decode exact match and sampling distribution tests with fixed seeds).
+- Acceptance rate logging per request for tuning `spec_length`.
+- No regression when disabled.
+- Benchmark comparing speculative vs non-speculative decode on baseline workload.
+
+### Phase 12: Structured Output
+
+Goal:
+
+- Constrain token generation to follow a schema (JSON schema or regex), enabling reliable structured output without post-hoc parsing or retries.
+
+Background:
+
+LLMs generate free-form text, but many applications need structured output (JSON objects, enum values, function call arguments). Structured output works by masking logits at each decode step: before sampling, set the logits of all tokens that would violate the grammar to `-inf`, so only valid continuations can be chosen. This requires tracking the current state in the grammar and computing which tokens are valid next — essentially intersecting the LLM's vocabulary with the set of strings accepted by the grammar from the current position.
+
+Deliverables:
+
+- Grammar representation: compile a JSON schema or regex pattern into a finite-state machine (FSM) where each state maps to a set of allowed token IDs.
+- `FSMCompiler` that takes a JSON schema or regex and produces an `FSM` with:
+  - `initial_state`: starting state.
+  - `allowed_tokens(state) -> set[int]`: valid token IDs from the current state.
+  - `next_state(state, token_id) -> state`: advance the FSM after a token is accepted.
+  - `is_terminal(state) -> bool`: whether the current state is a valid completion point.
+- Vocabulary pre-processing: for each FSM state, pre-compute the set of allowed token IDs by testing every vocabulary entry against the grammar transitions. Cache this mapping (state -> token mask) since it's expensive to compute but reusable across requests with the same schema.
+- `LogitMaskProcessor` that plugs into the sampler pipeline: given the current FSM state, applies `-inf` mask to disallowed tokens before temperature/top-k/top-p.
+- Per-request FSM state tracking: each `Request` carries its own FSM state, advanced after each token is sampled.
+- API extension: add `response_format` field to the completions request (`{"type": "json_schema", "schema": {...}}` or `{"type": "regex", "pattern": "..."}`).
+- Support for common JSON schema features: object, array, string, number, boolean, null, enum, required fields, nested objects. Does not need to cover the full JSON Schema spec.
+
+Constraints:
+
+- Token healing: some tokens span grammar boundaries (e.g. `"}` includes both a string close and object close). The FSM must handle multi-character tokens correctly by checking whether the token's decoded string is a valid prefix or completion of the expected grammar production.
+- Performance: logit masking must not add significant per-token latency. Pre-computed state-to-mask lookup should be O(1) per token. FSM compilation can be slower (one-time cost per unique schema).
+- Unconstrained mode must have zero overhead (no masking when `response_format` is not set).
+
+Exit criteria:
+
+- JSON schema mode produces valid JSON matching the schema for 100% of test cases (on a suite of at least 20 diverse schemas).
+- Regex mode produces strings matching the pattern for 100% of test cases.
+- No measurable throughput regression when structured output is not requested.
+- Correctness tests for edge cases: empty objects, nested arrays, enum constraints, numeric ranges.
+- Benchmark comparing unconstrained vs structured output generation speed.
+
 ---
 
 ## 8. Engine Configuration and Feature Flags
@@ -484,6 +630,17 @@ class EngineConfig:
     # Prefix caching
     use_prefix_caching: bool = False
 
+    # CUDA graphs (Phase 9)
+    use_cuda_graphs: bool = False
+
+    # Quantization (Phase 10)
+    quantization: str | None = None    # None | "int8" | "int4"
+
+    # Speculative decoding (Phase 11)
+    use_speculative_decoding: bool = False
+    draft_model: str | None = None
+    spec_length: int = 5               # candidate tokens per speculation step
+
     # Attention backend (Triton paged kernel auto-dispatches for paged decode)
     attention_backend: str = "sdpa"    # "naive" | "sdpa" | "flash"
 ```
@@ -492,6 +649,9 @@ Compatibility rules to enforce in config validation:
 
 - `use_chunked_prefill=True` requires `batching_mode="continuous"`.
 - `use_prefix_caching=True` requires `kv_cache_backend="paged"` and `use_chunked_prefill=True`.
+- `use_cuda_graphs=True` requires `batching_mode="continuous"`.
+- `use_speculative_decoding=True` requires `draft_model` to be set.
+- `quantization` must be `None`, `"int8"`, or `"int4"`.
 
 Benchmark matrix baseline:
 
@@ -590,6 +750,8 @@ Milestone gates:
 - M1 gate: single-layer parity (1a) + full-model parity (1b) + deterministic generation + KV cache regression tests.
 - M2 gate: API compatibility tests + load test with no deadlocks/starvation.
 - M3 gate: new feature enabled/disabled equivalence tests and no M2 regressions.
+- M4 gate: CUDA graph decode parity + quantized model loads and generates + no M3 regressions when disabled.
+- M5 gate: speculative decode distribution correctness + structured output schema compliance + no M4 regressions when disabled.
 
 ---
 
@@ -632,6 +794,8 @@ infer/
 │       │   ├── runner.py
 │       │   ├── runner_helpers.py
 │       │   ├── continuous_runner.py
+│       │   ├── cuda_graph_runner.py
+│       │   ├── speculative_runner.py
 │       │   ├── scheduler.py
 │       │   ├── sampler.py
 │       │   └── generate.py
@@ -647,7 +811,16 @@ infer/
 │       │   ├── rope.py
 │       │   ├── fused_norm_residual.py
 │       │   ├── activation.py
-│       │   └── paged_attention.py
+│       │   ├── paged_attention.py
+│       │   └── quantized_matmul.py
+│       ├── quant/
+│       │   ├── __init__.py
+│       │   ├── quantize.py
+│       │   └── linear.py
+│       ├── grammar/
+│       │   ├── __init__.py
+│       │   ├── fsm.py
+│       │   └── compiler.py
 │       └── server/
 │           ├── __init__.py
 │           ├── api.py
@@ -673,7 +846,11 @@ infer/
     ├── PHASE_5.md
     ├── PHASE_6.md
     ├── PHASE_7.md
-    └── PHASE_8.md
+    ├── PHASE_8.md
+    ├── PHASE_9.md
+    ├── PHASE_10.md
+    ├── PHASE_11.md
+    └── PHASE_12.md
 ```
 
 ---
@@ -697,7 +874,10 @@ infer/
 
 ## 15. Open Questions
 
-None currently. Re-open after Phase 5 policy benchmarking if additional scheduler policies are needed.
+- Phase 9: Should CUDA graphs be recorded lazily (on first encounter of each batch size) or eagerly (pre-record a fixed set at startup)? Lazy is simpler but adds latency on first encounter; eager requires knowing the batch size set in advance.
+- Phase 10: Prioritize pre-quantized checkpoint loading (AWQ/GPTQ) or on-the-fly quantization from bf16? Pre-quantized is more practical but requires checkpoint-format parsing; on-the-fly is simpler but slower to load.
+- Phase 11: What draft/target model pairs to benchmark? Llama-1B/Llama-3B is the natural pair, but Qwen3-1.7B/Qwen3-4B is also viable. Need to verify tokenizer compatibility.
+- Phase 12: Build the FSM compiler from scratch or use an existing library (e.g. `outlines-core`)? Building from scratch is more educational but significantly more work.
 
 ---
 
@@ -711,3 +891,9 @@ None currently. Re-open after Phase 5 policy benchmarking if additional schedule
 - [Triton tutorials](https://triton-lang.org/main/getting-started/tutorials/)
 - [vLLM source code](https://github.com/vllm-project/vllm)
 - [SGLang source code](https://github.com/sgl-project/sglang)
+- [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192)
+- [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318)
+- [AWQ: Activation-aware Weight Quantization](https://arxiv.org/abs/2306.00978)
+- [GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers](https://arxiv.org/abs/2210.17323)
+- [Efficient Guided Generation for Large Language Models (Outlines)](https://arxiv.org/abs/2307.09702)
+- [CUDA Graphs (NVIDIA docs)](https://developer.nvidia.com/blog/cuda-graphs/)
