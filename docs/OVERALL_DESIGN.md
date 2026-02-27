@@ -488,6 +488,10 @@ Exit criteria:
 - No regression when disabled.
 - Graph memory overhead documented (VRAM for placeholder tensors + graph capture).
 
+**Status: COMPLETE (not recommended for use).** All deliverables implemented and benchmarked on all three models. CUDA graph capture/replay is functionally correct, but profiling reveals that Triton-compiled kernels replay 75--145% slower inside CUDA graphs than they execute eagerly, resulting in a net throughput regression across all workloads (e.g. Llama baseline -38%, Gemma3 baseline -42%). The implementation and `--cuda-graphs` flag are kept for reference but should not be enabled for performance. See `docs/PHASE_9.md` for design and `benchmarks/log/SERVING_LOG.md` Phase 9 for profiling details. 1000 tests pass.
+
+See `docs/PHASE_9.md` for the full design.
+
 ### Phase 10: Weight Quantization
 
 Goal:
@@ -752,7 +756,7 @@ Milestone gates:
 - M1 gate: single-layer parity (1a) + full-model parity (1b) + deterministic generation + KV cache regression tests.
 - M2 gate: API compatibility tests + load test with no deadlocks/starvation.
 - M3 gate: new feature enabled/disabled equivalence tests and no M2 regressions.
-- M4 gate: CUDA graph decode parity + quantized model loads and generates + no M3 regressions when disabled.
+- M4 gate: CUDA graph decode functional correctness (note: not a performance win due to Triton/graph incompatibility) + quantized model loads and generates + no M3 regressions when disabled.
 - M5 gate: speculative decode distribution correctness + structured output schema compliance + no M4 regressions when disabled.
 
 ---

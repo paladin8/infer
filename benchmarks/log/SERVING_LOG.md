@@ -515,3 +515,121 @@ The prefix_caching workload is the headline comparison — 48 requests share a ~
 **Non-prefix workloads**: baseline, continuous_batching, paged_attention, and chunked_prefill show no regression — the prefix tree adds negligible overhead when prompts don't share prefixes. The chunked_prefill workload (different prompts, no sharing) fills and evicts the tree continuously without impacting performance.
 
 **Bug fix during benchmarking**: The initial chunked_prefill run had 46/48 errors ("Cannot allocate 1 blocks: only 0 free") because decode block allocation didn't evict from the prefix tree. Fixed by adding eviction-aware allocation to `PagedDecodeCacheView._ensure_blocks_allocated()`. Without prefix reuse, completed request blocks stay in the tree as evictable; the decode allocator must evict them when the free pool is exhausted.
+
+---
+
+## Phase 9 — CUDA Graphs
+
+Server launched with `--batching-mode continuous --kv-cache-backend paged --chunked-prefill --prefill-chunk-size 512 --prefix-caching --cuda-graphs`. Same hardware, seed=42. CUDA graphs capture the decode forward pass into pre-recorded graphs for power-of-2 batch size buckets (1, 2, 4, 8, 16, 32), replaying them with a single CPU call per step to eliminate kernel launch overhead. Prefill remains eager. Graphs are warmed up at server startup.
+
+Per-model server config (same batch/block settings as Phase 8):
+
+| Model  | max-batch-size | num-gpu-blocks |
+|--------|---------------:|---------------:|
+| Llama  |             24 |           2048 |
+| Qwen3  |             16 |   1024 (1536*) |
+| Gemma3 |             24 |           2048 |
+
+\* Qwen3 prefix_caching uses 1536 blocks (same as Phase 6/7/8).
+
+### baseline — Sequential Single Requests
+
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) |  53.8 |  42.2 |   50.1 |
+| TTFT P50 (ms)      |    44 |    53 |     36 |
+| TTFT P99 (ms)      |    49 |    56 |     39 |
+| ITL P50 (ms)       |    18 |    23 |     20 |
+| ITL P99 (ms)       |    21 |    26 |     21 |
+| Latency P50 (s)    | 4.744 | 6.043 |  5.107 |
+
+### continuous_batching — Staggered Arrivals
+
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) | 291.7 | 155.1 |  268.7 |
+| TTFT P50 (ms)      |   168 |  1215 |    159 |
+| TTFT P99 (ms)      |   702 | 11690 |   1674 |
+| ITL P50 (ms)       |    47 |    80 |     56 |
+| ITL P99 (ms)       |    91 |   129 |     79 |
+| Latency P50 (s)    | 7.471 |16.133 |  8.918 |
+| Errors             |     0 |     0 |      0 |
+
+### paged_attention — Single Burst, Moderate Lengths
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  440.2 |  175.3 |  323.7 |
+| TTFT P50 (ms)      |   3677 |  14887 |   5142 |
+| TTFT P99 (ms)      |  11744 |  39640 |  16972 |
+| ITL P50 (ms)       |     44 |     80 |     67 |
+| ITL P99 (ms)       |     85 |    126 |     81 |
+| Latency P50 (s)    | 13.001 | 32.345 | 18.878 |
+| Errors             |      0 |      0 |      0 |
+
+### chunked_prefill — Long Prompts, Poisson Arrivals
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  216.7 |  155.9 |  262.9 |
+| TTFT P50 (ms)      |   3597 |  13389 |   1866 |
+| TTFT P99 (ms)      |  17889 |  28550 |  12705 |
+| ITL P50 (ms)       |     90 |     81 |     77 |
+| ITL P99 (ms)       |    215 |    197 |    112 |
+| Latency P50 (s)    | 21.021 | 26.731 | 16.052 |
+| Errors             |      0 |      0 |      0 |
+
+### prefix_caching — Shared System Prompt
+
+Qwen3 uses 1536 blocks for this workload.
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  330.4 |  190.1 |  315.6 |
+| TTFT P50 (ms)      |   6458 |  19382 |   6801 |
+| TTFT P99 (ms)      |  15103 |  38548 |  16137 |
+| ITL P50 (ms)       |     67 |     81 |     72 |
+| ITL P99 (ms)       |     88 |    106 |     84 |
+| Latency P50 (s)    | 24.189 | 40.303 | 25.564 |
+| Errors             |      0 |      0 |      0 |
+
+### Phase 9 vs Phase 8 — Comparison
+
+CUDA graphs were expected to reduce decode latency by 5--15% through eliminated kernel launch overhead. The actual results show a regression across all models, most severe on low-concurrency workloads.
+
+**Throughput comparison (tok/s):**
+
+| Workload            | Llama P8 → P9       | Qwen3 P8 → P9       | Gemma3 P8 → P9      |
+|---------------------|---------------------:|---------------------:|---------------------:|
+| baseline            |  86.4 → 53.8 (-38%) |  64.6 → 42.2 (-35%) |  86.8 → 50.1 (-42%) |
+| continuous_batching | 348.7 → 291.7 (-16%) | 264.9 → 155.1 (-41%) | 282.3 → 268.7 (-5%) |
+| paged_attention     |  476.7 → 440.2 (-8%) | 325.0 → 175.3 (-46%) | 315.7 → 323.7 (+3%) |
+| chunked_prefill     |  220.7 → 216.7 (-2%) | 148.7 → 155.9 (+5%) | 276.0 → 262.9 (-5%) |
+| prefix_caching      |  331.3 → 330.4 ( 0%) | 221.6 → 190.1 (-14%) | 309.4 → 315.6 (+2%) |
+
+**ITL P50 comparison (ms):**
+
+| Workload            | Llama P8 → P9   | Qwen3 P8 → P9   | Gemma3 P8 → P9   |
+|---------------------|-----------------:|-----------------:|------------------:|
+| baseline            |  12 → 18 (+50%) |  15 → 23 (+53%) |   11 → 20 (+82%) |
+| continuous_batching |  34 → 47 (+38%) |  45 → 80 (+78%) |   53 → 56 (+6%)  |
+| paged_attention     |  44 → 44 ( 0%)  |  44 → 80 (+82%) |   69 → 67 (-3%)  |
+| chunked_prefill     |  90 → 90 ( 0%)  |  92 → 81 (-12%) |   77 → 77 ( 0%)  |
+| prefix_caching      |  68 → 67 (-1%)  |  70 → 81 (+16%) |   74 → 72 (-3%)  |
+
+**Root cause: Triton kernels replay ~2x slower inside CUDA graphs.** Profiling with `benchmarks/profile_cuda_graph.py` on Llama 3B reveals the bottleneck is the graph replay itself, not the Python-side `prepare()` overhead (which is only 0.1--0.8ms per step):
+
+```
+                      batch=1         batch=8
+Graph replay:         17.9 ms/step    31.6 ms/step
+Eager (SDPA path):    10.8 ms/step    15.3 ms/step
+Eager (Triton path):  10.0 ms/step    12.9 ms/step
+```
+
+The Triton paged attention kernel is actually *faster* than SDPA when run eagerly (10.0ms vs 10.8ms at batch=1). But the same kernel captured into a CUDA graph runs 75--145% slower than its eager equivalent. This is a Triton JIT + CUDA graph interaction issue: Triton's kernel launch mechanism, autotuning state, or compiled kernel variants may not replay correctly inside CUDA graphs, causing suboptimal execution.
+
+**Why larger batches are partially shielded:** High-concurrency workloads (paged_attention, prefix_caching) approach break-even because the per-step overhead is amortized across more sequences, and the workloads are less sensitive to per-token decode latency. The baseline (single-request sequential) is hit hardest because every ms of per-step overhead translates directly to per-token latency.
+
+**Why Qwen3 is hit hardest:** With batch=16 and 1024 blocks, Qwen3 is already VRAM-constrained. The additional memory from CUDA graph capture (graph intermediates + 6 captured graphs with shared pool) compounds the issue, and the smaller max concurrency means the per-step overhead is amortized across fewer sequences.
+
+**Path forward:** The Triton-in-CUDA-graph performance gap must be resolved before graph capture provides a net benefit. Options: (1) investigate Triton graph capture compatibility (warmup autotuning, kernel caching, stream interactions); (2) replace Triton attention with a native CUDA kernel (e.g. Flash Attention via `flash_attn`) that is known to work well with CUDA graphs; (3) use `torch.compile` with CUDA graph backend instead of manual capture.

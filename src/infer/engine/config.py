@@ -33,6 +33,8 @@ class EngineConfig:
             Requires ``kv_cache_backend="paged"`` and ``use_chunked_prefill=True``.
         use_cuda_graphs: Capture decode forward pass as CUDA graphs (Phase 9).
             Requires ``kv_cache_backend="paged"`` and ``batching_mode="continuous"``.
+            **Not recommended for performance** — Triton kernels replay slower
+            inside CUDA graphs than they execute eagerly. Kept for reference.
     """
 
     model: str

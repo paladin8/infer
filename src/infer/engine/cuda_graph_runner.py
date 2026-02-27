@@ -52,6 +52,14 @@ class CUDAGraphRunner:
     ``max_batch_size`` during warmup. At runtime, pads the actual batch
     to the nearest bucket and replays the corresponding graph.
 
+    .. note::
+
+        **Not recommended for production use.** Benchmarking shows that
+        Triton-compiled kernels replay 75--145% slower inside CUDA graphs
+        than they execute eagerly, resulting in a net throughput regression.
+        The implementation is kept for reference. See ``SERVING_LOG.md``
+        Phase 9 for profiling details.
+
     Args:
         model: The loaded model.
         cache_pool: The paged KV cache pool.

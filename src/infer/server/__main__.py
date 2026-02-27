@@ -74,7 +74,8 @@ def main() -> None:
         "--cuda-graphs",
         action="store_true",
         default=False,
-        help="enable CUDA graph capture for decode (requires --kv-cache-backend paged)",
+        help="enable CUDA graph capture for decode (requires --kv-cache-backend paged). "
+        "Not recommended: Triton kernels replay slower inside CUDA graphs than eagerly.",
     )
     args = parser.parse_args()
 

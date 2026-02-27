@@ -26,7 +26,8 @@ ContinuousRunner.step(prefill, decode)
     └── Yes → CUDAGraphRunner.execute(requests)
               │
               ├── 1. Allocate blocks if needed (Python, before graph)
-              │      pool.decode_view(slots)  →  _ensure_blocks_allocated()
+              │      tmp = pool.decode_view(slots)
+              │      tmp._ensure_blocks_allocated()
               │
               ├── 2. Prepare static tensors (Python → GPU copies)
               │      ├── input_ids_buf.copy_(real_tokens)
@@ -84,7 +85,7 @@ for batch_size in [1, 2, 4, 8, 16, 32]:  # power-of-2 buckets
 
 5. **Eager warmup at startup.** Graphs are captured for all power-of-2 buckets up to `max_batch_size` during server initialization, before any requests arrive. This avoids latency spikes during serving. The warmup allocates temporary cache slots, runs warmup forward passes, captures graphs, then frees the slots.
 
-6. **Scratch block for padding.** One block is reserved as a "scratch block" during warmup. Padding slots' KV writes target this block, and their page tables point to it. The block's data is never read for real attention (padding slots have `seq_lens_tensor[i] = 0`, so the Triton kernel skips them). This ensures graph-captured writes for padding slots go to a safe location.
+6. **Scratch block for padding.** One block is reserved as a "scratch block" during warmup and registered under a sentinel sequence ID (`-1`) in `pool.page_tables` so `audit_blocks()` does not flag it as leaked. Padding slots' KV writes target this block, and their page tables point to it. The block's data is never read for real attention (padding slots have `seq_lens_tensor[i] = 0`, so the Triton kernel skips them). This ensures graph-captured writes for padding slots go to a safe location.
 
 7. **Post-replay CPU state sync.** `kv_cache.advance(n)` inside the model forward updates `pool.seq_lens` (a Python dict) --- this is pure Python, not captured in the graph. The `CUDAGraphRunner` must call `pool.seq_lens[seq_id] += 1` for each real sequence after every replay to keep CPU state consistent with GPU reality.
 
@@ -344,7 +345,8 @@ class GraphPagedDecodeCacheView:
     Args:
         pool: The paged KV cache pool (provides ``k``, ``v`` storage tensors).
         max_batch_size: Maximum batch size (determines tensor first dimension).
-        max_blocks_per_seq: Maximum blocks per sequence (``max_seq_len // block_size``).
+        max_blocks_per_seq: Maximum blocks per sequence (ceiling division:
+            ``(max_seq_len + block_size - 1) // block_size``).
         device: Target device.
     """
 
@@ -395,9 +397,14 @@ class GraphPagedDecodeCacheView:
         self.pool.k[layer_idx][self._write_block_ids, :, self._write_offsets, :] = k_new
         self.pool.v[layer_idx][self._write_block_ids, :, self._write_offsets, :] = v_new
 
+    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Not supported. Use ``write_only()`` for CUDA graph decode."""
+        raise NotImplementedError(
+            "GraphPagedDecodeCacheView does not support update(); use write_only()"
+        )
+
     def advance(self, n: int) -> None:
         """No-op. CPU state is updated by CUDAGraphRunner after replay."""
-        pass
 
     def prepare(
         self,
@@ -497,11 +504,11 @@ class CUDAGraphRunner:
     def warmup(self) -> None:
         """Pre-capture graphs for all batch size buckets.
 
-        Called once at server startup before serving. For each bucket:
-        1. Allocate temporary cache slots.
-        2. Run warmup forward passes (eager, on a side stream).
-        3. Capture the graph.
-        4. Free temporary slots.
+        Called once at server startup before serving:
+        1. Allocate a scratch block and register it under a sentinel
+           sequence ID (-1) in pool.page_tables so audit_blocks()
+           does not flag it as leaked.
+        2. For each bucket: allocate temp slots, warmup, capture, free.
 
         Uses a shared CUDA memory pool across all graphs so intermediate
         activation memory is reused (only one graph runs at a time).
@@ -554,7 +561,8 @@ def _padded_batch_size(actual: int) -> int | None:
 ```python
 def _capture_for_batch_size(self, batch_size: int) -> CapturedGraph:
     device = self.config.device
-    max_blocks = self.config.max_seq_len // self.config.block_size
+    block_size = self.cache_pool.block_size
+    max_blocks = (self.config.max_seq_len + block_size - 1) // block_size
 
     # Pre-allocate static tensors.
     input_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
@@ -563,7 +571,9 @@ def _capture_for_batch_size(self, batch_size: int) -> CapturedGraph:
 
     # Allocate temporary cache slots for warmup.
     temp_slots = [self.cache_pool.allocate_slot(initial_tokens=1) for _ in range(batch_size)]
-    temp_view = self.cache_pool.decode_view(temp_slots)
+    # Set seq_lens to 1 so prepare() finds valid page table entries.
+    for slot in temp_slots:
+        self.cache_pool.seq_lens[slot] = 1
     view.prepare(temp_slots, self.cache_pool, self._scratch_block)
 
     # Warmup forward passes (eager, on side stream).
@@ -571,12 +581,13 @@ def _capture_for_batch_size(self, batch_size: int) -> CapturedGraph:
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            _ = self.model(input_ids, kv_cache=view, position_ids=position_ids)
+            with torch.inference_mode():
+                self.model(input_ids, kv_cache=view, position_ids=position_ids)
     torch.cuda.current_stream().wait_stream(s)
 
     # Capture.
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g, pool=self._mempool):
+    with torch.cuda.graph(g, pool=self._mempool), torch.inference_mode():
         logits = self.model(input_ids, kv_cache=view, position_ids=position_ids)
 
     # Free temporary slots.
@@ -599,22 +610,25 @@ def _capture_for_batch_size(self, batch_size: int) -> CapturedGraph:
 def execute(self, requests, cache_pool):
     actual_batch = len(requests)
     padded = _padded_batch_size(actual_batch)
-    if padded is None:
+    if padded is None or padded not in self._graphs:
         return None  # fallback to eager
 
     captured = self._graphs[padded]
     slots = [req.slot_idx for req in requests]
 
     # 1. Block allocation (Python, before graph).
-    _ = cache_pool.decode_view(slots)  # triggers _ensure_blocks_allocated
+    # decode_view() alone does NOT allocate blocks; call explicitly.
+    tmp_view = cache_pool.decode_view(slots)
+    tmp_view._ensure_blocks_allocated()
 
-    # 2. Prepare inputs.
+    # 2. Prepare inputs (zero padding positions, then fill real data).
     tokens = [req.generated_token_ids[-1] for req in requests]
     positions = [cache_pool.get_seq_len(slot) for slot in slots]
 
+    captured.input_ids.zero_()
+    captured.position_ids.zero_()
     captured.input_ids[:actual_batch, 0] = torch.tensor(tokens, dtype=torch.long, device=device)
     captured.position_ids[:actual_batch, 0] = torch.tensor(positions, dtype=torch.long, device=device)
-    # Padding slots: keep zeros from initialization.
 
     captured.view.prepare(slots, cache_pool, self._scratch_block)
 
@@ -790,7 +804,7 @@ if config.use_cuda_graphs and isinstance(self.runner, ContinuousRunner):
 ## Files NOT changed
 
 - **`src/infer/cache/__init__.py`** --- `GraphPagedDecodeCacheView` is internal to `CUDAGraphRunner` and not part of the public cache API. No export needed.
-- **`src/infer/cache/protocol.py`** --- `KVCacheProtocol` unchanged. `GraphPagedDecodeCacheView` satisfies the protocol (it has `seq_len`, `update` is not needed for Triton path, `write_only`/`advance`/`is_paged` are provided).
+- **`src/infer/cache/protocol.py`** --- `KVCacheProtocol` unchanged. `GraphPagedDecodeCacheView` satisfies the protocol (`seq_len`, `update` (raises `NotImplementedError`), `write_only`, `advance`, `is_paged` are all provided).
 - **`src/infer/cache/slotted.py`** --- Contiguous/slotted backends unchanged. CUDA graphs require paged backend.
 - **`src/infer/cache/prefix.py`** --- Prefix tree unchanged. CUDA graphs are orthogonal to prefix caching (prefix caching affects prefill; CUDA graphs affect decode).
 - **`src/infer/engine/scheduler.py`** --- Scheduler unchanged. It has no knowledge of CUDA graphs.
@@ -822,13 +836,13 @@ if config.use_cuda_graphs and isinstance(self.runner, ContinuousRunner):
 
 **VRAM overhead.** CUDA graph capture allocates memory for all intermediate activations in the decode forward pass. With a shared memory pool across all batch size buckets, the overhead is approximately that of the single largest bucket. Estimate for Llama 3B with max batch 32:
 
-| Component | Size |
-|---|---|
-| Graph intermediates (shared pool) | ~50--100 MB |
-| Logits placeholder (largest bucket) | ~8 MB |
-| Page table + seq_lens + write index tensors | < 1 MB |
-| Scratch block (1 block = block_size * head_dim * heads * layers * 2) | < 1 MB |
-| **Total** | **~60--110 MB** |
+| Component                                                            | Size            |
+| -------------------------------------------------------------------- | --------------- |
+| Graph intermediates (shared pool)                                    | ~50--100 MB     |
+| Logits placeholder (largest bucket)                                  | ~8 MB           |
+| Page table + seq_lens + write index tensors                          | < 1 MB          |
+| Scratch block (1 block = block_size * head_dim * heads * layers * 2) | < 1 MB          |
+| **Total**                                                            | **~60--110 MB** |
 
 This is roughly 0.5--1% of 16 GB VRAM. Acceptable.
 
@@ -838,13 +852,13 @@ This is roughly 0.5--1% of 16 GB VRAM. Acceptable.
 
 **Interaction with existing features:**
 
-| Feature | Interaction |
-|---|---|
-| Prefix caching | Compatible. Prefix caching affects prefill (match/insert); CUDA graphs affect decode. Both can be enabled simultaneously. |
-| Chunked prefill | Compatible. Prefill stays eager; decode uses graphs. |
-| Paged attention | Required. Triton paged attention is the only graph-compatible attention path. |
-| Contiguous backend | Incompatible. Config validation rejects this combination. |
-| Static batching | Incompatible. Config validation rejects this combination. |
+| Feature            | Interaction                                                                      |
+| ------------------ | -------------------------------------------------------------------------------- |
+| Prefix caching     | Compatible. Prefix caching affects prefill; CUDA graphs affect decode.           |
+| Chunked prefill    | Compatible. Prefill stays eager; decode uses graphs.                             |
+| Paged attention    | Required. Triton paged attention is the only graph-compatible attention path.    |
+| Contiguous backend | Incompatible. Config validation rejects this combination.                        |
+| Static batching    | Incompatible. Config validation rejects this combination.                        |
 
 ---
 
@@ -854,16 +868,16 @@ Run the `continuous_batching` and `baseline` workloads on all three benchmark mo
 
 **Configurations to compare:**
 
-| Config | Backend | Chunked | Prefix | CUDA Graphs | Expected outcome |
-|---|---|---|---|---|---|
-| Baseline (Phase 8) | paged | on | off | off | Eager decode |
-| +CUDA Graphs | paged | on | off | on | Reduced decode latency |
+| Config             | Backend | Chunked | Prefix | CUDA Graphs | Expected outcome       |
+| ------------------ | ------- | ------- | ------ | ----------- | ---------------------- |
+| Baseline (Phase 8) | paged   | on      | off    | off         | Eager decode           |
+| +CUDA Graphs       | paged   | on      | off    | on          | Reduced decode latency |
 
 **Additional configuration (stacking with prefix caching):**
 
-| Config | Backend | Chunked | Prefix | CUDA Graphs | Expected outcome |
-|---|---|---|---|---|---|
-| +Prefix+Graphs | paged | on | on | on | Both benefits combined |
+| Config         | Backend | Chunked | Prefix | CUDA Graphs | Expected outcome       |
+| -------------- | ------- | ------- | ------ | ----------- | ---------------------- |
+| +Prefix+Graphs | paged   | on      | on     | on          | Both benefits combined |
 
 **Metrics to report:**
 
