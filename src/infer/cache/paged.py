@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import Tensor
 
 from infer.loader.config import ModelConfig
+
+if TYPE_CHECKING:
+    from infer.cache.prefix import PrefixTree, PrefixTreeNode
 
 
 class BlockAllocator:
@@ -140,16 +145,23 @@ class PagedKVCachePool:
         v: Tensor,
         total_blocks: int,
         block_size: int,
+        *,
+        prefix_tree: PrefixTree | None = None,
     ) -> None:
         self.k = k
         self.v = v
         self.block_size = block_size
         self.allocator = BlockAllocator(total_blocks)
+        self.prefix_tree = prefix_tree
 
         # Per-sequence state.
         self.page_tables: dict[int, list[int]] = {}
         self.seq_lens: dict[int, int] = {}
         self._next_seq_id: int = 0
+
+        # Per-sequence prefix node references for refcount management.
+        # Populated by allocate_slot_with_prefix(), consumed by free_slot().
+        self._seq_prefix_nodes: dict[int, list[PrefixTreeNode]] = {}
 
     @staticmethod
     def from_model_config(
@@ -159,6 +171,7 @@ class PagedKVCachePool:
         *,
         dtype: torch.dtype = torch.bfloat16,
         device: str | torch.device = "cuda",
+        use_prefix_caching: bool = False,
     ) -> PagedKVCachePool:
         """Allocate a block pool sized for the given model config.
 
@@ -169,7 +182,10 @@ class PagedKVCachePool:
             block_size: Tokens per block.
             dtype: Data type for cache tensors.
             device: Device for cache tensors.
+            use_prefix_caching: If True, create a PrefixTree for block reuse.
         """
+        from infer.cache.prefix import PrefixTree
+
         shape = (
             config.num_hidden_layers,
             total_blocks,
@@ -179,7 +195,8 @@ class PagedKVCachePool:
         )
         k = torch.zeros(shape, dtype=dtype, device=device)
         v = torch.zeros(shape, dtype=dtype, device=device)
-        return PagedKVCachePool(k, v, total_blocks, block_size)
+        prefix_tree = PrefixTree(block_size) if use_prefix_caching else None
+        return PagedKVCachePool(k, v, total_blocks, block_size, prefix_tree=prefix_tree)
 
     def allocate_slot(self, initial_tokens: int = 0) -> int:
         """Allocate a new sequence and optionally pre-allocate blocks.
@@ -214,14 +231,92 @@ class PagedKVCachePool:
 
         return seq_id
 
+    def allocate_slot_with_prefix(self, token_ids: list[int]) -> tuple[int, int]:
+        """Allocate a slot with prefix-aware block reuse.
+
+        1. Query the prefix tree for cached blocks matching token_ids.
+        2. Place matched blocks directly in the new sequence's page table.
+        3. Allocate fresh blocks for the remaining suffix.
+        4. If the allocator is exhausted, evict from the tree and retry.
+
+        Args:
+            token_ids: Full prompt token IDs.
+
+        Returns:
+            Tuple of (seq_id, matched_tokens):
+            - seq_id: Allocated sequence ID.
+            - matched_tokens: Number of tokens covered by cached blocks
+              (the runner starts prefill from this offset).
+
+        Raises:
+            RuntimeError: If not enough blocks available even after eviction.
+        """
+        assert self.prefix_tree is not None
+        seq_id = self._next_seq_id
+        self._next_seq_id += 1
+
+        matched_blocks, matched_nodes, matched_tokens = self.prefix_tree.match(token_ids)
+        total_blocks_needed = (len(token_ids) + self.block_size - 1) // self.block_size
+        suffix_blocks_needed = total_blocks_needed - len(matched_blocks)
+
+        try:
+            if self.allocator.can_allocate(suffix_blocks_needed):
+                suffix_blocks = self.allocator.allocate(suffix_blocks_needed, owner=seq_id)
+            else:
+                deficit = suffix_blocks_needed - self.allocator.num_free()
+                evicted = self.prefix_tree.evict(deficit)
+                if evicted:
+                    self.allocator.free(evicted)
+                suffix_blocks = self.allocator.allocate(suffix_blocks_needed, owner=seq_id)
+        except RuntimeError:
+            # Allocation failed even after eviction. Undo the match refcounts.
+            for node in matched_nodes:
+                node.ref_count -= 1
+            raise
+
+        self.page_tables[seq_id] = matched_blocks + suffix_blocks
+        self.seq_lens[seq_id] = 0
+        self._seq_prefix_nodes[seq_id] = matched_nodes
+        return seq_id, matched_tokens
+
+    def insert_prefix(self, seq_id: int, token_ids: list[int]) -> None:
+        """Insert a sequence's completed blocks into the prefix tree.
+
+        Called by the runner after the last prefill chunk completes.
+        Newly created tree nodes are tracked in ``_seq_prefix_nodes``
+        so that ``free_slot()`` decrements their refcounts.
+
+        Args:
+            seq_id: The sequence that just finished prefill.
+            token_ids: Full prompt token IDs.
+        """
+        assert self.prefix_tree is not None
+        new_nodes = self.prefix_tree.insert(token_ids, self.page_tables[seq_id])
+        self._seq_prefix_nodes.setdefault(seq_id, []).extend(new_nodes)
+
     def free_slot(self, seq_id: int) -> None:
-        """Free all blocks for a sequence and remove its tracking state.
+        """Free a sequence's resources, prefix-aware.
+
+        1. Decrement ref_count on cached prefix nodes (via stored references).
+        2. Free non-tree blocks to the allocator.
+        3. Clean up per-sequence state.
 
         Raises ``KeyError`` if ``seq_id`` is not a valid active sequence.
         """
+        # Decrement refcounts for prefix nodes.
+        prefix_nodes = self._seq_prefix_nodes.pop(seq_id, [])
+        for node in prefix_nodes:
+            node.ref_count -= 1
+
+        # Free blocks: skip tree-managed ones, free the rest.
         blocks = self.page_tables.pop(seq_id)
-        if blocks:
-            self.allocator.free(blocks)
+        if self.prefix_tree is not None:
+            non_tree_blocks = [b for b in blocks if not self.prefix_tree.contains_block(b)]
+            if non_tree_blocks:
+                self.allocator.free(non_tree_blocks)
+        else:
+            if blocks:
+                self.allocator.free(blocks)
         del self.seq_lens[seq_id]
 
     def get_seq_len(self, seq_id: int) -> int:
@@ -237,20 +332,29 @@ class PagedKVCachePool:
         return self.allocator.num_free()
 
     def free_token_capacity(self) -> int:
-        """Number of tokens that can be stored in currently free blocks."""
-        return self.allocator.num_free() * self.block_size
+        """Number of tokens that can be stored in free + evictable blocks."""
+        free = self.allocator.num_free() * self.block_size
+        if self.prefix_tree is not None:
+            free += self.prefix_tree.evictable_count() * self.block_size
+        return free
 
     def audit_blocks(self) -> list[int]:
         """Return block IDs that are allocated but not in any page table.
 
         These are "leaked" blocks — allocated but unreachable via any
-        active sequence.
+        active sequence. When the prefix tree is active, tree-managed
+        blocks are excluded (they are intentionally cached, not leaked).
 
         Delegates to ``BlockAllocator.find_unreferenced_blocks()``.
         """
         referenced_blocks: set[int] = set()
         for blocks in self.page_tables.values():
             referenced_blocks.update(blocks)
+        # Exclude blocks managed by the prefix tree from leak detection.
+        if self.prefix_tree is not None:
+            for block_id in self.allocator.allocated_block_ids():
+                if self.prefix_tree.contains_block(block_id):
+                    referenced_blocks.add(block_id)
         return self.allocator.find_unreferenced_blocks(referenced_blocks)
 
     def reclaim_leaked_blocks(self) -> int:

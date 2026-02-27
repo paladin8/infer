@@ -148,7 +148,7 @@ class PrefixTree:
         self,
         token_ids: list[int],
         block_ids: list[int],
-    ) -> None:
+    ) -> list[PrefixTreeNode]:
         """Insert completed blocks into the tree.
 
         Called after the last prefill chunk completes. Walks the token
@@ -164,6 +164,11 @@ class PrefixTree:
             block_ids: Physical block IDs from the sequence's page table,
                 in logical order. ``block_ids[i]`` corresponds to tokens
                 ``[i * block_size, (i + 1) * block_size)``.
+
+        Returns:
+            List of newly created ``PrefixTreeNode`` references (nodes
+            that did not already exist in the tree). The pool stores
+            these per-sequence for refcount decrement at free time.
         """
         ...
 

@@ -105,7 +105,7 @@ class PrefixTree:
         self,
         token_ids: list[int],
         block_ids: list[int],
-    ) -> None:
+    ) -> list[PrefixTreeNode]:
         """Insert completed blocks into the tree.
 
         Called after the last prefill chunk completes. Walks the token
@@ -121,16 +121,22 @@ class PrefixTree:
             block_ids: Physical block IDs from the sequence's page table,
                 in logical order. ``block_ids[i]`` corresponds to tokens
                 ``[i * block_size, (i + 1) * block_size)``.
+
+        Returns:
+            List of newly created ``PrefixTreeNode`` references (nodes
+            that did not already exist in the tree). The pool stores
+            these per-sequence for refcount decrement at free time.
         """
         num_complete_blocks = len(token_ids) // self.block_size
         if num_complete_blocks == 0:
-            return
+            return []
         assert len(block_ids) >= num_complete_blocks, (
             f"block_ids has {len(block_ids)} entries but need {num_complete_blocks}"
         )
 
         self._clock += 1
         node = self._root
+        new_nodes: list[PrefixTreeNode] = []
 
         for i in range(num_complete_blocks):
             start = i * self.block_size
@@ -153,7 +159,10 @@ class PrefixTree:
             )
             node.children[chunk] = new_node
             self._block_to_node[block_ids[i]] = new_node
+            new_nodes.append(new_node)
             node = new_node
+
+        return new_nodes
 
     def evict(self, num_blocks: int) -> list[int]:
         """Evict up to ``num_blocks`` blocks using LRU policy.
