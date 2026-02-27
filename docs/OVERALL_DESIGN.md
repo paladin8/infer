@@ -204,6 +204,8 @@ class Request:
     finish_reason: str | None = None
     error: str | None = None
     generator: torch.Generator | None = None
+    slot_idx: int | None = None           # Cache pool slot (Phase 5+)
+    prefill_progress: int = 0             # Chunked prefill token count (Phase 7)
     output_queue: asyncio.Queue[StepOutput] | None = None
 
 @dataclass
@@ -416,6 +418,10 @@ Exit criteria:
 - No throughput regression on decode-only workload (chunking disabled or chunk size >= prompt length).
 - Correctness: chunked prefill produces identical logits to full prefill under greedy decode.
 
+**Status: COMPLETE.** All deliverables implemented, benchmarked on all three models. Chunked prefill (512-token chunks, paged backend) dramatically improves ITL under long-prompt prefill pressure: Llama ITL P50 1384ms to 90ms (-94%), Qwen3 1241ms to 92ms (-93%), with throughput gains of +874% and +782% respectively on the chunked_prefill workload. No regressions on non-chunked workloads. Both contiguous and paged backends supported. 902 tests pass.
+
+See `docs/PHASE_7.md` for the full design.
+
 ### Phase 8: Prefix Caching
 
 Goal:
@@ -465,6 +471,7 @@ class EngineConfig:
     # Chunked prefill
     use_chunked_prefill: bool = False
     prefill_chunk_size: int = 512
+    max_prefill_chunks_per_step: int | None = None  # None = no cap
 
     # Prefix caching
     use_prefix_caching: bool = False
@@ -656,7 +663,8 @@ infer/
     ├── PHASE_3_1.md
     ├── PHASE_4.md
     ├── PHASE_5.md
-    └── PHASE_6.md
+    ├── PHASE_6.md
+    └── PHASE_7.md
 ```
 
 ---
