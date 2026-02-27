@@ -499,6 +499,9 @@ class PagedDecodeCacheView:
     def _ensure_blocks_allocated(self) -> None:
         """Allocate new blocks for sequences that need them (once per step).
 
+        When prefix caching is active, evicts from the prefix tree if the
+        allocator is exhausted.
+
         NOTE: if allocation succeeds for sequences 0..k but fails at k+1,
         sequences 0..k have new blocks in their page tables that haven't
         been written to yet.  The engine error handler frees all slots on
@@ -510,6 +513,10 @@ class PagedDecodeCacheView:
             pos = self.slot_seq_lens[i]
             block_idx = pos // self.pool.block_size
             if block_idx >= len(self.pool.page_tables[seq_id]):
+                if not self.pool.allocator.can_allocate(1) and self.pool.prefix_tree is not None:
+                    evicted = self.pool.prefix_tree.evict(1)
+                    if evicted:
+                        self.pool.allocator.free(evicted)
                 new_block = self.pool.allocator.allocate(1, owner=seq_id)
                 self.pool.page_tables[seq_id].extend(new_block)
         self._blocks_allocated = True

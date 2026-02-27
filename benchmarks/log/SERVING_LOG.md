@@ -416,3 +416,102 @@ The chunked_prefill workload is the headline comparison — it has long-prompt a
 **Non-chunked workload regressions**: baseline, continuous_batching, and paged_attention workloads show negligible change vs Phase 6, confirming no regression from the chunked prefill code path when prefills are short enough to complete in one chunk.
 
 **prefix_caching recovery**: Qwen3 prefix_caching went from 29.1 tok/s (Phase 6) to 206.2 tok/s (Phase 7). The shared 1024-token system prompt is now processed in two 512-token chunks instead of one blocking prefill, preventing the massive decode stalls that collapsed throughput in Phase 6.
+
+---
+
+## Phase 8 — Prefix Caching
+
+Server launched with `--batching-mode continuous --kv-cache-backend paged --chunked-prefill --prefill-chunk-size 512 --prefix-caching`. Same hardware, seed=42. Prefix caching stores completed KV blocks in a radix tree keyed by token IDs. When a new request shares a prefix with a prior request, the cached blocks are reused — the runner starts prefill from the first uncached token, skipping redundant computation.
+
+Per-model server config (same batch/block settings as Phase 7):
+
+| Model  | max-batch-size | num-gpu-blocks |
+|--------|---------------:|---------------:|
+| Llama  |             24 |           2048 |
+| Qwen3  |             16 |   1024 (1536*) |
+| Gemma3 |             24 |           2048 |
+
+\* Qwen3 prefix_caching uses 1536 blocks (same as Phase 6/7).
+
+### baseline — Sequential Single Requests
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |   86.4 |   64.6 |   86.8 |
+| TTFT P50 (ms)      |     37 |     45 |     26 |
+| TTFT P99 (ms)      |     38 |     48 |     31 |
+| ITL P50 (ms)       |     12 |     15 |     11 |
+| ITL P99 (ms)       |     13 |     18 |     14 |
+| Latency P50 (s)    |  2.964 |  3.940 |  2.942 |
+
+### continuous_batching — Staggered Arrivals
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  348.7 |  264.9 |  282.3 |
+| TTFT P50 (ms)      |    117 |    175 |    154 |
+| TTFT P99 (ms)      |    206 |   3490 |   1248 |
+| ITL P50 (ms)       |     34 |     45 |     53 |
+| ITL P99 (ms)       |     80 |     90 |     79 |
+| Latency P50 (s)    |  5.852 |  8.230 |  8.679 |
+| Errors             |      0 |      0 |      0 |
+
+### paged_attention — Single Burst, Moderate Lengths
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  476.7 |  325.0 |  315.7 |
+| TTFT P50 (ms)      |   3412 |   7915 |   4735 |
+| TTFT P99 (ms)      |  11614 |  21482 |  16841 |
+| ITL P50 (ms)       |     44 |     44 |     69 |
+| ITL P99 (ms)       |     84 |     82 |     97 |
+| Latency P50 (s)    | 12.828 | 17.498 | 16.982 |
+| Errors             |      0 |      0 |      0 |
+
+### chunked_prefill — Long Prompts, Poisson Arrivals
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  220.7 |  148.7 |  276.0 |
+| TTFT P50 (ms)      |   3327 |  14827 |   1348 |
+| TTFT P99 (ms)      |  17770 |  32062 |  12393 |
+| ITL P50 (ms)       |     90 |     92 |     77 |
+| ITL P99 (ms)       |    221 |    194 |    102 |
+| Latency P50 (s)    | 21.084 | 29.914 | 15.976 |
+| Errors             |      0 |      0 |      0 |
+
+### prefix_caching — Shared System Prompt
+
+Qwen3 uses 1536 blocks for this workload.
+
+| Metric             |  Llama |  Qwen3 | Gemma3 |
+|--------------------|-------:|-------:|-------:|
+| Throughput (tok/s) |  331.3 |  221.6 |  309.4 |
+| TTFT P50 (ms)      |   5833 |  16059 |   6314 |
+| TTFT P99 (ms)      |  15315 |  32515 |  16671 |
+| ITL P50 (ms)       |     68 |     70 |     74 |
+| ITL P99 (ms)       |     87 |     92 |     90 |
+| Latency P50 (s)    | 23.810 | 34.017 | 25.772 |
+| Errors             |      0 |      0 |      0 |
+
+### Phase 8 vs Phase 7 — Comparison (prefix_caching workload)
+
+The prefix_caching workload is the headline comparison — 48 requests share a ~1024-token system prompt, so prefix caching should eliminate redundant prefill after the first request.
+
+| Metric             |   Llama P7 → P8  |   Qwen3 P7 → P8  |  Gemma3 P7 → P8  |
+|--------------------|------------------:|------------------:|-----------------:|
+| Throughput (tok/s) | 299.2 → 331.3 (**+11%**) | 206.2 → 221.6 (**+7%**) | 309.4 → 309.4 (0%) |
+| TTFT P50 (ms)      | 8092 → 5833 (**-28%**) | 18157 → 16059 (**-12%**) | 6787 → 6314 (**-7%**) |
+| TTFT P99 (ms)      | 18189 → 15315 (**-16%**) | 36053 → 32515 (**-10%**) | 16903 → 16671 (-1%) |
+| ITL P50 (ms)       | 70 → 68 (-3%) | 70 → 70 (0%) | 73 → 74 (+1%) |
+| ITL P99 (ms)       | 163 → 87 (**-47%**) | 171 → 92 (**-46%**) | 96 → 90 (-6%) |
+
+**Llama (+11% throughput, -28% TTFT P50)**: Prefix caching eliminates ~1024-token prefill for 47 of 48 requests. TTFT P50 dropped from 8,092ms to 5,833ms — requests start generating faster because the shared prefix is read from cached KV blocks instead of recomputed. ITL P99 dropped 47% (163ms → 87ms) because skipped prefill chunks free up compute budget for decode.
+
+**Qwen3 (+7% throughput, -12% TTFT P50)**: Similar pattern. TTFT P50 improved from 18,157ms to 16,059ms. ITL P99 dropped 46% (171ms → 92ms). The smaller relative TTFT improvement vs Llama is because Qwen3's higher per-token cost makes the suffix prefill (unique per request) a larger fraction of total TTFT.
+
+**Gemma3 (stable)**: Negligible change. The 1B model prefills the ~1024-token prefix so fast (~25ms) that caching it provides minimal savings. All metrics within noise.
+
+**Non-prefix workloads**: baseline, continuous_batching, paged_attention, and chunked_prefill show no regression — the prefix tree adds negligible overhead when prompts don't share prefixes. The chunked_prefill workload (different prompts, no sharing) fills and evicts the tree continuously without impacting performance.
+
+**Bug fix during benchmarking**: The initial chunked_prefill run had 46/48 errors ("Cannot allocate 1 blocks: only 0 free") because decode block allocation didn't evict from the prefix tree. Fixed by adding eviction-aware allocation to `PagedDecodeCacheView._ensure_blocks_allocated()`. Without prefix reuse, completed request blocks stay in the tree as evictable; the decode allocator must evict them when the free pool is exhausted.
