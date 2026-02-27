@@ -7,6 +7,7 @@ from infer.cache.paged import (
     PagedKVCachePool,
     PagedPrefillCacheView,
 )
+from infer.cache.prefix import PrefixTree, PrefixTreeNode
 from infer.cache.protocol import CachePoolProtocol, KVCacheProtocol
 from infer.cache.simple import KVCache
 from infer.cache.slotted import (
@@ -28,5 +29,7 @@ __all__ = [
     "PagedKVCachePool",
     "PagedPrefillCacheView",
     "PrefillCacheView",
+    "PrefixTree",
+    "PrefixTreeNode",
     "SlottedKVCache",
 ]

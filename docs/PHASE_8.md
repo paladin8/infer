@@ -645,7 +645,7 @@ Run the `prefix_caching` workload (already defined in `bench_serving.py`: 48 req
 
 ### Unit tests (`tests/unit/test_prefix_tree.py`)
 
-- **Empty tree:** `match()` returns `([], 0)`.
+- **Empty tree:** `match()` returns `([], [], 0)`.
 - **Insert and match:** Insert a 4-block sequence, match returns all 4 blocks.
 - **Partial match:** Insert `[A, B, C, D]`, query `[A, B, X, Y]` → matches `[A, B]`.
 - **Full match:** Insert 4 blocks for a 64-token (block-aligned) prompt, query same tokens → returns all 4 blocks and 64 matched tokens.
@@ -654,7 +654,7 @@ Run the `prefix_caching` workload (already defined in `bench_serving.py`: 48 req
 - **Cascading eviction:** Insert `[A, B]`, release all refs, evict `B` → `A` becomes leaf → evict `A` in same call.
 - **`contains_block()`:** Returns `True` for inserted blocks, `False` after eviction.
 - **`cached_block_count()`:** Tracks total nodes correctly across insert/evict.
-- **Short prompt:** Prompt shorter than `block_size` → `match()` returns `([], 0)`, `insert()` is no-op.
+- **Short prompt:** Prompt shorter than `block_size` → `match()` returns `([], [], 0)`, `insert()` is no-op.
 
 ### Integration tests (`tests/unit/test_paged_prefix.py`)
 
