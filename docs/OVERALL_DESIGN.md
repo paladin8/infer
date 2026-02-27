@@ -433,6 +433,7 @@ Deliverables:
 - Radix/prefix tree keyed by token ids.
 - Block refcounting and LRU eviction policy.
 - Prefix-aware allocation and free in `PagedKVCachePool`.
+- Eviction-aware decode block allocation (decode path evicts from prefix tree when allocator is exhausted).
 - Full-hit optimization (single last-token forward pass when entire prefix is cached).
 
 Exit criteria:
@@ -441,6 +442,10 @@ Exit criteria:
 - Correctness: identical output with/without prefix caching (greedy decode).
 - Cache correctness tests for refcount + eviction edge cases.
 - No regression when disabled.
+
+**Status: COMPLETE.** All deliverables implemented, benchmarked on all three models. Prefix caching on the shared-prefix workload (48 requests, ~1024-token common prefix): Llama +11% throughput, -28% TTFT P50, -47% ITL P99; Qwen3 +7% throughput, -12% TTFT P50, -46% ITL P99; Gemma3 stable (1B model prefills too fast for caching to help). No regression on non-prefix workloads. 976 tests pass.
+
+See `docs/PHASE_8.md` for the full design.
 
 ---
 
@@ -667,7 +672,8 @@ infer/
     ├── PHASE_4.md
     ├── PHASE_5.md
     ├── PHASE_6.md
-    └── PHASE_7.md
+    ├── PHASE_7.md
+    └── PHASE_8.md
 ```
 
 ---

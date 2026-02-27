@@ -380,6 +380,29 @@ def audit_blocks(self) -> list[int]:
     return self.allocator.find_unreferenced_blocks(referenced_blocks)
 ```
 
+**Modified `PagedDecodeCacheView._ensure_blocks_allocated()`:**
+
+Decode block allocation must also evict from the prefix tree when the allocator is exhausted. Without this, workloads where prompts don't share prefixes (e.g., the `chunked_prefill` workload) fill the tree with unreusable cached blocks, exhausting the free pool and causing decode allocation failures:
+
+```python
+def _ensure_blocks_allocated(self) -> None:
+    if self._blocks_allocated:
+        return
+    for i, seq_id in enumerate(self.seq_ids):
+        pos = self.slot_seq_lens[i]
+        block_idx = pos // self.pool.block_size
+        if block_idx >= len(self.pool.page_tables[seq_id]):
+            if not self.pool.allocator.can_allocate(1) and self.pool.prefix_tree is not None:
+                evicted = self.pool.prefix_tree.evict(1)
+                if evicted:
+                    self.pool.allocator.free(evicted)
+            new_block = self.pool.allocator.allocate(1, owner=seq_id)
+            self.pool.page_tables[seq_id].extend(new_block)
+    self._blocks_allocated = True
+```
+
+This was discovered during Phase 8 benchmarking: the `chunked_prefill` workload (48 requests with different long prompts) had 46/48 allocation failures before this fix.
+
 **Tests:**
 
 - `allocate_slot_with_prefix()` with empty tree (no match, allocates all blocks).
@@ -510,13 +533,11 @@ This avoids re-prefilling an entire chunk --- only one token's compute is spent.
 # After the last chunk completes (is_last == True), or after full-hit handling:
 if self.config.use_prefix_caching:
     assert isinstance(self.cache_pool, PagedKVCachePool)
-    tree = self.cache_pool.prefix_tree
-    assert tree is not None
-    tree.insert(
-        token_ids=req.prompt_token_ids,
-        block_ids=self.cache_pool.page_tables[req.slot_idx],
-    )
+    assert req.slot_idx is not None
+    self.cache_pool.insert_prefix(req.slot_idx, req.prompt_token_ids)
 ```
+
+The pool's `insert_prefix()` method handles tree insertion and tracks newly created nodes per sequence in `_seq_prefix_nodes` for refcount management at free time.
 
 **`free_slot()` is unchanged:**
 
@@ -628,10 +649,10 @@ Run the `prefix_caching` workload (already defined in `bench_serving.py`: 48 req
 
 **Configurations to compare:**
 
-| Config | Backend | Chunked | Prefix | Expected outcome |
-|--------|---------|---------|--------|------------------|
-| Baseline (Phase 7) | paged | on | off | Full re-prefill for every request |
-| +Prefix caching | paged | on | on | TTFT improvement for requests 2-48 |
+| Config             | Backend | Chunked | Prefix | Expected outcome                   |
+|--------------------|---------|---------|--------|------------------------------------|
+| Baseline (Phase 7) | paged   | on      | off    | Full re-prefill for every request  |
+| +Prefix caching    | paged   | on      | on     | TTFT improvement for requests 2-48 |
 
 **Metrics to report:**
 
@@ -690,6 +711,26 @@ Run the `prefix_caching` workload (already defined in `bench_serving.py`: 48 req
 3. **Refcount + eviction tests pass:** All unit tests for PrefixTree and integration tests for prefix-aware allocation/free.
 4. **No regression when disabled:** All Phase 1-7 tests pass with `use_prefix_caching=False`. Benchmark results unchanged.
 5. **Config validation:** `use_prefix_caching=True` with wrong backend or without chunked prefill → `ValueError`.
+
+---
+
+## Status: COMPLETE
+
+All deliverables implemented, benchmarked on all three models (Llama 3.2 3B, Qwen3-4B, Gemma 3 1B). 976 tests pass.
+
+### Benchmark Results (prefix_caching workload)
+
+Server config: `--batching-mode continuous --kv-cache-backend paged --chunked-prefill --prefill-chunk-size 512 --prefix-caching`. Same batch/block settings as Phase 7.
+
+| Metric             |            Llama P7 → P8 |            Qwen3 P7 → P8 |      Gemma3 P7 → P8 |
+|--------------------|-------------------------:|-------------------------:|--------------------:|
+| Throughput (tok/s) | 299.2 → 331.3 (**+11%**) |  206.2 → 221.6 (**+7%**) |  309.4 → 309.4 (0%) |
+| TTFT P50 (ms)      |   8092 → 5833 (**-28%**) | 18157 → 16059 (**-12%**) |   6787 → 6314 (-7%) |
+| TTFT P99 (ms)      | 18189 → 15315 (**-16%**) | 36053 → 32515 (**-10%**) | 16903 → 16671 (-1%) |
+| ITL P50 (ms)       |            70 → 68 (-3%) |             70 → 70 (0%) |       73 → 74 (+1%) |
+| ITL P99 (ms)       |      163 → 87 (**-47%**) |      171 → 92 (**-46%**) |       96 → 90 (-6%) |
+
+Prefix caching eliminates ~1024-token prefill for 47/48 requests on the shared-prefix workload. Llama and Qwen3 see meaningful TTFT and throughput improvements. ITL P99 drops ~47% because skipped prefill chunks free compute budget for decode. Gemma3 (1B) prefills so fast that caching adds negligible savings. Non-prefix workloads show no regression. Full results in `benchmarks/log/SERVING_LOG.md`.
 
 ---
 

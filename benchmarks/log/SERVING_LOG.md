@@ -6,13 +6,13 @@ Serving throughput (output tok/s), TTFT (ms), and ITL (ms) against a running `in
 
 ## Workloads
 
-| Workload            | Requests | Prompt lengths                                  | Max tokens | Arrival pattern                  | Measures                                              |
-|---------------------|----------|-------------------------------------------------|------------|----------------------------------|-------------------------------------------------------|
-| baseline            |       10 | ~256 tok                                        | 256        | Sequential (wait for completion) | Single-request overhead floor                         |
-| continuous_batching |       32 | ~[64, 512] tok                                  | [64, 256]  | Uniform 4 RPS                    | TTFT P95/P99 (benefit of per-step admit/retire)       |
-| paged_attention     |       48 | ~[128, 384] tok                                 | [128, 256] | Single burst (all at once)       | Throughput + TTFT (paged admits more per memory budget)|
-| chunked_prefill     |       48 | ~75% [1024,2048], ~25% [64,128] tok             | [64, 256]  | Poisson 6 RPS                    | ITL P95/P99 (long prefills block decode)              |
-| prefix_caching      |       48 | ~1024 tok shared prefix + ~[32,128] tok suffix  | 256        | Uniform 8 RPS                    | TTFT P50/P95 (repeated prefill cost)                  |
+| Workload            | Requests | Prompt lengths                                 | Max tokens | Arrival pattern                  | Measures                                                |
+|---------------------|----------|------------------------------------------------|------------|----------------------------------|---------------------------------------------------------|
+| baseline            | 10       | ~256 tok                                       | 256        | Sequential (wait for completion) | Single-request overhead floor                           |
+| continuous_batching | 32       | ~[64, 512] tok                                 | [64, 256]  | Uniform 4 RPS                    | TTFT P95/P99 (benefit of per-step admit/retire)         |
+| paged_attention     | 48       | ~[128, 384] tok                                | [128, 256] | Single burst (all at once)       | Throughput + TTFT (paged admits more per memory budget) |
+| chunked_prefill     | 48       | ~75% [1024,2048], ~25% [64,128] tok            | [64, 256]  | Poisson 6 RPS                    | ITL P95/P99 (long prefills block decode)                |
+| prefix_caching      | 48       | ~1024 tok shared prefix + ~[32,128] tok suffix | 256        | Uniform 8 RPS                    | TTFT P50/P95 (repeated prefill cost)                    |
 
 Prompts are realistic English text (assembled from a fixed corpus). Token counts are approximate (~4 chars/token); actual counts come from the server.
 
@@ -65,26 +65,26 @@ Defaults: seed=42, 2 warmup requests per workload, JSON reports saved to `benchm
 
 ### baseline — Sequential Single Requests
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |   88.5 |   67.4 |   91.9 |
-| TTFT P50 (ms)      |     86 |     93 |     75 |
-| TTFT P99 (ms)      |     88 |     96 |     77 |
-| ITL P50 (ms)       |     11 |     14 |     11 |
-| ITL P99 (ms)       |     13 |     18 |     14 |
-| Latency P50 (s)    |  2.890 |  3.767 |  2.748 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) |  88.5 |  67.4 |   91.9 |
+| TTFT P50 (ms)      |    86 |    93 |     75 |
+| TTFT P99 (ms)      |    88 |    96 |     77 |
+| ITL P50 (ms)       |    11 |    14 |     11 |
+| ITL P99 (ms)       |    13 |    18 |     14 |
+| Latency P50 (s)    | 2.890 | 3.767 |  2.748 |
 
 ### continuous_batching — Staggered Arrivals
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |  254.0 |  192.4 |  231.8 |
-| TTFT P50 (ms)      |   4037 |   6123 |   4242 |
-| TTFT P99 (ms)      |   9678 |  14226 |  10960 |
-| ITL P50 (ms)       |     17 |     23 |     23 |
-| ITL P99 (ms)       |     19 |     27 |     29 |
-| Latency P50 (s)    |  6.491 |  9.422 |  7.141 |
-| Errors             |      0 |      0 |      0 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) | 254.0 | 192.4 |  231.8 |
+| TTFT P50 (ms)      |  4037 |  6123 |   4242 |
+| TTFT P99 (ms)      |  9678 | 14226 |  10960 |
+| ITL P50 (ms)       |    17 |    23 |     23 |
+| ITL P99 (ms)       |    19 |    27 |     29 |
+| Latency P50 (s)    | 6.491 | 9.422 |  7.141 |
+| Errors             |     0 |     0 |      0 |
 
 ### paged_attention — Single Burst, Moderate Lengths
 
@@ -132,26 +132,26 @@ Server launched with `--batching-mode continuous`. Same hardware, models, seeds,
 
 ### baseline — Sequential Single Requests
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |   87.1 |   65.8 |   86.3 |
-| TTFT P50 (ms)      |     35 |     43 |     25 |
-| TTFT P99 (ms)      |     37 |     44 |     27 |
-| ITL P50 (ms)       |     11 |     15 |     11 |
-| ITL P99 (ms)       |     13 |     17 |     16 |
-| Latency P50 (s)    |  2.939 |  3.875 |  2.966 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) |  87.1 |  65.8 |   86.3 |
+| TTFT P50 (ms)      |    35 |    43 |     25 |
+| TTFT P99 (ms)      |    37 |    44 |     27 |
+| ITL P50 (ms)       |    11 |    15 |     11 |
+| ITL P99 (ms)       |    13 |    17 |     16 |
+| Latency P50 (s)    | 2.939 | 3.875 |  2.966 |
 
 ### continuous_batching — Staggered Arrivals
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |  316.9 |  241.9 |  249.8 |
-| TTFT P50 (ms)      |   1825 |   3378 |   2965 |
-| TTFT P99 (ms)      |   4352 |   7918 |   7334 |
-| ITL P50 (ms)       |     21 |     28 |     28 |
-| ITL P99 (ms)       |     58 |     71 |     40 |
-| Latency P50 (s)    |  5.149 |  7.659 |  7.180 |
-| Errors             |      0 |      0 |      0 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) | 316.9 | 241.9 |  249.8 |
+| TTFT P50 (ms)      |  1825 |  3378 |   2965 |
+| TTFT P99 (ms)      |  4352 |  7918 |   7334 |
+| ITL P50 (ms)       |    21 |    28 |     28 |
+| ITL P99 (ms)       |    58 |    71 |     40 |
+| Latency P50 (s)    | 5.149 | 7.659 |  7.180 |
+| Errors             |     0 |     0 |      0 |
 
 ### paged_attention — Single Burst, Moderate Lengths
 
@@ -195,13 +195,13 @@ Workload redefined in Phase 6 (see above).
 
 The continuous_batching workload is the headline comparison. Changes relative to Phase 4 static batching:
 
-| Metric             |   Llama |   Qwen3 |  Gemma3 |
-|--------------------|--------:|--------:|--------:|
-| Throughput         |   +25%  |   +26%  |    +8%  |
-| TTFT P50           |   -55%  |   -45%  |   -30%  |
-| TTFT P99           |   -55%  |   -44%  |   -33%  |
-| ITL P50            |   +24%  |   +22%  |   +22%  |
-| ITL P99            |  +205%  |  +163%  |   +38%  |
+| Metric     | Llama | Qwen3 | Gemma3 |
+|------------|------:|------:|-------:|
+| Throughput |  +25% |  +26% |    +8% |
+| TTFT P50   |  -55% |  -45% |   -30% |
+| TTFT P99   |  -55% |  -44% |   -33% |
+| ITL P50    |  +24% |  +22% |   +22% |
+| ITL P99    | +205% | +163% |   +38% |
 
 **What improved**: TTFT dropped 30-55% across all models — requests no longer wait for an entire batch to drain before being admitted. Throughput improved 8-26% because the batch stays fuller (no wasted slots for already-finished requests). Batched prefill amortizes weight loading when multiple requests arrive in the same step.
 
@@ -229,26 +229,26 @@ Per-model server config (tuned to avoid VRAM pressure):
 
 ### baseline — Sequential Single Requests
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |   84.1 |   62.9 |   85.4 |
-| TTFT P50 (ms)      |     40 |     48 |     29 |
-| TTFT P99 (ms)      |     41 |     51 |     39 |
-| ITL P50 (ms)       |     12 |     16 |     12 |
-| ITL P99 (ms)       |     13 |     20 |     15 |
-| Latency P50 (s)    |  3.046 |  4.076 |  2.997 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) |  84.1 |  62.9 |   85.4 |
+| TTFT P50 (ms)      |    40 |    48 |     29 |
+| TTFT P99 (ms)      |    41 |    51 |     39 |
+| ITL P50 (ms)       |    12 |    16 |     12 |
+| ITL P99 (ms)       |    13 |    20 |     15 |
+| Latency P50 (s)    | 3.046 | 4.076 |  2.997 |
 
 ### continuous_batching — Staggered Arrivals
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |  340.4 |  258.8 |  284.5 |
-| TTFT P50 (ms)      |    133 |    190 |    146 |
-| TTFT P99 (ms)      |    202 |   3951 |   1215 |
-| ITL P50 (ms)       |     35 |     47 |     53 |
-| ITL P99 (ms)       |     85 |     98 |     83 |
-| Latency P50 (s)    |  6.202 |  8.699 |  8.666 |
-| Errors             |      0 |      0 |      0 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) | 340.4 | 258.8 |  284.5 |
+| TTFT P50 (ms)      |   133 |   190 |    146 |
+| TTFT P99 (ms)      |   202 |  3951 |   1215 |
+| ITL P50 (ms)       |    35 |    47 |     53 |
+| ITL P99 (ms)       |    85 |    98 |     83 |
+| Latency P50 (s)    | 6.202 | 8.699 |  8.666 |
+| Errors             |     0 |     0 |      0 |
 
 ### paged_attention — Single Burst, Moderate Lengths
 
@@ -264,40 +264,40 @@ Per-model server config (tuned to avoid VRAM pressure):
 
 ### chunked_prefill — Long Prompts, Poisson Arrivals
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |   22.5 |   16.8 |  276.6 |
-| TTFT P50 (ms)      |  39099 | 174046 |   1318 |
-| TTFT P99 (ms)      | 285209 | 393755 |  12314 |
-| ITL P50 (ms)       |   1384 |   1241 |     77 |
-| ITL P99 (ms)       |   1562 |   2203 |    119 |
-| Latency P50 (s)    | 294.249| 332.746| 16.010 |
-| Errors             |      0 |      0 |      0 |
+| Metric             |   Llama |   Qwen3 | Gemma3 |
+|--------------------|--------:|--------:|-------:|
+| Throughput (tok/s) |    22.5 |    16.8 |  276.6 |
+| TTFT P50 (ms)      |   39099 |  174046 |   1318 |
+| TTFT P99 (ms)      |  285209 |  393755 |  12314 |
+| ITL P50 (ms)       |    1384 |    1241 |     77 |
+| ITL P99 (ms)       |    1562 |    2203 |    119 |
+| Latency P50 (s)    | 294.249 | 332.746 | 16.010 |
+| Errors             |       0 |       0 |      0 |
 
 ### prefix_caching — Shared System Prompt
 
 Qwen3 uses 1536 blocks for this workload (longer sequences need more blocks than 1024).
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |  253.2 |   29.1 |  309.6 |
-| TTFT P50 (ms)      |  10214 | 127742 |   6673 |
-| TTFT P99 (ms)      |  22173 | 278685 |  16762 |
-| ITL P50 (ms)       |     83 |    709 |     73 |
-| ITL P99 (ms)       |    208 |   1673 |    100 |
-| Latency P50 (s)    | 33.739 | 273.611| 26.060 |
-| Errors             |      0 |      0 |      0 |
+| Metric             |  Llama |   Qwen3 | Gemma3 |
+|--------------------|-------:|--------:|-------:|
+| Throughput (tok/s) |  253.2 |    29.1 |  309.6 |
+| TTFT P50 (ms)      |  10214 |  127742 |   6673 |
+| TTFT P99 (ms)      |  22173 |  278685 |  16762 |
+| ITL P50 (ms)       |     83 |     709 |     73 |
+| ITL P99 (ms)       |    208 |    1673 |    100 |
+| Latency P50 (s)    | 33.739 | 273.611 | 26.060 |
+| Errors             |      0 |       0 |      0 |
 
 ### Phase 6 vs Phase 5 — Comparison (paged_attention workload)
 
 The paged_attention workload is the headline comparison. Throughput in tok/s:
 
-| Configuration                            |   Llama |  Qwen3 | Gemma3 |
-|------------------------------------------|--------:|-------:|-------:|
-| Phase 4: static + contiguous (batch=8)   |   346.1 |  271.0 |  289.1 |
-| Phase 5: continuous + contiguous (batch=8)|  338.2 |  259.5 |  269.3 |
-| Phase 6: continuous + paged              |   455.2 |  317.4 |  325.2 |
-| Phase 6 vs Phase 4                       | **+32%**| **+17%**| **+12%**|
+| Configuration                              |    Llama |    Qwen3 |   Gemma3 |
+|--------------------------------------------|---------:|---------:|---------:|
+| Phase 4: static + contiguous (batch=8)     |    346.1 |    271.0 |    289.1 |
+| Phase 5: continuous + contiguous (batch=8) |    338.2 |    259.5 |    269.3 |
+| Phase 6: continuous + paged                |    455.2 |    317.4 |    325.2 |
+| Phase 6 vs Phase 4                         | **+32%** | **+17%** | **+12%** |
 
 **Llama (+32% throughput, -66% TTFT P50)**: The headline win. Batch=24 fits 3x more concurrent requests in the same memory. TTFT P50 dropped from 10,920ms to 3,736ms.
 
@@ -311,12 +311,12 @@ The paged_attention workload is the headline comparison. Throughput in tok/s:
 
 **Batch size tuning**: The right paged batch size depends on VRAM headroom after model weights and KV pool. Empirical sweep on Qwen3-4B (paged_attention workload):
 
-| batch | blocks | Throughput | Notes |
-|------:|-------:|-----------:|-------|
-|    12 |    768 |      293.9 | Underfilled — not enough concurrency |
+| batch | blocks | Throughput | Notes                                  |
+|------:|-------:|-----------:|----------------------------------------|
+|    12 |    768 |      293.9 | Underfilled — not enough concurrency   |
 |    16 |   1024 |      318.1 | Sweet spot — best throughput/ITL ratio |
 |    20 |   1280 |      326.2 | Slightly higher throughput, higher ITL |
-|    24 |   2048 |      121.4 | VRAM cliff — 3x collapse |
+|    24 |   2048 |      121.4 | VRAM cliff — 3x collapse               |
 
 ---
 
@@ -336,26 +336,26 @@ Per-model server config (same batch/block settings as Phase 6):
 
 ### baseline — Sequential Single Requests
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |   84.7 |   47.2 |   86.0 |
-| TTFT P50 (ms)      |     37 |     45 |     28 |
-| TTFT P99 (ms)      |     38 |     60 |     30 |
-| ITL P50 (ms)       |     12 |     15 |     12 |
-| ITL P99 (ms)       |     13 |     37 |     14 |
-| Latency P50 (s)    |  3.016 |  3.944 |  2.974 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) |  84.7 |  47.2 |   86.0 |
+| TTFT P50 (ms)      |    37 |    45 |     28 |
+| TTFT P99 (ms)      |    38 |    60 |     30 |
+| ITL P50 (ms)       |    12 |    15 |     12 |
+| ITL P99 (ms)       |    13 |    37 |     14 |
+| Latency P50 (s)    | 3.016 | 3.944 |  2.974 |
 
 ### continuous_batching — Staggered Arrivals
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |  345.8 |  263.7 |  289.5 |
-| TTFT P50 (ms)      |    128 |    175 |    140 |
-| TTFT P99 (ms)      |    220 |   3624 |   1131 |
-| ITL P50 (ms)       |     34 |     45 |     51 |
-| ITL P99 (ms)       |     84 |     94 |     78 |
-| Latency P50 (s)    |  6.001 |  8.359 |  8.404 |
-| Errors             |      0 |      0 |      0 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) | 345.8 | 263.7 |  289.5 |
+| TTFT P50 (ms)      |   128 |   175 |    140 |
+| TTFT P99 (ms)      |   220 |  3624 |   1131 |
+| ITL P50 (ms)       |    34 |    45 |     51 |
+| ITL P99 (ms)       |    84 |    94 |     78 |
+| Latency P50 (s)    | 6.001 | 8.359 |  8.404 |
+| Errors             |     0 |     0 |      0 |
 
 ### paged_attention — Single Burst, Moderate Lengths
 
@@ -399,13 +399,13 @@ Qwen3 uses 1536 blocks for this workload.
 
 The chunked_prefill workload is the headline comparison — it has long-prompt arrivals creating prefill pressure while decode requests are in-flight.
 
-| Metric             |   Llama P6 → P7  |   Qwen3 P6 → P7  |  Gemma3 P6 → P7  |
-|--------------------|------------------:|------------------:|-----------------:|
-| Throughput (tok/s) |  22.5 → 219.3 (+874%) | 16.8 → 148.1 (+782%) | 276.6 → 272.6 (-1%) |
-| ITL P50 (ms)       | 1384 → 90 (**-94%**) | 1241 → 92 (**-93%**) | 77 → 78 (0%) |
+| Metric             |         Llama P6 → P7 |         Qwen3 P6 → P7 |       Gemma3 P6 → P7 |
+|--------------------|----------------------:|----------------------:|---------------------:|
+| Throughput (tok/s) |  22.5 → 219.3 (+874%) |  16.8 → 148.1 (+782%) |  276.6 → 272.6 (-1%) |
+| ITL P50 (ms)       |  1384 → 90 (**-94%**) |  1241 → 92 (**-93%**) |         77 → 78 (0%) |
 | ITL P99 (ms)       | 1562 → 209 (**-87%**) | 2203 → 207 (**-91%**) | 119 → 103 (**-13%**) |
-| TTFT P50 (ms)      | 39099 → 3464 (-91%) | 174046 → 15071 (-91%) | 1318 → 1525 (+16%) |
-| TTFT P99 (ms)      | 285209 → 17975 (-94%) | 393755 → 32236 (-92%) | 12314 → 12708 (+3%) |
+| TTFT P50 (ms)      |   39099 → 3464 (-91%) | 174046 → 15071 (-91%) |   1318 → 1525 (+16%) |
+| TTFT P99 (ms)      | 285209 → 17975 (-94%) | 393755 → 32236 (-92%) |  12314 → 12708 (+3%) |
 
 **Llama (+874% throughput, -94% ITL P50)**: The headline win. Phase 6 was catastrophically slow on this workload (22.5 tok/s) because long-prompt prefills blocked all decode requests for hundreds of milliseconds per step, creating a vicious cycle where prefills dominated the schedule. Chunked prefill breaks long prefills into 512-token chunks interleaved with decode, restoring ITL P50 from 1,384ms to 90ms — a 15x improvement. Throughput jumped from 22.5 to 219.3 tok/s because decode requests can actually make progress between chunks.
 
@@ -435,26 +435,26 @@ Per-model server config (same batch/block settings as Phase 7):
 
 ### baseline — Sequential Single Requests
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |   86.4 |   64.6 |   86.8 |
-| TTFT P50 (ms)      |     37 |     45 |     26 |
-| TTFT P99 (ms)      |     38 |     48 |     31 |
-| ITL P50 (ms)       |     12 |     15 |     11 |
-| ITL P99 (ms)       |     13 |     18 |     14 |
-| Latency P50 (s)    |  2.964 |  3.940 |  2.942 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) |  86.4 |  64.6 |   86.8 |
+| TTFT P50 (ms)      |    37 |    45 |     26 |
+| TTFT P99 (ms)      |    38 |    48 |     31 |
+| ITL P50 (ms)       |    12 |    15 |     11 |
+| ITL P99 (ms)       |    13 |    18 |     14 |
+| Latency P50 (s)    | 2.964 | 3.940 |  2.942 |
 
 ### continuous_batching — Staggered Arrivals
 
-| Metric             |  Llama |  Qwen3 | Gemma3 |
-|--------------------|-------:|-------:|-------:|
-| Throughput (tok/s) |  348.7 |  264.9 |  282.3 |
-| TTFT P50 (ms)      |    117 |    175 |    154 |
-| TTFT P99 (ms)      |    206 |   3490 |   1248 |
-| ITL P50 (ms)       |     34 |     45 |     53 |
-| ITL P99 (ms)       |     80 |     90 |     79 |
-| Latency P50 (s)    |  5.852 |  8.230 |  8.679 |
-| Errors             |      0 |      0 |      0 |
+| Metric             | Llama | Qwen3 | Gemma3 |
+|--------------------|------:|------:|-------:|
+| Throughput (tok/s) | 348.7 | 264.9 |  282.3 |
+| TTFT P50 (ms)      |   117 |   175 |    154 |
+| TTFT P99 (ms)      |   206 |  3490 |   1248 |
+| ITL P50 (ms)       |    34 |    45 |     53 |
+| ITL P99 (ms)       |    80 |    90 |     79 |
+| Latency P50 (s)    | 5.852 | 8.230 |  8.679 |
+| Errors             |     0 |     0 |      0 |
 
 ### paged_attention — Single Burst, Moderate Lengths
 
@@ -498,13 +498,13 @@ Qwen3 uses 1536 blocks for this workload.
 
 The prefix_caching workload is the headline comparison — 48 requests share a ~1024-token system prompt, so prefix caching should eliminate redundant prefill after the first request.
 
-| Metric             |   Llama P7 → P8  |   Qwen3 P7 → P8  |  Gemma3 P7 → P8  |
-|--------------------|------------------:|------------------:|-----------------:|
-| Throughput (tok/s) | 299.2 → 331.3 (**+11%**) | 206.2 → 221.6 (**+7%**) | 309.4 → 309.4 (0%) |
-| TTFT P50 (ms)      | 8092 → 5833 (**-28%**) | 18157 → 16059 (**-12%**) | 6787 → 6314 (**-7%**) |
-| TTFT P99 (ms)      | 18189 → 15315 (**-16%**) | 36053 → 32515 (**-10%**) | 16903 → 16671 (-1%) |
-| ITL P50 (ms)       | 70 → 68 (-3%) | 70 → 70 (0%) | 73 → 74 (+1%) |
-| ITL P99 (ms)       | 163 → 87 (**-47%**) | 171 → 92 (**-46%**) | 96 → 90 (-6%) |
+| Metric             |            Llama P7 → P8 |            Qwen3 P7 → P8 |        Gemma3 P7 → P8 |
+|--------------------|-------------------------:|-------------------------:|----------------------:|
+| Throughput (tok/s) | 299.2 → 331.3 (**+11%**) |  206.2 → 221.6 (**+7%**) |    309.4 → 309.4 (0%) |
+| TTFT P50 (ms)      |   8092 → 5833 (**-28%**) | 18157 → 16059 (**-12%**) | 6787 → 6314 (**-7%**) |
+| TTFT P99 (ms)      | 18189 → 15315 (**-16%**) | 36053 → 32515 (**-10%**) |   16903 → 16671 (-1%) |
+| ITL P50 (ms)       |            70 → 68 (-3%) |             70 → 70 (0%) |         73 → 74 (+1%) |
+| ITL P99 (ms)       |      163 → 87 (**-47%**) |      171 → 92 (**-46%**) |         96 → 90 (-6%) |
 
 **Llama (+11% throughput, -28% TTFT P50)**: Prefix caching eliminates ~1024-token prefill for 47 of 48 requests. TTFT P50 dropped from 8,092ms to 5,833ms — requests start generating faster because the shared prefix is read from cached KV blocks instead of recomputed. ITL P99 dropped 47% (163ms → 87ms) because skipped prefill chunks free up compute budget for decode.
 
