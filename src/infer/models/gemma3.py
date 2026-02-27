@@ -81,6 +81,8 @@ class Gemma3TransformerBlock(nn.Module):
         rms_norm_eps: Epsilon for RMSNorm layers.
         query_pre_attn_scalar: Scaling denominator for attention.
             The attention scale is ``query_pre_attn_scalar ** -0.5``.
+        sliding_window: Sliding window size for this block's attention.
+            ``0`` for full-attention layers, positive for sliding-window layers.
     """
 
     def __init__(
@@ -92,6 +94,7 @@ class Gemma3TransformerBlock(nn.Module):
         head_dim: int,
         rms_norm_eps: float = 1e-5,
         query_pre_attn_scalar: float = 256.0,
+        sliding_window: int = 0,
     ) -> None:
         super().__init__()
         # Attention with QK-norm disabled at init. We assign Gemma3RMSNorm
@@ -107,6 +110,7 @@ class Gemma3TransformerBlock(nn.Module):
             bias=False,
             qk_norm=False,
             scale=query_pre_attn_scalar**-0.5,
+            sliding_window=sliding_window,
         )
         self.self_attn.q_norm = Gemma3RMSNorm(head_dim, eps=rms_norm_eps)
         self.self_attn.k_norm = Gemma3RMSNorm(head_dim, eps=rms_norm_eps)
@@ -189,6 +193,15 @@ class Gemma3Model(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        # Model-specific attributes (must be set before nn.ModuleList
+        # construction so layer_types is available for per-layer sliding_window).
+        self.embedding_normalizer = math.sqrt(config.hidden_size)
+        self.layer_types: list[str] = (
+            config.layer_types or ["full_attention"] * config.num_hidden_layers
+        )
+        self.sliding_window = config.sliding_window or 512
+
         self.layers = nn.ModuleList(
             [
                 Gemma3TransformerBlock(
@@ -199,19 +212,15 @@ class Gemma3Model(nn.Module):
                     head_dim=config.computed_head_dim,
                     rms_norm_eps=config.rms_norm_eps,
                     query_pre_attn_scalar=config.query_pre_attn_scalar or config.computed_head_dim,
+                    sliding_window=(
+                        self.sliding_window if self.layer_types[i] == "sliding_attention" else 0
+                    ),
                 )
-                for _ in range(config.num_hidden_layers)
+                for i in range(config.num_hidden_layers)
             ]
         )
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Model-specific attributes.
-        self.embedding_normalizer = math.sqrt(config.hidden_size)
-        self.layer_types: list[str] = (
-            config.layer_types or ["full_attention"] * config.num_hidden_layers
-        )
-        self.sliding_window = config.sliding_window or 512
 
         # Precompute local RoPE tables (rope_local_base_freq, used for sliding-window layers).
         local_theta = config.rope_local_base_freq or config.rope_theta
@@ -320,21 +329,26 @@ class Gemma3Model(nn.Module):
                             .clone()
                         )
                 else:
-                    # Decode: start from zeros, add sliding window cutoff to local.
-                    global_mask = torch.zeros(
-                        batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device
-                    )
-                    local_mask = torch.zeros(
-                        batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device
-                    )
-                    cutoff = max(0, kv_len - self.sliding_window)
-                    if cutoff > 0:
-                        local_mask[:, :, :, :cutoff] = float("-inf")
-                if padding_mask is not None:
-                    # Apply padding to both masks.
-                    pad_mask = ~padding_mask[:, None, None, :kv_len]
-                    local_mask.masked_fill_(pad_mask, float("-inf"))
-                    global_mask.masked_fill_(pad_mask, float("-inf"))
+                    if padding_mask is not None:
+                        # Decode with padding: create explicit masks for SDPA.
+                        global_mask = torch.zeros(
+                            batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device
+                        )
+                        local_mask = torch.zeros(
+                            batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device
+                        )
+                        cutoff = max(0, kv_len - self.sliding_window)
+                        if cutoff > 0:
+                            local_mask[:, :, :, :cutoff] = float("-inf")
+                        pad_mask = ~padding_mask[:, None, None, :kv_len]
+                        global_mask.masked_fill_(pad_mask, float("-inf"))
+                        local_mask.masked_fill_(pad_mask, float("-inf"))
+                    else:
+                        # Decode without padding: no masks needed.
+                        # Full-attention layers use Triton paged attention (mask=None).
+                        # Sliding-window layers use Triton paged attention with window_size.
+                        global_mask = None
+                        local_mask = None
             elif seq_len == 1:
                 # Single-token decode (no padding, no position_ids).
                 cached_len = pos + 1

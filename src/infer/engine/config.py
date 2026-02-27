@@ -31,6 +31,8 @@ class EngineConfig:
         max_prefill_chunks_per_step: Cap on chunks per step (``None`` = no cap).
         use_prefix_caching: Cache KV blocks for shared prefixes (Phase 8).
             Requires ``kv_cache_backend="paged"`` and ``use_chunked_prefill=True``.
+        use_cuda_graphs: Capture decode forward pass as CUDA graphs (Phase 9).
+            Requires ``kv_cache_backend="paged"`` and ``batching_mode="continuous"``.
     """
 
     model: str
@@ -56,6 +58,9 @@ class EngineConfig:
 
     # Prefix caching.
     use_prefix_caching: bool = False
+
+    # CUDA graphs (Phase 9).
+    use_cuda_graphs: bool = False
 
     # Paged backend configuration.
     block_size: int = 16  # tokens per KV cache block (paged backend only)
@@ -118,3 +123,8 @@ class EngineConfig:
                 raise ValueError("Prefix caching requires kv_cache_backend='paged'")
             if not self.use_chunked_prefill:
                 raise ValueError("Prefix caching requires use_chunked_prefill=True")
+        if self.use_cuda_graphs:
+            if self.kv_cache_backend != "paged":
+                raise ValueError("CUDA graphs require kv_cache_backend='paged'")
+            if self.batching_mode != "continuous":
+                raise ValueError("CUDA graphs require batching_mode='continuous'")

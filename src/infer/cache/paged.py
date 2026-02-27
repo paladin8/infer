@@ -824,3 +824,125 @@ class PagedBatchedChunkedPrefillCacheView:
         """
         for i, seq_id in enumerate(self.seq_ids):
             self.pool.seq_lens[seq_id] = self.kv_lens[i]
+
+
+class GraphPagedDecodeCacheView:
+    """Paged decode cache view for CUDA graph capture and replay.
+
+    All tensors are pre-allocated at construction time with fixed shapes and
+    GPU addresses. Contents are updated via ``prepare()`` before each graph
+    replay. Used exclusively by ``CUDAGraphRunner``.
+
+    The view satisfies the ``KVCacheProtocol`` interface expected by the model
+    forward pass, with graph-compatible implementations:
+
+    - ``write_only()``: uses GPU-indexed advanced indexing instead of
+      Python-level loop indexing.
+    - ``advance()``: no-op (CPU state is updated by the graph runner after
+      replay).
+    - ``page_table_tensor`` / ``seq_lens_tensor``: pre-allocated at fixed
+      addresses; contents updated before replay.
+
+    Args:
+        pool: The paged KV cache pool (provides ``k``, ``v`` storage tensors).
+        max_batch_size: Maximum batch size (determines tensor first dimension).
+        max_blocks_per_seq: Maximum blocks per sequence.
+        device: Target device.
+    """
+
+    def __init__(
+        self,
+        pool: PagedKVCachePool,
+        max_batch_size: int,
+        max_blocks_per_seq: int,
+        device: str | torch.device = "cuda",
+    ) -> None:
+        self.pool = pool
+        self._max_batch_size = max_batch_size
+
+        # Static kernel tensors (fixed addresses, contents updated by prepare()).
+        self.page_table_tensor = torch.zeros(
+            max_batch_size,
+            max_blocks_per_seq,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.seq_lens_tensor = torch.zeros(
+            max_batch_size,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Static write indices (for GPU-indexed KV scatter write).
+        self._write_block_ids = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        self._write_offsets = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+
+        # Current max seq len (set by prepare()).
+        self._seq_len: int = 0
+
+    @property
+    def seq_len(self) -> int:
+        return self._seq_len
+
+    def is_paged(self) -> bool:
+        return True
+
+    def write_only(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
+        """Graph-compatible KV write using pre-computed GPU indices.
+
+        k, v shape: ``[batch, num_kv_heads, 1, head_dim]``.
+
+        Uses advanced indexing on the pool's K/V storage tensors. The
+        ``_write_block_ids`` and ``_write_offsets`` tensors are at fixed GPU
+        addresses; their contents were set by ``prepare()`` before the graph
+        replay.
+        """
+        k_new = k[:, :, 0, :]  # [batch, kv_heads, head_dim]
+        v_new = v[:, :, 0, :]
+        self.pool.k[layer_idx][self._write_block_ids, :, self._write_offsets, :] = k_new
+        self.pool.v[layer_idx][self._write_block_ids, :, self._write_offsets, :] = v_new
+
+    def advance(self, n: int) -> None:
+        """No-op. CPU state is updated by CUDAGraphRunner after replay."""
+
+    def prepare(
+        self,
+        seq_ids: list[int],
+        pool: PagedKVCachePool,
+        scratch_block: int,
+    ) -> None:
+        """Update tensor contents before graph replay.
+
+        Copies current page tables, sequence lengths, and write positions
+        from CPU-side pool state to the pre-allocated GPU tensors. Padding
+        slots (indices beyond ``len(seq_ids)``) are directed to the scratch
+        block.
+
+        Args:
+            seq_ids: Active sequence IDs for this step.
+            pool: The paged pool (source of page tables and seq_lens).
+            scratch_block: Block ID reserved for padding slot writes.
+        """
+        device = self.page_table_tensor.device
+
+        # Zero out all rows first (handles padding).
+        self.page_table_tensor.zero_()
+        self.seq_lens_tensor.zero_()
+        self._write_block_ids.fill_(scratch_block)
+        self._write_offsets.zero_()
+
+        for i, seq_id in enumerate(seq_ids):
+            pos = pool.seq_lens[seq_id]
+            # Page table.
+            page_table = pool.page_tables[seq_id]
+            pt_tensor = torch.tensor(page_table, dtype=torch.int32, device=device)
+            self.page_table_tensor[i, : len(page_table)] = pt_tensor
+            # Seq len (includes +1 for the token being written).
+            self.seq_lens_tensor[i] = pos + 1
+            # Write position.
+            block_idx = pos // pool.block_size
+            offset = pos % pool.block_size
+            self._write_block_ids[i] = page_table[block_idx]
+            self._write_offsets[i] = offset
+
+        self._seq_len = max((pool.seq_lens[sid] for sid in seq_ids), default=0)

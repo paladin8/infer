@@ -222,3 +222,46 @@ class TestPrefixCachingConfig:
             use_prefix_caching=False,
         )
         assert cfg.use_prefix_caching is False
+
+
+class TestCUDAGraphsConfig:
+    def test_default_disabled(self) -> None:
+        cfg = EngineConfig(model="m")
+        assert cfg.use_cuda_graphs is False
+
+    def test_cuda_graphs_accepted(self) -> None:
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="continuous",
+            kv_cache_backend="paged",
+            use_cuda_graphs=True,
+        )
+        assert cfg.use_cuda_graphs is True
+
+    def test_cuda_graphs_requires_paged(self) -> None:
+        with pytest.raises(ValueError, match="kv_cache_backend='paged'"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                kv_cache_backend="contiguous",
+                use_cuda_graphs=True,
+            )
+
+    def test_cuda_graphs_rejects_contiguous_and_static(self) -> None:
+        """CUDA graphs with contiguous + static rejects (paged check fires first)."""
+        with pytest.raises(ValueError, match="kv_cache_backend='paged'"):
+            EngineConfig(
+                model="m",
+                batching_mode="static",
+                kv_cache_backend="contiguous",
+                use_cuda_graphs=True,
+            )
+
+    def test_disabled_skips_validation(self) -> None:
+        """When use_cuda_graphs=False, backend/batching requirements don't apply."""
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="static",
+            use_cuda_graphs=False,
+        )
+        assert cfg.use_cuda_graphs is False

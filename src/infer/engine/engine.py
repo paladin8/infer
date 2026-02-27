@@ -66,6 +66,10 @@ class Engine:
             self.scheduler = StaticScheduler(config)
             self.runner = ModelRunner(model, tokenizer, config)
 
+        # CUDA graph warmup (Phase 9).
+        if config.use_cuda_graphs and isinstance(self.runner, ContinuousRunner):
+            self.runner.warmup_cuda_graphs()
+
     def add_request(
         self,
         request_id: str,

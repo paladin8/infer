@@ -136,7 +136,7 @@ def _run_and_compare(
     max_num_blocks = page_table.shape[1]
 
     result = triton_paged_attention(
-        q, k_pool, v_pool, page_table, seq_lens_t, scale, max_num_blocks
+        q, k_pool, v_pool, page_table, seq_lens_t, scale=scale, max_num_blocks=max_num_blocks
     )
     reference = _reference_paged_attention(q, k_pool, v_pool, page_table, seq_lens_t, scale)
 
@@ -271,7 +271,7 @@ class TestPagedAttentionKernel:
         )
         q = torch.randn(3, 8, 1, 64, dtype=torch.bfloat16, device="cuda")
         out = triton_paged_attention(
-            q, k_pool, v_pool, page_table, seq_lens_t, scale=64**-0.5, max_num_blocks=2
+            q, k_pool, v_pool, page_table, seq_lens_t, scale=64.0**-0.5, max_num_blocks=2
         )
         assert out.shape == (3, 8, 1, 64)
         assert out.dtype == torch.bfloat16

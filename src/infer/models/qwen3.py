@@ -213,10 +213,16 @@ class Qwen3Model(nn.Module):
                         mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
                         mask = mask.expand(batch_size, -1, -1, -1).clone()
                 else:
-                    mask = torch.zeros(batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device)
+                    if padding_mask is not None:
+                        mask = torch.zeros(batch_size, 1, 1, kv_len, dtype=x.dtype, device=x.device)
+                    else:
+                        # Decode without padding: no mask needed.
+                        # Triton paged attention handles per-sequence lengths
+                        # via seq_lens_tensor.
+                        mask = None
                 if padding_mask is not None:
                     pad_mask = ~padding_mask[:, None, None, :kv_len]
-                    mask.masked_fill_(pad_mask, float("-inf"))
+                    mask.masked_fill_(pad_mask, float("-inf"))  # type: ignore[union-attr]
             else:
                 mask = (
                     None if seq_len == 1 else causal_mask(seq_len, dtype=x.dtype, device=x.device)

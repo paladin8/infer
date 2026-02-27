@@ -70,6 +70,12 @@ def main() -> None:
         default=False,
         help="enable prefix caching (requires --kv-cache-backend paged and --chunked-prefill)",
     )
+    parser.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        default=False,
+        help="enable CUDA graph capture for decode (requires --kv-cache-backend paged)",
+    )
     args = parser.parse_args()
 
     config = EngineConfig(
@@ -89,6 +95,7 @@ def main() -> None:
         prefill_chunk_size=args.prefill_chunk_size,
         max_prefill_chunks_per_step=args.max_prefill_chunks_per_step,
         use_prefix_caching=args.prefix_caching,
+        use_cuda_graphs=args.cuda_graphs,
     )
 
     app = create_app(config)

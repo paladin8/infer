@@ -176,6 +176,9 @@ class Attention(nn.Module):
         rms_norm_eps: Epsilon for QK-norm RMSNorm layers.
         scale: Attention scaling factor.  Defaults to ``head_dim ** -0.5``.
             Pass ``query_pre_attn_scalar ** -0.5`` for Gemma 3.
+        sliding_window: Sliding window size for attention.  ``0`` means full
+            attention (default).  When positive, the Triton paged attention
+            kernel attends only to the last ``sliding_window`` positions.
     """
 
     def __init__(
@@ -188,6 +191,7 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         rms_norm_eps: float = 1e-6,
         scale: float | None = None,
+        sliding_window: int = 0,
     ) -> None:
         super().__init__()
         if num_heads % num_kv_heads != 0:
@@ -198,6 +202,7 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.scale = scale if scale is not None else head_dim**-0.5
+        self.sliding_window = sliding_window
 
         self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=bias)
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=bias)
@@ -274,6 +279,7 @@ class Attention(nn.Module):
                 paged_view.seq_lens_tensor,
                 scale=self.scale,
                 max_num_blocks=paged_view.page_table_tensor.shape[1],
+                window_size=self.sliding_window,
             )
         else:
             # Standard path: cache update + GQA expansion + SDPA.

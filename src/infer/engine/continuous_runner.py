@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from infer.cache.paged import PagedKVCachePool
 from infer.cache.protocol import CachePoolProtocol
 from infer.cache.slotted import SlottedKVCache
 from infer.engine.config import EngineConfig
+from infer.engine.cuda_graph_runner import CUDAGraphRunner
 from infer.engine.request import Request, RequestState, StepOutput
 from infer.engine.runner_helpers import (
     check_stop,
@@ -74,6 +75,12 @@ class ContinuousRunner:
         # Per-request text tracking, keyed by request_id.
         self._prev_text_lens: dict[str, int] = {}
 
+        # CUDA graph runner (Phase 9).
+        self._cuda_graph_runner: CUDAGraphRunner | None = None
+        if config.use_cuda_graphs:
+            assert isinstance(self.cache_pool, PagedKVCachePool)
+            self._cuda_graph_runner = CUDAGraphRunner(model, self.cache_pool, config)
+
     def step(
         self,
         prefill: list[Request],
@@ -115,6 +122,11 @@ class ContinuousRunner:
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request tracking state."""
         self._prev_text_lens.pop(request_id, None)
+
+    def warmup_cuda_graphs(self) -> None:
+        """Pre-capture CUDA graphs. Call before serving."""
+        if self._cuda_graph_runner is not None:
+            self._cuda_graph_runner.warmup()
 
     def free_kv_tokens(self) -> int | None:
         """Return available token capacity, or None for contiguous backend."""
@@ -429,6 +441,14 @@ class ContinuousRunner:
     @torch.inference_mode()
     def _batched_decode(self, requests: list[Request]) -> list[StepOutput]:
         """Batched decode for all active requests using DecodeCacheView."""
+        # Try CUDA graph path.
+        if self._cuda_graph_runner is not None:
+            assert isinstance(self.cache_pool, PagedKVCachePool)
+            logits = self._cuda_graph_runner.execute(requests, self.cache_pool)
+            if logits is not None:
+                return self._sample_decode(requests, logits)
+
+        # Eager fallback (existing code).
         device = self.config.device
         batch_size = len(requests)
 
@@ -462,7 +482,10 @@ class ContinuousRunner:
         )
         # logits: [batch, 1, vocab_size]
 
-        # Sample per request.
+        return self._sample_decode(requests, logits)
+
+    def _sample_decode(self, requests: list[Request], logits: Tensor) -> list[StepOutput]:
+        """Sample tokens and build StepOutputs from decode logits."""
         outputs: list[StepOutput] = []
         for i, req in enumerate(requests):
             context = req.prompt_token_ids + req.generated_token_ids

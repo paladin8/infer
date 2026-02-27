@@ -5,8 +5,8 @@ query token per sequence).  Reads K/V directly from scattered block pools
 instead of gathering into contiguous tensors before SDPA, eliminating
 ``O(batch * seq_len * head_dim)`` gather copy per layer.
 
-Decode-only: prefill always uses standard SDPA.  Sliding-window layers
-(Gemma 3 local attention) fall back to gather + SDPA.
+Decode-only: prefill always uses standard SDPA.  Supports sliding-window
+attention via the ``window_size`` parameter.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ def _paged_attention_kernel(
     MAX_NUM_BLOCKS: tl.constexpr,
     BLOCK_HD: tl.constexpr,  # next_power_of_2(HEAD_DIM)
     BLOCK_BS: tl.constexpr,  # next_power_of_2(BLOCK_SIZE)
+    WINDOW_SIZE: tl.constexpr,  # 0 = full attention, >0 = sliding window
 ):
     """Paged attention for one (batch, q_head) pair.
 
@@ -50,6 +51,10 @@ def _paged_attention_kernel(
     Uses online softmax (streaming softmax) to iterate over KV blocks
     without materialising the full attention matrix.  Float32 accumulation
     for numerical stability.
+
+    When ``WINDOW_SIZE > 0``, only the last ``WINDOW_SIZE`` positions
+    contribute to attention.  Blocks entirely before the window are skipped,
+    and the block straddling the window boundary has per-position masking.
     """
     batch_idx = tl.program_id(0)
     q_head_idx = tl.program_id(1)
@@ -59,6 +64,9 @@ def _paged_attention_kernel(
 
     # Sequence length for this batch element.
     seq_len = tl.load(SEQ_LENS + batch_idx)
+
+    # Sliding window: compute the start of the attention window.
+    window_start = tl.maximum(0, seq_len - WINDOW_SIZE) if WINDOW_SIZE > 0 else 0
 
     # Load query vector [HEAD_DIM] → float32.
     q_offset = batch_idx * stride_q_batch + q_head_idx * stride_q_head
@@ -81,35 +89,45 @@ def _paged_attention_kernel(
         remaining = seq_len - start_pos
         valid_len = tl.maximum(0, tl.minimum(BLOCK_SIZE, remaining))
 
-        # Physical block ID from page table.
-        block_id = tl.load(PAGE_TABLE + batch_idx * stride_pt_batch + block_idx).to(tl.int64)
+        # Skip blocks entirely before the sliding window.
+        block_end_pos = start_pos + BLOCK_SIZE
+        skip = block_end_pos <= window_start if WINDOW_SIZE > 0 else False
 
-        # --- Load K block [BLOCK_BS, BLOCK_HD] → float32 ---
-        k_base = block_id * stride_k_block + kv_head_idx * stride_k_head
-        k_ptrs = K_POOL + k_base + pos_offsets[:, None] * stride_k_pos + dim_offsets[None, :]
-        k_mask = (pos_offsets[:, None] < valid_len) & dim_mask[None, :]
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        if not skip:
+            # Physical block ID from page table.
+            block_id = tl.load(PAGE_TABLE + batch_idx * stride_pt_batch + block_idx).to(tl.int64)
 
-        # Attention scores: q @ k^T * scale → [BLOCK_BS].
-        scores = tl.sum(q[None, :] * k, axis=1) * SCALE
-        scores = tl.where(pos_offsets < valid_len, scores, float("-inf"))
+            # --- Load K block [BLOCK_BS, BLOCK_HD] → float32 ---
+            k_base = block_id * stride_k_block + kv_head_idx * stride_k_head
+            k_ptrs = K_POOL + k_base + pos_offsets[:, None] * stride_k_pos + dim_offsets[None, :]
+            k_mask = (pos_offsets[:, None] < valid_len) & dim_mask[None, :]
+            k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-        # Online softmax update.
-        m_new = tl.maximum(m_prev, tl.max(scores, axis=0))
-        exp_scores = tl.exp(scores - m_new)
-        correction = tl.exp(m_prev - m_new)
-        l_new = correction * l_prev + tl.sum(exp_scores, axis=0)
+            # Attention scores: q @ k^T * scale → [BLOCK_BS].
+            scores = tl.sum(q[None, :] * k, axis=1) * SCALE
+            scores = tl.where(pos_offsets < valid_len, scores, float("-inf"))
 
-        # --- Load V block [BLOCK_BS, BLOCK_HD] → float32 ---
-        v_base = block_id * stride_v_block + kv_head_idx * stride_v_head
-        v_ptrs = V_POOL + v_base + pos_offsets[:, None] * stride_v_pos + dim_offsets[None, :]
-        v = tl.load(v_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+            # Sliding window: mask out positions before the window start.
+            if WINDOW_SIZE > 0:
+                abs_positions = start_pos + pos_offsets
+                scores = tl.where(abs_positions >= window_start, scores, float("-inf"))
 
-        # Accumulate weighted V.
-        acc = correction * acc + tl.sum(exp_scores[:, None] * v, axis=0)
+            # Online softmax update.
+            m_new = tl.maximum(m_prev, tl.max(scores, axis=0))
+            exp_scores = tl.exp(scores - m_new)
+            correction = tl.exp(m_prev - m_new)
+            l_new = correction * l_prev + tl.sum(exp_scores, axis=0)
 
-        m_prev = m_new
-        l_prev = l_new
+            # --- Load V block [BLOCK_BS, BLOCK_HD] → float32 ---
+            v_base = block_id * stride_v_block + kv_head_idx * stride_v_head
+            v_ptrs = V_POOL + v_base + pos_offsets[:, None] * stride_v_pos + dim_offsets[None, :]
+            v = tl.load(v_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+
+            # Accumulate weighted V.
+            acc = correction * acc + tl.sum(exp_scores[:, None] * v, axis=0)
+
+            m_prev = m_new
+            l_prev = l_new
 
     # Final normalisation (guard against l_prev==0 from empty sequences).
     safe_l = tl.maximum(l_prev, 1e-6)
@@ -126,8 +144,10 @@ def triton_paged_attention(
     v_pool: Tensor,
     page_table: Tensor,
     seq_lens: Tensor,
+    *,
     scale: float,
     max_num_blocks: int,
+    window_size: int = 0,
 ) -> Tensor:
     """Paged attention for decode step.
 
@@ -146,6 +166,9 @@ def triton_paged_attention(
         scale: Attention scaling factor (typically ``head_dim ** -0.5``).
         max_num_blocks: Compile-time upper bound on blocks per sequence
             (``page_table.shape[1]``).
+        window_size: Sliding window size. ``0`` means full attention.
+            When positive, only the last ``window_size`` positions
+            contribute to the output.
 
     Returns:
         Attention output ``[batch, num_q_heads, 1, head_dim]``.
@@ -188,6 +211,7 @@ def triton_paged_attention(
         MAX_NUM_BLOCKS=max_num_blocks,
         BLOCK_HD=BLOCK_HD,
         BLOCK_BS=BLOCK_BS,
+        WINDOW_SIZE=window_size,
         num_warps=num_warps,
     )
 
