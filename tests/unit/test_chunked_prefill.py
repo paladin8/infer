@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import time
 
+import pytest
 import torch
 from torch import Tensor, nn
 
@@ -985,3 +986,372 @@ class TestEngineChunkedPrefill:
         initial_free = engine.runner.cache_pool.free_slot_count()
         engine.step()  # triggers retire → free_slot
         assert engine.runner.cache_pool.free_slot_count() == initial_free + 1
+
+
+# ===========================================================================
+# Prefix caching runner tests (Phase 8)
+# ===========================================================================
+
+
+def _make_prefix_config(**overrides: object) -> EngineConfig:
+    defaults: dict[str, object] = {
+        "model": "test-model",
+        "device": "cpu",
+        "dtype": "float16",
+        "max_seq_len": 128,
+        "max_batch_size": 8,
+        "batching_mode": "continuous",
+        "kv_cache_backend": "paged",
+        "block_size": 4,
+        "use_chunked_prefill": True,
+        "prefill_chunk_size": 4,
+        "use_prefix_caching": True,
+    }
+    defaults.update(overrides)
+    return EngineConfig(**defaults)  # type: ignore[arg-type]
+
+
+class TestPrefixCachingRunnerSetup:
+    def test_prefix_tree_created(self) -> None:
+        """Runner creates prefix tree when use_prefix_caching=True."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        assert isinstance(runner.cache_pool, PagedKVCachePool)
+        assert runner.cache_pool.prefix_tree is not None
+
+    def test_prefix_tree_not_created_when_disabled(self) -> None:
+        """Paged backend without prefix caching has no tree."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_paged_config())
+
+        assert isinstance(runner.cache_pool, PagedKVCachePool)
+        assert runner.cache_pool.prefix_tree is None
+
+
+class TestPrefixCachingTreeInsertion:
+    def test_insert_after_last_chunk(self) -> None:
+        """Block insertion populates tree only after the final chunk."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+        pool = runner.cache_pool
+        assert isinstance(pool, PagedKVCachePool)
+        assert pool.prefix_tree is not None
+
+        # 12-token prompt = 3 complete blocks.
+        req = _make_request("r1", list(range(12)))
+
+        runner.step(prefill=[req], decode=[])  # chunk 1
+        assert pool.prefix_tree.cached_block_count() == 0
+
+        runner.step(prefill=[req], decode=[])  # chunk 2
+        assert pool.prefix_tree.cached_block_count() == 0
+
+        runner.step(prefill=[req], decode=[])  # chunk 3 (final)
+        assert pool.prefix_tree.cached_block_count() == 3
+
+    def test_non_block_aligned_inserts_only_complete(self) -> None:
+        """Trailing tokens beyond block boundary are not inserted."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+        pool = runner.cache_pool
+        assert isinstance(pool, PagedKVCachePool)
+        assert pool.prefix_tree is not None
+
+        # 10 tokens = 2 complete blocks + 2 trailing.
+        req = _make_request("r1", list(range(10)))
+
+        runner.step(prefill=[req], decode=[])  # chunk 1: [0..3]
+        runner.step(prefill=[req], decode=[])  # chunk 2: [4..7]
+        runner.step(prefill=[req], decode=[])  # chunk 3: [8..9] (final)
+
+        assert pool.prefix_tree.cached_block_count() == 2
+
+
+class TestPrefixCachingPrefixHit:
+    def test_prefix_hit_skips_cached_tokens(self) -> None:
+        """Second request with shared prefix skips cached blocks."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        # Request A: 10 tokens. Empty tree → 3 chunks.
+        a = _make_request("a", list(range(10)))
+        runner.step(prefill=[a], decode=[])  # chunk 1
+        runner.step(prefill=[a], decode=[])  # chunk 2
+        runner.step(prefill=[a], decode=[])  # chunk 3 (final)
+        assert a.state is RequestState.DECODE
+
+        # Request B: same first 8 tokens, different suffix.
+        # Tree has blocks for [0..3] and [4..7] → 8 matched tokens.
+        # Remaining: tokens [8..9] = 2 tokens, completes in 1 chunk.
+        b = _make_request("b", [*list(range(8)), 20, 21])
+        outputs = runner.step(prefill=[b], decode=[])
+
+        assert b.state is RequestState.DECODE
+        assert b.prefill_progress == 10
+        assert len(outputs) == 1
+        _, out = outputs[0]
+        assert out.token_id == 7
+
+    def test_no_hit_on_different_prefix(self) -> None:
+        """Request with entirely different tokens gets no prefix hit."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        # Populate tree.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+        assert a.state is RequestState.DECODE
+
+        # Different tokens → no match, standard 2-chunk prefill.
+        b = _make_request("b", [50, 51, 52, 53, 54, 55, 56, 57])
+        runner.step(prefill=[b], decode=[])
+        assert b.prefill_progress == 4  # only first chunk
+
+        runner.step(prefill=[b], decode=[])
+        assert b.state is RequestState.DECODE
+        assert b.prefill_progress == 8
+
+
+class TestPrefixCachingFullHit:
+    def test_full_hit_single_token_forward(self) -> None:
+        """Full prefix cache hit uses single last-token forward pass."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        # Populate cache with block-aligned 8-token prompt.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+        assert a.state is RequestState.DECODE
+
+        model.forward_count = 0
+
+        # Same tokens → full hit.
+        b = _make_request("b", list(range(8)))
+        outputs = runner.step(prefill=[b], decode=[])
+
+        assert model.forward_count == 1  # single forward
+        assert b.state is RequestState.DECODE
+        assert b.prefill_progress == 8
+        assert len(outputs) == 1
+        _, out = outputs[0]
+        assert out.token_id == 7
+
+        # Verify single-token input.
+        assert model.last_position_ids is not None
+        assert model.last_position_ids.shape == (1, 1)
+        assert model.last_position_ids.item() == 7  # prompt_len - 1
+
+    def test_full_hit_inserts_into_tree(self) -> None:
+        """Full-hit path calls insert_prefix (no-op but consistent)."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+        pool = runner.cache_pool
+        assert isinstance(pool, PagedKVCachePool)
+        assert pool.prefix_tree is not None
+
+        # Populate cache.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+        assert pool.prefix_tree.cached_block_count() == 2
+
+        # Full hit: insert is called but no new nodes created.
+        b = _make_request("b", list(range(8)))
+        runner.step(prefill=[b], decode=[])
+        assert pool.prefix_tree.cached_block_count() == 2  # unchanged
+
+
+class TestPrefixCachingDecodeAfter:
+    def test_decode_after_prefix_hit(self) -> None:
+        """Decode works after prefix-cached prefill."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        # Populate cache.
+        a = _make_request("a", list(range(8)), max_new_tokens=3)
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+        assert a.state is RequestState.DECODE
+
+        # Prefix hit.
+        b = _make_request("b", [*list(range(8)), 20, 21], max_new_tokens=3)
+        runner.step(prefill=[b], decode=[a])
+        assert b.state is RequestState.DECODE
+
+        # Both decode together.
+        outputs = runner.step(prefill=[], decode=[a, b])
+        assert len(outputs) == 2
+        for _, out in outputs:
+            assert out.token_id == 7
+
+    def test_decode_after_full_hit(self) -> None:
+        """Decode works after full prefix cache hit."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        # Populate cache.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+
+        # Full hit + 3 decode steps.
+        b = _make_request("b", list(range(8)), max_new_tokens=3)
+        runner.step(prefill=[b], decode=[])  # full hit
+        assert b.state is RequestState.DECODE
+        assert len(b.generated_token_ids) == 1
+
+        runner.step(prefill=[], decode=[b])
+        assert len(b.generated_token_ids) == 2
+
+        outputs = runner.step(prefill=[], decode=[b])
+        _, out = outputs[0]
+        assert out.finished is True
+        assert out.finish_reason == "length"
+
+
+class TestPrefixCachingRefcounts:
+    def test_free_slot_decrements_refcounts(self) -> None:
+        """Freeing a slot makes cached blocks evictable."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+        pool = runner.cache_pool
+        assert isinstance(pool, PagedKVCachePool)
+        assert pool.prefix_tree is not None
+
+        # Populate cache.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+        assert pool.prefix_tree.evictable_count() == 0
+
+        # Free slot → refcounts go to 0 → blocks become evictable.
+        assert a.slot_idx is not None
+        runner.free_slot(a.slot_idx)
+        assert pool.prefix_tree.evictable_count() == 2
+
+    def test_shared_prefix_refcounts(self) -> None:
+        """Two active sequences sharing a prefix keep blocks protected."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+        pool = runner.cache_pool
+        assert isinstance(pool, PagedKVCachePool)
+        assert pool.prefix_tree is not None
+
+        # A populates cache.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+
+        # B matches the prefix.
+        b = _make_request("b", list(range(8)))
+        runner.step(prefill=[b], decode=[])
+
+        # Both active → blocks protected (not evictable).
+        assert pool.prefix_tree.evictable_count() == 0
+
+        # Free A → blocks still protected (B holds refs).
+        assert a.slot_idx is not None
+        runner.free_slot(a.slot_idx)
+        assert pool.prefix_tree.evictable_count() == 0
+
+        # Free B → blocks now evictable.
+        assert b.slot_idx is not None
+        runner.free_slot(b.slot_idx)
+        assert pool.prefix_tree.evictable_count() == 2
+
+
+class TestPrefixCachingBatched:
+    def test_batch_with_full_hit_and_normal(self) -> None:
+        """Batch mixing full-hit and normal requests returns correct outputs."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        # Populate cache with block-aligned prompt.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+        assert a.state is RequestState.DECODE
+
+        # b: full hit (same tokens). c: no hit (different tokens).
+        b = _make_request("b", list(range(8)))
+        c = _make_request("c", [50, 51, 52, 53, 54, 55, 56, 57])
+
+        outputs = runner.step(prefill=[b, c], decode=[])
+
+        # b completes (full hit). c is intermediate (first chunk).
+        assert len(outputs) == 1
+        req, out = outputs[0]
+        assert req.request_id == "b"
+        assert out.token_id == 7
+        assert b.state is RequestState.DECODE
+        assert c.state is RequestState.PREFILL
+        assert c.prefill_progress == 4
+
+    def test_all_full_hits(self) -> None:
+        """Batch where all requests are full hits."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_prefix_config())
+
+        # Populate cache.
+        a = _make_request("a", list(range(8)))
+        runner.step(prefill=[a], decode=[])
+        runner.step(prefill=[a], decode=[])
+
+        # Two full-hit requests.
+        b = _make_request("b", list(range(8)))
+        c = _make_request("c", list(range(8)))
+        outputs = runner.step(prefill=[b, c], decode=[])
+
+        assert len(outputs) == 2
+        assert b.state is RequestState.DECODE
+        assert c.state is RequestState.DECODE
+
+
+class TestPrefixCachingErrorRecovery:
+    def test_allocation_failure_preserves_tree(self) -> None:
+        """Tree state is consistent after suffix allocation failure."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        # Tiny pool: only 4 blocks.
+        config = _make_prefix_config(num_gpu_blocks=4)
+        runner = _make_runner(model, config)
+        pool = runner.cache_pool
+        assert isinstance(pool, PagedKVCachePool)
+        assert pool.prefix_tree is not None
+
+        # Request A: 16 tokens uses all 4 blocks.
+        a = _make_request("a", list(range(16)))
+        for _ in range(4):
+            runner.step(prefill=[a], decode=[])
+        assert a.state is RequestState.DECODE
+        assert pool.prefix_tree.cached_block_count() == 4
+
+        # Request B: same prefix + 4 extra tokens. Needs 5 total blocks.
+        # Match succeeds (4 blocks), but suffix allocation (1 block) fails
+        # because pool has 0 free and all tree blocks have ref_count > 0.
+        b = _make_request("b", [*list(range(16)), 99, 98, 97, 96])
+        with pytest.raises(RuntimeError, match="Cannot allocate"):
+            runner.step(prefill=[b], decode=[])
+
+        # Tree intact: 4 blocks, refcounts back to pre-match state.
+        assert pool.prefix_tree.cached_block_count() == 4
+        assert pool.prefix_tree.evictable_count() == 0
+
+
+class TestPrefixCachingBackwardCompat:
+    def test_paged_without_prefix_works(self) -> None:
+        """Paged backend with chunked prefill but no prefix caching."""
+        model = ChunkedMockModel(vocab_size=100, fixed_next_token=7)
+        runner = _make_runner(model, _make_paged_config())
+
+        req = _make_request("r1", list(range(8)), max_new_tokens=3)
+        runner.step(prefill=[req], decode=[])
+        runner.step(prefill=[req], decode=[])
+        assert req.state is RequestState.DECODE
+
+        outputs = runner.step(prefill=[], decode=[req])
+        assert len(outputs) == 1
+        _, out = outputs[0]
+        assert out.token_id == 7
