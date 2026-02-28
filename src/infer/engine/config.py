@@ -36,6 +36,11 @@ class EngineConfig:
             Requires ``kv_cache_backend="paged"`` and ``batching_mode="continuous"``.
             **Not recommended for performance** — Triton kernels replay slower
             inside CUDA graphs than they execute eagerly. Kept for reference.
+        use_speculative_decoding: Use a draft model for speculative decoding (Phase 11).
+            Requires ``batching_mode="continuous"`` and ``draft_model`` to be set.
+            Incompatible with ``use_cuda_graphs=True``.
+        draft_model: HuggingFace model ID for the draft model (speculative decoding).
+        spec_length: Number of candidate tokens per speculation round (default 5).
     """
 
     model: str
@@ -67,6 +72,11 @@ class EngineConfig:
 
     # Quantization (Phase 10).
     quantization: str | None = None
+
+    # Speculative decoding (Phase 11).
+    use_speculative_decoding: bool = False
+    draft_model: str | None = None
+    spec_length: int = 5  # candidate tokens per speculation round
 
     # Paged backend configuration.
     block_size: int = 16  # tokens per KV cache block (paged backend only)
@@ -139,3 +149,12 @@ class EngineConfig:
                 f"Unsupported quantization: {self.quantization!r}. "
                 f"Choose from {sorted(_VALID_QUANTIZATIONS)}"
             )
+        if self.use_speculative_decoding:
+            if self.draft_model is None:
+                raise ValueError("use_speculative_decoding=True requires draft_model to be set")
+            if self.batching_mode != "continuous":
+                raise ValueError("Speculative decoding requires batching_mode='continuous'")
+            if self.use_cuda_graphs:
+                raise ValueError("Speculative decoding is incompatible with use_cuda_graphs=True")
+            if self.spec_length < 1:
+                raise ValueError(f"spec_length must be >= 1, got {self.spec_length}")

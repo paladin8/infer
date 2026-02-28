@@ -265,3 +265,73 @@ class TestCUDAGraphsConfig:
             use_cuda_graphs=False,
         )
         assert cfg.use_cuda_graphs is False
+
+
+class TestSpeculativeDecodingConfig:
+    def test_default_disabled(self) -> None:
+        cfg = EngineConfig(model="m")
+        assert cfg.use_speculative_decoding is False
+        assert cfg.draft_model is None
+        assert cfg.spec_length == 5
+
+    def test_speculative_decoding_valid_config(self) -> None:
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="continuous",
+            use_speculative_decoding=True,
+            draft_model="d",
+            spec_length=3,
+        )
+        assert cfg.use_speculative_decoding is True
+        assert cfg.draft_model == "d"
+        assert cfg.spec_length == 3
+
+    def test_speculative_decoding_requires_draft_model(self) -> None:
+        with pytest.raises(ValueError, match="draft_model"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                use_speculative_decoding=True,
+                draft_model=None,
+            )
+
+    def test_speculative_decoding_requires_continuous(self) -> None:
+        with pytest.raises(ValueError, match="batching_mode='continuous'"):
+            EngineConfig(
+                model="m",
+                batching_mode="static",
+                use_speculative_decoding=True,
+                draft_model="d",
+            )
+
+    def test_speculative_decoding_rejects_cuda_graphs(self) -> None:
+        with pytest.raises(ValueError, match="incompatible with use_cuda_graphs"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                kv_cache_backend="paged",
+                use_speculative_decoding=True,
+                draft_model="d",
+                use_cuda_graphs=True,
+            )
+
+    def test_spec_length_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="spec_length must be >= 1"):
+            EngineConfig(
+                model="m",
+                batching_mode="continuous",
+                use_speculative_decoding=True,
+                draft_model="d",
+                spec_length=0,
+            )
+
+    def test_disabled_skips_validation(self) -> None:
+        """When use_speculative_decoding=False, draft_model/spec_length are not validated."""
+        cfg = EngineConfig(
+            model="m",
+            batching_mode="static",
+            use_speculative_decoding=False,
+            draft_model=None,
+            spec_length=0,
+        )
+        assert cfg.use_speculative_decoding is False

@@ -96,6 +96,22 @@ class SlottedKVCache:
         """Return a multi-slot view for batched decode."""
         return DecodeCacheView(self, active_slots)
 
+    def truncate_to(self, slot: int, new_seq_len: int) -> None:
+        """Roll back a slot's sequence length counter.
+
+        Stale entries beyond the new length are left in the cache tensor
+        and will be overwritten in the next forward pass.
+
+        Args:
+            slot: The slot index to truncate.
+            new_seq_len: The new sequence length (must be <= current seq_len).
+        """
+        assert new_seq_len <= self.seq_lens[slot], (
+            f"Cannot truncate slot {slot} from {self.seq_lens[slot]} to {new_seq_len}: "
+            f"new_seq_len exceeds current length"
+        )
+        self.seq_lens[slot] = new_seq_len
+
     def get_seq_len(self, slot: int) -> int:
         """Return the current sequence length for a slot."""
         return self.seq_lens[slot]

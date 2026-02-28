@@ -83,6 +83,24 @@ def main() -> None:
         choices=["fp8", "int8"],
         help="weight quantization format (default: auto-detect from checkpoint)",
     )
+    parser.add_argument(
+        "--speculative-decoding",
+        action="store_true",
+        default=False,
+        help="enable speculative decoding (requires --batching-mode continuous and --draft-model)",
+    )
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="HuggingFace model ID or local path for the draft model",
+    )
+    parser.add_argument(
+        "--spec-length",
+        type=int,
+        default=5,
+        help="candidate tokens per speculation round (default: 5)",
+    )
     args = parser.parse_args()
 
     config = EngineConfig(
@@ -104,6 +122,9 @@ def main() -> None:
         use_prefix_caching=args.prefix_caching,
         use_cuda_graphs=args.cuda_graphs,
         quantization=args.quantization,
+        use_speculative_decoding=args.speculative_decoding,
+        draft_model=args.draft_model,
+        spec_length=args.spec_length,
     )
 
     app = create_app(config)

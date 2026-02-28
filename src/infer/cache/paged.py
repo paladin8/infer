@@ -319,6 +319,50 @@ class PagedKVCachePool:
                 self.allocator.free(blocks)
         del self.seq_lens[seq_id]
 
+    def truncate_to(self, seq_id: int, new_seq_len: int) -> None:
+        """Roll back a sequence's length and free blocks beyond the new length.
+
+        Blocks whose first token position is at or beyond ``new_seq_len`` are
+        freed. Partial last blocks (where ``new_seq_len`` falls mid-block) are
+        kept -- their stale entries are overwritten in the next forward pass.
+
+        Only frees non-tree blocks. Prefix tree blocks are never freed by
+        truncation because speculative tokens are always beyond the prompt
+        prefix managed by the tree.
+
+        Args:
+            seq_id: The sequence ID to truncate.
+            new_seq_len: The new sequence length (must be <= current seq_len).
+
+        Raises:
+            AssertionError: If ``new_seq_len`` exceeds the current sequence length.
+        """
+        current_len = self.seq_lens[seq_id]
+        assert new_seq_len <= current_len, (
+            f"Cannot truncate seq {seq_id} from {current_len} to {new_seq_len}: "
+            f"new_seq_len exceeds current length"
+        )
+        self.seq_lens[seq_id] = new_seq_len
+
+        # Compute how many blocks are needed for new_seq_len.
+        if new_seq_len == 0:
+            blocks_needed = 0
+        else:
+            blocks_needed = (new_seq_len + self.block_size - 1) // self.block_size
+
+        # Free blocks beyond the new length.
+        page_table = self.page_tables[seq_id]
+        if len(page_table) > blocks_needed:
+            blocks_to_free = page_table[blocks_needed:]
+            # Only free non-tree blocks.
+            if self.prefix_tree is not None:
+                non_tree = [b for b in blocks_to_free if not self.prefix_tree.contains_block(b)]
+                if non_tree:
+                    self.allocator.free(non_tree)
+            else:
+                self.allocator.free(blocks_to_free)
+            self.page_tables[seq_id] = page_table[:blocks_needed]
+
     def get_seq_len(self, seq_id: int) -> int:
         """Return the current sequence length for a sequence."""
         return self.seq_lens[seq_id]

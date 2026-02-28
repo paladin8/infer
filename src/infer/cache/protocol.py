@@ -102,6 +102,19 @@ class CachePoolProtocol(Protocol):
         """
         ...
 
+    def truncate_to(self, slot: int, new_seq_len: int) -> None:
+        """Roll back a slot's sequence length, freeing resources beyond the new length.
+
+        For slotted backends, this simply decrements the sequence length counter.
+        For paged backends, this also frees blocks whose first token position is
+        at or beyond ``new_seq_len``.
+
+        Args:
+            slot: The slot/sequence ID to truncate.
+            new_seq_len: The new sequence length (must be <= current seq_len).
+        """
+        ...
+
     def is_paged(self) -> bool:
         """Whether this pool uses paged block allocation."""
         ...
