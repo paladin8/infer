@@ -411,12 +411,230 @@ Fits within 16 GB dev tier. For larger batch sizes or longer sequences, reduce `
 
 ---
 
-## Exit Criteria
+## Expanded Implementation Signatures
 
-- Measurable tokens-per-second improvement on single-request decode with Llama 1B/3B pair (expect 1.5-2.5x depending on acceptance rate).
-- Correctness: greedy decode output is identical with and without speculation (exact token match on 5+ diverse prompts).
-- Correctness: sampling mode output is statistically equivalent (verified via fixed-seed deterministic comparison and distribution tests).
-- Acceptance rate logged per request at completion.
-- No regression when `use_speculative_decoding=False` (default).
-- All existing tests pass with speculation disabled.
-- Benchmark comparing speculative vs non-speculative decode on the W1 (single request) workload.
+### D8: EngineConfig and CLI (Foundation)
+
+**Files: `src/infer/engine/config.py`, `src/infer/server/__main__.py`**
+
+```python
+# config.py — new fields on EngineConfig:
+use_speculative_decoding: bool = False
+draft_model: str | None = None
+spec_length: int = 5
+
+# config.py — new validation rules in validate():
+# - use_speculative_decoding=True requires draft_model is not None
+# - use_speculative_decoding=True requires batching_mode == "continuous"
+# - use_speculative_decoding=True is incompatible with use_cuda_graphs=True
+# - spec_length must be >= 1
+
+# __main__.py — new CLI arguments:
+# --speculative-decoding  (action="store_true")
+# --draft-model           (str, default=None)
+# --spec-length           (int, default=5)
+```
+
+**Test coverage (in `tests/unit/test_engine_config.py`):**
+- `test_speculative_decoding_requires_draft_model`: `use_speculative_decoding=True` without `draft_model` raises `ValueError`.
+- `test_speculative_decoding_requires_continuous`: `use_speculative_decoding=True` with `batching_mode="static"` raises `ValueError`.
+- `test_speculative_decoding_rejects_cuda_graphs`: `use_speculative_decoding=True` with `use_cuda_graphs=True` raises `ValueError`.
+- `test_spec_length_validation`: `spec_length=0` raises `ValueError`.
+- `test_speculative_decoding_valid_config`: Valid config with all fields set passes validation.
+
+### D6: KV Cache truncate_to (Foundation)
+
+**Files: `src/infer/cache/protocol.py`, `src/infer/cache/slotted.py`, `src/infer/cache/paged.py`**
+
+```python
+# protocol.py — add to CachePoolProtocol:
+def truncate_to(self, slot: int, new_seq_len: int) -> None:
+    """Roll back a slot's sequence length, freeing blocks beyond the new length."""
+    ...
+
+# slotted.py — SlottedKVCache.truncate_to:
+def truncate_to(self, slot: int, new_seq_len: int) -> None:
+    """Roll back by setting seq_lens[slot] = new_seq_len."""
+
+# paged.py — PagedKVCachePool.truncate_to:
+def truncate_to(self, seq_id: int, new_seq_len: int) -> None:
+    """Roll back: set seq_lens[seq_id] = new_seq_len, free blocks
+    whose first position >= new_seq_len."""
+```
+
+**Test coverage (in `tests/unit/test_speculative.py`):**
+- `test_truncate_to_slotted`: Allocate slot, advance seq_len, truncate, verify seq_len decremented.
+- `test_truncate_to_paged_frees_blocks`: Allocate blocks, advance, truncate to fewer blocks needed, verify blocks freed.
+- `test_truncate_to_paged_keeps_partial_block`: Truncate to a position mid-block, verify partial block is kept.
+- `test_truncate_to_noop_when_already_at_len`: Truncating to current length is a no-op.
+
+### D9: Acceptance Rate Metrics (Foundation)
+
+**Files: `src/infer/engine/request.py`**
+
+```python
+# request.py — new field on Request:
+speculation_acceptance_rates: list[float] = field(default_factory=list, repr=False)
+
+# request.py — new field on StepOutput:
+acceptance_rate: float | None = None
+```
+
+**Test coverage (in `tests/unit/test_speculative.py`):**
+- `test_request_has_speculation_rates_field`: Verify default empty list.
+- `test_step_output_has_acceptance_rate_field`: Verify default None.
+
+### D1+D3+D4+D5: SpeculativeRunner (Core)
+
+**File: `src/infer/engine/speculative_runner.py`**
+
+```python
+class SpeculativeRunner:
+    """Speculative decoding runner: draft-then-verify decode loop."""
+
+    def __init__(
+        self,
+        target_model: nn.Module,
+        draft_model: nn.Module,
+        tokenizer: Tokenizer,
+        config: EngineConfig,
+    ) -> None: ...
+
+    def step(
+        self,
+        prefill: list[Request],
+        decode: list[Request],
+    ) -> list[tuple[Request, StepOutput]]: ...
+
+    def free_slot(self, slot_idx: int) -> None: ...
+    def cleanup_request(self, request_id: str) -> None: ...
+    def free_kv_tokens(self) -> int | None: ...
+
+    # --- Internal methods ---
+
+    @torch.inference_mode()
+    def _prefill_one(self, req: Request) -> StepOutput: ...
+
+    @torch.inference_mode()
+    def _prefill_batch(self, requests: list[Request]) -> list[StepOutput]: ...
+
+    @torch.inference_mode()
+    def _prefill_chunks_batched(
+        self, requests: list[Request]
+    ) -> list[StepOutput | None]: ...
+
+    @torch.inference_mode()
+    def _speculative_decode(
+        self, requests: list[Request]
+    ) -> list[tuple[Request, StepOutput]]: ...
+
+    @torch.inference_mode()
+    def _draft_generate(
+        self, requests: list[Request]
+    ) -> tuple[dict[str, list[int]], dict[str, list[Tensor]]]: ...
+
+    @torch.inference_mode()
+    def _verify(
+        self, requests: list[Request], draft_tokens: dict[str, list[int]]
+    ) -> Tensor: ...
+
+    def _accept_reject(
+        self,
+        requests: list[Request],
+        draft_tokens: dict[str, list[int]],
+        draft_log_probs: dict[str, list[Tensor]],
+        target_logits: Tensor,
+    ) -> dict[str, list[int]]: ...
+
+    def _rollback_kv_caches(
+        self,
+        requests: list[Request],
+        accepted_tokens: dict[str, list[int]],
+        draft_start_positions: dict[str, int],
+    ) -> None: ...
+```
+
+**Design note on prefill delegation:** SpeculativeRunner contains its own `_prefill_one`, `_prefill_batch`, and `_prefill_chunks_batched` methods rather than wrapping a ContinuousRunner, because those methods need to allocate slots in *both* cache pools (target and draft) and track the draft prefill state. The implementation follows the same structure as ContinuousRunner but also allocates a draft cache slot during prefill.
+
+**Test coverage (in `tests/unit/test_speculative.py`):**
+- `test_accept_reject_greedy_all_match`: All draft tokens match target argmax, all accepted + bonus.
+- `test_accept_reject_greedy_first_mismatch`: First draft token mismatches, only correction returned.
+- `test_accept_reject_greedy_partial`: Some accepted, then mismatch with correction.
+- `test_accept_reject_sampling_known_distributions`: Construct fixed p/q distributions, verify acceptance criterion.
+- `test_accept_reject_sampling_correction_distribution`: On rejection, verify correction token sampled from `norm(max(0, p - q))`.
+- `test_multi_token_output`: Verify multiple StepOutputs emitted per request per step.
+- `test_draft_generate_produces_k_tokens`: Mock model producing K draft tokens.
+- `test_verify_uses_chunked_prefill_view`: Verify target verification uses correct cache view.
+- `test_spec_length_overflow_guard`: When remaining capacity < K+1, effective spec_length is reduced.
+
+### D7: Engine Integration
+
+**File: `src/infer/engine/engine.py`**
+
+```python
+# In _init_components:
+# - When config.use_speculative_decoding:
+#   1. Load draft model via load_model(config.draft_model, ...)
+#   2. Verify tokenizer compatibility (vocab_size, eos_token_ids)
+#   3. Create SpeculativeRunner(target_model, draft_model, tokenizer, config)
+# - Update type annotations: self.runner: ModelRunner | ContinuousRunner | SpeculativeRunner
+# - In _step_continuous: accept SpeculativeRunner as well as ContinuousRunner
+```
+
+**Test coverage (in `tests/unit/test_speculative.py`):**
+- `test_engine_creates_speculative_runner`: With spec config, engine creates SpeculativeRunner.
+- `test_engine_rejects_mismatched_tokenizers`: Draft/target with different vocab_size raises error.
+
+### D10: Integration Tests
+
+**File: `tests/integration/test_speculative_e2e.py`**
+
+```python
+# GPU integration tests (require Llama-3.2-1B and 3B models):
+# - test_speculative_greedy_parity: Compare greedy output with/without speculation.
+# - test_speculative_e2e_sampling: Sampling mode produces coherent output.
+# - test_speculative_with_continuous_batching: Multiple concurrent requests.
+```
+
+---
+
+## Deliverables Dependency Order
+
+Implementation order (foundations first):
+
+1. **D8** — EngineConfig + CLI (no dependencies, pure config)
+2. **D6** — KV cache `truncate_to` (no dependencies, pure cache)
+3. **D9** — Acceptance rate fields (no dependencies, pure data model)
+4. **D1+D3+D4+D5** — SpeculativeRunner (depends on D6 for rollback, D9 for metrics, D8 for config)
+5. **D7** — Engine integration (depends on D1)
+6. **D10** — Tests (depends on all above; unit tests are written alongside each deliverable)
+
+---
+
+## Acceptance Criteria
+
+### Must Pass (Unit Tests, No GPU Required)
+
+1. `uv run pytest tests/unit/test_speculative.py` passes all tests.
+2. `uv run pytest tests/unit/test_engine_config.py` passes (including new spec-decoding validation tests).
+3. `uv run ruff check .` reports no errors.
+4. `uv run ruff format --check .` reports no changes needed.
+5. `uv run mypy .` reports no errors.
+6. All 1002+ existing unit tests still pass (`uv run pytest tests/unit/`).
+7. `EngineConfig` validates speculative decoding constraints correctly.
+8. `truncate_to` works for both slotted and paged backends.
+9. Greedy accept/reject produces correct results with known mock data.
+10. Sampling accept/reject implements the correct rejection sampling criterion.
+11. Multi-token output emits the right number of StepOutputs.
+12. KV cache rollback correctly truncates both draft and target caches.
+
+### Must Pass (GPU Integration, Requires Models)
+
+13. Greedy decode output is identical with and without speculation (Llama 1B/3B).
+14. Sampling mode produces coherent output with acceptance rate logged.
+15. Multiple concurrent requests with speculation complete correctly.
+
+### Documentation
+
+16. Design document is expanded with all implementation signatures and test plans.
+17. `.ai/memory.md` is updated with Phase 11 status.
