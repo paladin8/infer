@@ -544,13 +544,13 @@ Autoregressive decode is sequential — one forward pass per token. Speculative 
 
 Deliverables:
 
-- `DraftTargetRunner` that orchestrates the draft-then-verify loop.
+- `SpeculativeRunner` that orchestrates the draft-then-verify loop.
 - Draft model loading: load a second, smaller model alongside the target model. Both models share the same tokenizer.
 - Draft generation loop: run the draft model autoregressively for K steps (configurable `spec_length`, default 5), producing K candidate token IDs and their log-probabilities.
 - Target verification pass: run the target model on all K candidates in a single forward pass, compare target log-probabilities against draft log-probabilities to determine acceptance.
 - Rejection sampling: use the standard speculative decoding acceptance criterion (accept token i if `target_prob[i] >= draft_prob[i]`, otherwise accept with probability `target_prob[i] / draft_prob[i]`) to guarantee the output distribution is identical to pure target-model sampling.
 - KV cache management: draft model gets its own lightweight KV cache. On rejection, roll back both draft and target KV caches to the last accepted position.
-- Integration with continuous batching: speculative decoding applies per-sequence within the existing scheduler. Sequences using speculation coexist with non-speculative sequences in the same batch.
+- Integration with continuous batching: speculative decoding applies to all decode requests uniformly within the existing scheduler. The scheduler is unaware of speculation — it manages request lifecycle as before.
 - `use_speculative_decoding: bool` and `draft_model: str | None` fields in `EngineConfig`.
 
 Constraints:
@@ -663,7 +663,8 @@ Compatibility rules to enforce in config validation:
 - `use_chunked_prefill=True` requires `batching_mode="continuous"`.
 - `use_prefix_caching=True` requires `kv_cache_backend="paged"` and `use_chunked_prefill=True`.
 - `use_cuda_graphs=True` requires `batching_mode="continuous"` and `kv_cache_backend="paged"`.
-- `use_speculative_decoding=True` requires `draft_model` to be set.
+- `use_speculative_decoding=True` requires `draft_model` to be set and `batching_mode="continuous"`.
+- `use_speculative_decoding=True` is incompatible with `use_cuda_graphs=True`.
 - `quantization` must be `None`, `"fp8"`, or `"int8"`.
 
 Benchmark matrix baseline:
@@ -889,7 +890,7 @@ infer/
 
 - ~~Phase 9: Should CUDA graphs be recorded lazily (on first encounter of each batch size) or eagerly (pre-record a fixed set at startup)?~~ **Resolved in Phase 9 design:** Eager warmup at startup for power-of-2 batch sizes (1, 2, 4, 8, 16, 32). This avoids first-encounter latency during serving while keeping the number of captured graphs bounded. Batch sizes exceeding the largest bucket fall back to eager mode. See `docs/PHASE_9.md` for details.
 - ~~Phase 10: Prioritize pre-quantized checkpoint loading (AWQ/GPTQ) or on-the-fly quantization from bf16?~~ **Resolved:** Load pre-quantized checkpoints. FP8: block-wise FP8 with 128x128 blocks and per-block `weight_scale_inv` (Qwen/Qwen3-8B-FP8). INT8: per-channel symmetric INT8 with per-row `weight_scale` (nytopop/Qwen3-8B.w8a8, compressed-tensors format). No on-the-fly quantization needed.
-- Phase 11: What draft/target model pairs to benchmark? Llama-1B/Llama-3B is the natural pair, but Qwen3-1.7B/Qwen3-4B is also viable. Need to verify tokenizer compatibility.
+- ~~Phase 11: What draft/target model pairs to benchmark? Llama-1B/Llama-3B is the natural pair, but Qwen3-1.7B/Qwen3-4B is also viable. Need to verify tokenizer compatibility.~~ **Resolved:** Llama-3.2-1B-Instruct (draft) / Llama-3.2-3B-Instruct (target). Same model family, identical tokenizer and vocabulary (128,256 tokens). Both fit within 16 GB VRAM (~9 GB weights + ~4.5 GB KV caches). See `docs/PHASE_11.md` for the full design.
 - Phase 12: Build the FSM compiler from scratch or use an existing library (e.g. `outlines-core`)? Building from scratch is more educational but significantly more work.
 
 ---
