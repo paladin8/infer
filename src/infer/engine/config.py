@@ -8,7 +8,7 @@ _VALID_BATCHING_MODES = {"static", "continuous"}
 _VALID_SCHEDULER_POLICIES = {"fcfs"}
 _VALID_KV_CACHE_BACKENDS = {"contiguous", "paged"}
 _VALID_DTYPES = {"bfloat16", "float16"}
-_VALID_QUANTIZATIONS = {"fp8"}
+_VALID_QUANTIZATIONS = {"fp8", "int8"}
 
 
 @dataclass

@@ -24,6 +24,7 @@ MODELS: dict[str, str] = {
     "qwen3": "Qwen/Qwen3-1.7B",
     "gemma3": "google/gemma-3-1b-it",
     "qwen3-8b-fp8": "Qwen/Qwen3-8B-FP8",
+    "qwen3-8b-int8": "nytopop/Qwen3-8B.w8a8",
 }
 
 DEFAULT_PROMPT = "List the top 5 cities in Japan."

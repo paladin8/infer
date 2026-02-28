@@ -492,38 +492,45 @@ Exit criteria:
 
 See `docs/PHASE_9.md` for the full design.
 
-### Phase 10: FP8 Weight Quantization
+### Phase 10: Weight Quantization (FP8 + INT8)
 
 Goal:
 
-- Support FP8 weight-only quantization to reduce memory footprint, enabling 8B-class models on 16 GB VRAM and improving memory-bandwidth-bound decode throughput. Primary target: load and serve `Qwen/Qwen3-8B-FP8` with reasonable output quality.
+- Support weight-only quantization to reduce memory footprint, enabling 8B-class models on 16 GB VRAM and improving memory-bandwidth-bound decode throughput. Two formats are supported:
+  - **FP8**: Block-wise float8_e4m3fn quantization. Target: `Qwen/Qwen3-8B-FP8`.
+  - **INT8**: Per-channel symmetric int8 quantization. Target: `nytopop/Qwen3-8B.w8a8`.
 
 Background:
 
-Unquantized bf16 weights for an 8B model require ~16 GB, leaving no room for KV cache on a 16 GB card. FP8 (float8_e4m3fn) halves weight memory to ~8 GB, making 8B models practical. Decode throughput is memory-bandwidth-bound (reading weights dominates), so smaller weights directly translate to faster decode — in theory ~2x (in practice limited by dequantization overhead). FP8 is the industry-standard quantization format supported by modern GPUs (Ada Lovelace / Hopper and newer, compute capability >= 8.9). The `Qwen/Qwen3-8B-FP8` checkpoint uses block-wise FP8 quantization (128x128 blocks) with per-block scale factors, following the format popularized by DeepSeek-V3.
+Unquantized bf16 weights for an 8B model require ~16 GB, leaving no room for KV cache on a 16 GB card. Quantization halves weight memory to ~8 GB, making 8B models practical. Decode throughput is memory-bandwidth-bound (reading weights dominates), so smaller weights directly translate to faster decode. Both FP8 and INT8 achieve approximately 2x memory reduction (1 byte per element vs 2 bytes for bf16), with negligible scale tensor overhead.
+
+FP8 uses block-wise quantization (128x128 blocks with per-block scale factors) in the DeepSeek-V3 format. INT8 uses per-channel symmetric quantization (one scale per output channel) in the compressed-tensors format, which is simpler but equally effective for weight-only dequantization.
 
 Deliverables:
 
-- FP8-aware weight loader: detect FP8 checkpoints via `quantization_config` in config.json, load float8_e4m3fn weights and their per-block scale tensors (`weight_scale_inv`).
-- `FP8Linear` module replacing `nn.Linear` for quantized layers, storing FP8 weight tensor and block-wise scale tensor. Forward pass dequantizes weights to bf16 and performs the matmul.
-- Triton block-wise dequantization kernel: fused per-block dequant (FP8 weight * scale) for 128x128 blocks. Alternatively, use eager dequant-then-matmul as a simpler baseline.
+- Quantization-aware weight loader: detect quantization format from `quantization_config` in config.json. Support both FP8 (`quant_method: "fp8"`) and INT8 (`quant_method: "compressed-tensors"` with int weights).
+- `FP8Linear` module for block-wise FP8: stores float8_e4m3fn weight and per-block float32 scale tensor (`weight_scale_inv`). Forward pass dequantizes to bf16 and computes matmul.
+- `INT8Linear` module for per-channel INT8: stores int8 weight and per-channel bf16 scale tensor (`weight_scale`). Forward pass dequantizes to bf16 and computes matmul.
+- Model surgery functions: `replace_linear_with_fp8` and `replace_linear_with_int8` to swap `nn.Linear` modules with quantized versions.
 - Per-architecture support: quantize all linear layers in attention (Q/K/V/O projections) and MLP (gate/up/down projections). Norms, embeddings, and LM head stay in bf16.
-- `quantization: str | None` config field in `EngineConfig` (`None`, `"fp8"`). Auto-detected from checkpoint when `None`.
-- Weight map extension: map `weight_scale_inv` tensors alongside weight tensors for each quantized linear layer.
+- `quantization: str | None` config field in `EngineConfig` (`None`, `"fp8"`, `"int8"`). Auto-detected from checkpoint when `None`.
+- Weight map extension: map scale tensors alongside weight tensors for each quantized linear layer (`weight_scale_inv` for FP8, `weight_scale` for INT8).
 
 Constraints:
 
-- Generation quality must be verified: quantized model produces coherent, reasonable output on standard prompts.
-- Block-wise quantization (128x128) must be supported — this is the format used by Qwen/Qwen3-8B-FP8.
+- Generation quality must be verified: quantized models produce coherent, reasonable output on standard prompts.
+- FP8: block-wise quantization (128x128) must be supported — this is the format used by Qwen/Qwen3-8B-FP8.
+- INT8: per-channel symmetric quantization must be supported — this is the format used by nytopop/Qwen3-8B.w8a8.
 - Non-quantized layers (embeddings, norms, LM head) remain in bf16.
 - All existing tests must pass with `quantization=None` (no regression).
 
 Exit criteria:
 
 - Successfully load and serve `Qwen/Qwen3-8B-FP8` on 16 GB VRAM.
-- Generation quality sanity check: model produces coherent, reasonable output on standard prompts.
+- Successfully load and serve `nytopop/Qwen3-8B.w8a8` on 16 GB VRAM.
+- Generation quality sanity check: both quantized models produce coherent, reasonable output on standard prompts.
 - All existing tests pass with `quantization=None` (no regression).
-- Benchmark report: VRAM usage comparison (bf16 vs FP8) and generation quality samples.
+- Unit tests for both FP8 and INT8 dequantization, model surgery, and weight maps.
 
 ### Phase 11: Speculative Decoding
 
@@ -640,7 +647,7 @@ class EngineConfig:
     use_cuda_graphs: bool = False
 
     # Quantization (Phase 10)
-    quantization: str | None = None    # None | "fp8"
+    quantization: str | None = None    # None | "fp8" | "int8"
 
     # Speculative decoding (Phase 11)
     use_speculative_decoding: bool = False
@@ -657,7 +664,7 @@ Compatibility rules to enforce in config validation:
 - `use_prefix_caching=True` requires `kv_cache_backend="paged"` and `use_chunked_prefill=True`.
 - `use_cuda_graphs=True` requires `batching_mode="continuous"` and `kv_cache_backend="paged"`.
 - `use_speculative_decoding=True` requires `draft_model` to be set.
-- `quantization` must be `None`, `"int8"`, or `"int4"`.
+- `quantization` must be `None`, `"fp8"`, or `"int8"`.
 
 Benchmark matrix baseline:
 
@@ -756,7 +763,7 @@ Milestone gates:
 - M1 gate: single-layer parity (1a) + full-model parity (1b) + deterministic generation + KV cache regression tests.
 - M2 gate: API compatibility tests + load test with no deadlocks/starvation.
 - M3 gate: new feature enabled/disabled equivalence tests and no M2 regressions.
-- M4 gate: CUDA graph decode functional correctness (note: not a performance win due to Triton/graph incompatibility) + quantized model loads and generates + no M3 regressions when disabled.
+- M4 gate: CUDA graph decode functional correctness (note: not a performance win due to Triton/graph incompatibility) + quantized model loads and generates (both FP8 and INT8) + no M3 regressions when disabled.
 - M5 gate: speculative decode distribution correctness + structured output schema compliance + no M4 regressions when disabled.
 
 ---
@@ -821,7 +828,8 @@ infer/
 │       │   └── fp8_dequant.py
 │       ├── quant/
 │       │   ├── __init__.py
-│       │   └── fp8_linear.py
+│       │   ├── fp8_linear.py
+│       │   └── int8_linear.py
 │       ├── grammar/
 │       │   ├── __init__.py
 │       │   ├── fsm.py
@@ -880,7 +888,7 @@ infer/
 ## 15. Open Questions
 
 - ~~Phase 9: Should CUDA graphs be recorded lazily (on first encounter of each batch size) or eagerly (pre-record a fixed set at startup)?~~ **Resolved in Phase 9 design:** Eager warmup at startup for power-of-2 batch sizes (1, 2, 4, 8, 16, 32). This avoids first-encounter latency during serving while keeping the number of captured graphs bounded. Batch sizes exceeding the largest bucket fall back to eager mode. See `docs/PHASE_9.md` for details.
-- ~~Phase 10: Prioritize pre-quantized checkpoint loading (AWQ/GPTQ) or on-the-fly quantization from bf16?~~ **Resolved:** Load pre-quantized FP8 checkpoints (Qwen/Qwen3-8B-FP8 format). Block-wise FP8 with 128x128 blocks and per-block `weight_scale_inv` tensors. No on-the-fly quantization needed.
+- ~~Phase 10: Prioritize pre-quantized checkpoint loading (AWQ/GPTQ) or on-the-fly quantization from bf16?~~ **Resolved:** Load pre-quantized checkpoints. FP8: block-wise FP8 with 128x128 blocks and per-block `weight_scale_inv` (Qwen/Qwen3-8B-FP8). INT8: per-channel symmetric INT8 with per-row `weight_scale` (nytopop/Qwen3-8B.w8a8, compressed-tensors format). No on-the-fly quantization needed.
 - Phase 11: What draft/target model pairs to benchmark? Llama-1B/Llama-3B is the natural pair, but Qwen3-1.7B/Qwen3-4B is also viable. Need to verify tokenizer compatibility.
 - Phase 12: Build the FSM compiler from scratch or use an existing library (e.g. `outlines-core`)? Building from scratch is more educational but significantly more work.
 

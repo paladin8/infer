@@ -80,7 +80,7 @@ def main() -> None:
     parser.add_argument(
         "--quantization",
         default=None,
-        choices=["fp8"],
+        choices=["fp8", "int8"],
         help="weight quantization format (default: auto-detect from checkpoint)",
     )
     args = parser.parse_args()

@@ -14,7 +14,7 @@ from infer.loader.weights import load_weights
 from infer.models.gemma3 import Gemma3Model
 from infer.models.llama import LlamaModel
 from infer.models.qwen3 import Qwen3Model
-from infer.quant import replace_linear_with_fp8
+from infer.quant import replace_linear_with_fp8, replace_linear_with_int8
 
 _MODEL_CLASSES: dict[str, type[nn.Module]] = {
     "llama": LlamaModel,
@@ -59,15 +59,20 @@ def _resolve_model_path(model_path: str) -> str:
 def _detect_quantization(config: ModelConfig) -> str | None:
     """Auto-detect quantization format from checkpoint metadata.
 
-    Returns ``"fp8"`` if the config indicates block-wise FP8 quantization,
-    ``None`` otherwise.
+    Returns ``"fp8"`` for block-wise FP8 quantization, ``"int8"`` for
+    per-channel symmetric INT8 (compressed-tensors format), or ``None``.
     """
     qc = config.quantization_config
     if qc is None:
         return None
     if qc.get("quant_method") == "fp8":
         return "fp8"
+    if qc.get("quant_method") == "compressed-tensors" and qc.get("format") == "int-quantized":
+        return "int8"
     return None
+
+
+_QUANTIZED_PARAM_DTYPES = {torch.float8_e4m3fn, torch.int8}
 
 
 def _selective_to(
@@ -75,21 +80,22 @@ def _selective_to(
     device: str,
     dtype: torch.dtype,
 ) -> None:
-    """Move model to device and dtype, preserving FP8 parameter dtypes.
+    """Move model to device and dtype, preserving quantized parameter dtypes.
 
-    ``model.to(dtype=...)`` would convert FP8 weights to bf16, destroying
+    ``model.to(dtype=...)`` would convert FP8/INT8 weights to bf16, destroying
     the quantized values.  This function moves all tensors to the target
-    device and converts non-FP8 parameters to the target dtype.
+    device and converts non-quantized parameters to the target dtype.
 
-    The buffer heuristic preserves float32 buffers (FP8 scale tensors) and
-    converts everything else to the target dtype.  This works because at this
-    point in the pipeline, the only float32 buffers are ``weight_scale_inv``
-    from ``FP8Linear`` modules — RoPE cos/sin buffers arrive as bf16 from
-    the checkpoint.  ``FP8Linear._apply`` provides a second layer of defense
-    if ``model.to()`` is called later.
+    The buffer heuristic preserves float32 buffers (scale tensors from
+    ``FP8Linear`` and ``INT8Linear``) and converts everything else to the
+    target dtype.  This works because at this point in the pipeline, the only
+    float32 buffers are scale tensors from quantized modules — RoPE cos/sin
+    buffers arrive as bf16 from the checkpoint.  The quantized linear modules'
+    ``_apply`` overrides provide a second layer of defense if ``model.to()``
+    is called later.
     """
     for param in model.parameters():
-        if param.dtype == torch.float8_e4m3fn:
+        if param.dtype in _QUANTIZED_PARAM_DTYPES:
             param.data = param.data.to(device=device)
         else:
             param.data = param.data.to(device=device, dtype=dtype)
@@ -131,13 +137,15 @@ def load_model(
 
     model = _build_model(config)
 
-    # Apply FP8 model surgery before loading weights.
+    # Apply quantization model surgery before loading weights.
     if quantization == "fp8":
         replace_linear_with_fp8(model)
+    elif quantization == "int8":
+        replace_linear_with_int8(model)
 
-    # Load weights.  For FP8 checkpoints, pass dtype=None to preserve
-    # float8_e4m3fn tensors; for standard checkpoints, convert to target dtype.
-    load_dtype = None if quantization == "fp8" else dtype
+    # Load weights.  For quantized checkpoints, pass dtype=None to preserve
+    # quantized tensors (fp8/int8); for standard checkpoints, convert to target dtype.
+    load_dtype = None if quantization in ("fp8", "int8") else dtype
     raw_weights = load_weights(local_path, device="cpu", dtype=load_dtype)
     weight_map = get_weight_map(config, quantization=quantization)
 
@@ -156,8 +164,8 @@ def load_model(
 
     model.load_state_dict(renamed, strict=True)
 
-    if quantization == "fp8":
-        # Selective move: preserve FP8 weight dtypes.
+    if quantization in ("fp8", "int8"):
+        # Selective move: preserve quantized weight dtypes.
         _selective_to(model, device, dtype)
     else:
         model.to(device=device, dtype=dtype)

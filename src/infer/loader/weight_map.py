@@ -32,6 +32,22 @@ def _add_fp8_scales(
             mapping[f"{hf}.mlp.{proj}.weight_scale_inv"] = f"{internal}.mlp.{proj}.weight_scale_inv"
 
 
+def _add_int8_scales(
+    mapping: dict[str, str],
+    num_layers: int,
+) -> None:
+    """Add ``weight_scale`` entries for all quantized linear layers."""
+    for i in range(num_layers):
+        hf = f"model.layers.{i}"
+        internal = f"layers.{i}"
+        for proj in _ATTN_PROJS:
+            mapping[f"{hf}.self_attn.{proj}.weight_scale"] = (
+                f"{internal}.self_attn.{proj}.weight_scale"
+            )
+        for proj in _MLP_PROJS:
+            mapping[f"{hf}.mlp.{proj}.weight_scale"] = f"{internal}.mlp.{proj}.weight_scale"
+
+
 def llama_weight_map(num_layers: int) -> dict[str, str]:
     """Map HF tensor names to internal names for Llama 3.
 
@@ -151,9 +167,10 @@ def get_weight_map(
 
     Args:
         config: A loaded ModelConfig instance.
-        quantization: Quantization format (``None`` or ``"fp8"``).
+        quantization: Quantization format (``None``, ``"fp8"``, or ``"int8"``).
             When ``"fp8"``, adds ``weight_scale_inv`` entries for each
-            quantized linear layer.
+            quantized linear layer.  When ``"int8"``, adds ``weight_scale``
+            entries instead.
 
     Returns:
         Mapping from HF checkpoint names to internal parameter names.
@@ -176,5 +193,7 @@ def get_weight_map(
 
     if quantization == "fp8":
         _add_fp8_scales(mapping, config.num_hidden_layers)
+    elif quantization == "int8":
+        _add_int8_scales(mapping, config.num_hidden_layers)
 
     return mapping

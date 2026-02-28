@@ -1,12 +1,15 @@
-# Phase 10: FP8 Weight Quantization
+# Phase 10: Weight Quantization (FP8 + INT8)
 
 ## Goal
 
-Load and serve `Qwen/Qwen3-8B-FP8` on 16 GB VRAM with reasonable output quality. This requires supporting FP8 (float8_e4m3fn) weight-only quantization with block-wise per-block scale factors.
+Load and serve quantized 8B-class models on 16 GB VRAM with reasonable output quality. Two quantization formats are supported:
 
-FP8 halves weight memory from ~16 GB (bf16) to ~8 GB, making 8B-class models practical on a single 16 GB GPU. Decode throughput is memory-bandwidth-bound (reading weights dominates each step), so halving weight size translates to meaningful speedup. The implementation uses eager dequant-then-matmul (dequantize FP8 weight to bf16, then call `F.linear`), which works on any GPU with bf16 support (compute capability >= 8.0, i.e. Ampere+). Native FP8 matrix multiply (`torch._scaled_mm`) requires SM89+ but is not used here.
+1. **FP8 (float8_e4m3fn)**: Block-wise quantization with per-block scale factors. Target: `Qwen/Qwen3-8B-FP8`.
+2. **INT8 (int8)**: Per-channel symmetric quantization with per-row scale factors. Target: `nytopop/Qwen3-8B.w8a8`.
 
-Benchmark model: `Qwen/Qwen3-8B-FP8`.
+Both formats halve weight memory from ~16 GB (bf16) to ~8 GB, making 8B-class models practical on a single 16 GB GPU. Decode throughput is memory-bandwidth-bound (reading weights dominates each step), so halving weight size translates to meaningful speedup. Both implementations use eager dequant-then-matmul (dequantize to bf16, then call `F.linear`), which works on any GPU with bf16 support (compute capability >= 8.0, i.e. Ampere+).
+
+Benchmark models: `Qwen/Qwen3-8B-FP8`, `nytopop/Qwen3-8B.w8a8`.
 
 ---
 
@@ -38,6 +41,53 @@ The checkpoint's `config.json` contains a `quantization_config` field:
 ```
 
 Non-quantized layers (embeddings, layer norms, QK norms, LM head) remain in bf16. For Qwen3-8B-FP8, `tie_word_embeddings` may be true, so `lm_head.weight` may be absent from the checkpoint — the existing tied-embeddings logic in `model_loader.py` handles this.
+
+---
+
+## Background: INT8 Checkpoint Format (compressed-tensors)
+
+The `nytopop/Qwen3-8B.w8a8` checkpoint uses per-channel symmetric INT8 quantization in the `compressed-tensors` format. This is produced by LLM Compressor using SmoothQuant + GPTQ with the W8A8 scheme. Each quantized linear layer has two tensors:
+
+1. **Weight** (`{name}.weight`): stored as `int8`, shape `[out_features, in_features]`. Raw signed 8-bit integers, no bit-packing.
+2. **Scale** (`{name}.weight_scale`): stored as `bfloat16`, shape `[out_features, 1]`. One scale factor per output channel (per-row). Stored internally as `float32` for precision consistency with the FP8 path (bf16 from checkpoint is coerced to float32 by `load_state_dict`).
+
+The quantization is **symmetric** with zero point implicitly 0 (no zero-point tensor stored). Dequantization is a simple multiply:
+
+```
+dequantized[row, :] = weight_int8[row, :].to(bf16) * weight_scale[row, 0]
+```
+
+The checkpoint's `config.json` contains a `quantization_config` field:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "compressed-tensors",
+    "format": "int-quantized",
+    "config_groups": {
+      "group_0": {
+        "weights": {
+          "num_bits": 8,
+          "type": "int",
+          "symmetric": true,
+          "strategy": "channel"
+        },
+        "targets": ["Linear"]
+      }
+    },
+    "ignore": ["lm_head"]
+  }
+}
+```
+
+Key properties:
+- **Per-channel** (per-row) quantization — one scale per output feature.
+- **Symmetric** — no zero point needed (`zero_point = 0` implicitly).
+- **8-bit signed integer** — values in `[-128, 127]`.
+- **`lm_head` excluded** — kept in bf16 for quality.
+- **Dynamic input activation quantization** — `input_activations.dynamic = true` means activation scales are computed at runtime. We only implement weight dequantization (W8A16 inference), not quantized matmul (W8A8).
+
+Non-quantized layers remain in bf16: embeddings, layer norms, QK norms, LM head.
 
 ---
 
@@ -114,6 +164,46 @@ FP8Linear(in_features, out_features)
 
 **Inference mode requirement.** The forward pass must run under `torch.no_grad()` or `torch.inference_mode()` to ensure temporary dequantized weight tensors are freed promptly. The model is in `.eval()` mode and the generate/runner code already uses `torch.no_grad()`.
 
+### INT8Linear Module
+
+```text
+INT8Linear(in_features, out_features)
+│
+├── Attributes:
+│   ├── weight: Parameter[int8, (out, in)]
+│   │   └── Initialized as empty int8 tensor; populated by load_state_dict
+│   ├── weight_scale: Buffer[float32, (out, 1)]
+│   │   └── Persistent buffer (float32 for precision; bf16 from checkpoint
+│   │       coerced to float32 by load_state_dict)
+│   └── (no block_size — per-channel quantization)
+│
+├── _apply() override:
+│   └── Skip dtype conversion for int8 parameters
+│       (prevents model.to(dtype=bf16) from destroying INT8 weights)
+│
+└── forward(x: Tensor[bf16, (batch, seq, in)]) -> Tensor[bf16, (batch, seq, out)]
+    │
+    ├── Dequantize weight to bf16:
+    │   w_bf16 = (self.weight.to(float32) * self.weight_scale).to(bf16)
+    │   → Multiply in float32 for precision, then cast to bf16
+    │   → Shape: (out, in) in bf16
+    │
+    └── F.linear(x, w_bf16)
+        → Standard matmul with dequantized weights
+```
+
+**Design decision: per-channel dequant.** INT8 per-channel dequantization is simpler than FP8 block-wise dequant — just cast int8 to bf16 and multiply by a `[out, 1]` scale that broadcasts along the in_features dimension. No padding or reshaping needed.
+
+### Auto-detection Logic
+
+The `_detect_quantization` function in `model_loader.py` is extended to handle both formats:
+
+- `quantization_config.quant_method == "fp8"` → `"fp8"`
+- `quantization_config.quant_method == "compressed-tensors"` AND `quantization_config.format == "int-quantized"` → `"int8"`
+- Everything else → `None`
+
+The `format` field is the most reliable discriminator for compressed-tensors checkpoints. No need to navigate nested `config_groups` for detection.
+
 ---
 
 ## Deliverables
@@ -180,6 +270,50 @@ Add `quantization: str | None = None` to `EngineConfig` with validation. Allowed
 
 **Files:** `tests/unit/test_fp8_linear.py`, `tests/unit/test_weight_map_fp8.py`
 
+### D8: INT8Linear module
+
+Create `src/infer/quant/int8_linear.py` with the `INT8Linear` module:
+
+- `weight` is an `nn.Parameter` with `dtype=torch.int8`. Override `_apply` to skip dtype conversion for int8 parameters (prevents `model.to(dtype=...)` from destroying them).
+- `weight_scale` is a persistent registered buffer (`float32`). Must be persistent so `load_state_dict` can populate it. Checkpoint stores bf16 scales which are coerced to float32 by `load_state_dict`.
+- `forward()` dequantizes weight to bf16 via `(weight.to(float32) * weight_scale).to(bf16)`, then calls `F.linear`.
+- `int8_channel_dequant(weight, scale)` helper: cast int8 → float32, broadcast-multiply by scale `[out, 1]`, cast to bf16.
+- Does not support bias (all target architectures use bias-free linears).
+
+**Files:** `src/infer/quant/int8_linear.py`
+
+### D9: Model surgery — replace nn.Linear with INT8Linear
+
+Add `replace_linear_with_int8(model)` function that walks the module tree and replaces `nn.Linear` instances with `INT8Linear`. Same skip logic as FP8: skip `embed_tokens`, `lm_head`, and `*norm*` layers. Assert `bias is None`.
+
+**Files:** `src/infer/quant/int8_linear.py`
+
+### D10: Weight map and loader extension for INT8
+
+Extend `get_weight_map()` to handle `quantization="int8"`. Add `weight_scale` entries (not `weight_scale_inv`) alongside each linear layer's weight entry. The INT8 scale tensor name in the checkpoint is `{name}.weight_scale`, mapped to `{internal_name}.weight_scale`.
+
+Update `_detect_quantization` to recognize `compressed-tensors` format with int weights as `"int8"`.
+
+Update `_selective_to` to preserve `int8` parameter dtypes (same pattern as FP8).
+
+**Files:** `src/infer/loader/weight_map.py`, `src/infer/loader/model_loader.py`
+
+### D11: EngineConfig and CLI update for INT8
+
+Add `"int8"` to `_VALID_QUANTIZATIONS`. Update `--quantization` CLI choices to include `"int8"`.
+
+**Files:** `src/infer/engine/config.py`, `src/infer/server/__main__.py`
+
+### D12: INT8 tests
+
+- Unit test for `int8_channel_dequant`: create known bf16 weight, quantize to INT8 + scales, dequantize, verify close to original.
+- Unit test for `INT8Linear`: verify forward pass produces same output as `nn.Linear` with dequantized weights.
+- Unit test for `replace_linear_with_int8`: verify module surgery.
+- Unit test for weight map with INT8 quantization.
+- Unit test for `_detect_quantization` with compressed-tensors config.
+
+**Files:** `tests/unit/test_int8_linear.py`, `tests/unit/test_weight_map_fp8.py` (extend existing)
+
 ---
 
 ## Implementation Details
@@ -216,6 +350,24 @@ def fp8_block_dequant(
     weight = weight[:out_features, :in_features]
     return weight.to(torch.bfloat16)
 ```
+
+### Per-channel INT8 dequantization
+
+```python
+def int8_channel_dequant(
+    weight: Tensor,      # [out, in], int8
+    scale: Tensor,       # [out, 1], float32
+) -> Tensor:
+    """Dequantize per-channel symmetric INT8 weight to bf16."""
+    return (weight.to(torch.float32) * scale).to(torch.bfloat16)
+```
+
+This is simpler than FP8 block-wise dequant because:
+- No padding or reshaping needed (per-channel, not per-block).
+- Scale broadcasts naturally along the input dimension.
+- Multiply in float32 for precision (consistent with FP8 path), then cast to bf16.
+
+Note: The checkpoint name `w8a8` is the calibration scheme (SmoothQuant + GPTQ with 8-bit weights and 8-bit activations). We serve this as W8A16 — weights are int8, activations are bf16. Dynamic activation quantization is not implemented; we dequantize weights to bf16 and compute in bf16.
 
 ### Weight loading without dtype conversion
 
@@ -259,6 +411,20 @@ These layers remain in bf16 (full precision):
 Per layer: 184 MB (FP8) vs 368 MB (bf16). With 36 layers: ~6.5 GB (FP8) vs ~13 GB (bf16).
 Total with embeddings, norms, LM head: ~8 GB (FP8) vs ~16 GB (bf16).
 
+### Model dimensions — INT8 (Qwen3-8B, nytopop/Qwen3-8B.w8a8)
+
+| Layer | Weight shape | Scale shape | INT8 bytes | bf16 bytes | Savings |
+|---|---|---|---|---|---|
+| `q_proj` | [4096, 4096] | [4096, 1] | 16 MB + 8 KB | 32 MB | ~2x |
+| `k_proj` | [1024, 4096] | [1024, 1] | 4 MB + 2 KB | 8 MB | ~2x |
+| `v_proj` | [1024, 4096] | [1024, 1] | 4 MB + 2 KB | 8 MB | ~2x |
+| `o_proj` | [4096, 4096] | [4096, 1] | 16 MB + 8 KB | 32 MB | ~2x |
+| `gate_proj` | [12288, 4096] | [12288, 1] | 48 MB + 24 KB | 96 MB | ~2x |
+| `up_proj` | [12288, 4096] | [12288, 1] | 48 MB + 24 KB | 96 MB | ~2x |
+| `down_proj` | [4096, 12288] | [4096, 1] | 48 MB + 8 KB | 96 MB | ~2x |
+
+Per layer: 184 MB (INT8) vs 368 MB (bf16) — same savings ratio as FP8. Scale tensor overhead is negligible (~76 KB per layer vs 184 MB weights).
+
 ---
 
 ## Risks and Mitigations
@@ -278,7 +444,8 @@ Total with embeddings, norms, LM head: ~8 GB (FP8) vs ~16 GB (bf16).
 ## Exit Criteria
 
 - `Qwen/Qwen3-8B-FP8` loads successfully and fits in 16 GB VRAM.
-- Generated text is coherent and reasonable on standard prompts.
+- `nytopop/Qwen3-8B.w8a8` loads successfully and fits in 16 GB VRAM.
+- Generated text is coherent and reasonable on standard prompts for both models.
 - All existing tests pass with `quantization=None` (no regression).
-- Unit tests for FP8 dequantization and model surgery pass.
+- Unit tests for FP8 dequantization, INT8 dequantization, and model surgery pass.
 - VRAM usage logged: ~8 GB for weights vs ~16 GB for bf16.

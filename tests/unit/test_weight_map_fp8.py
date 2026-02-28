@@ -1,4 +1,4 @@
-"""Tests for weight map FP8 scale tensor extensions."""
+"""Tests for weight map quantization scale tensor extensions (FP8 + INT8)."""
 
 from __future__ import annotations
 
@@ -85,3 +85,63 @@ class TestWeightMapFP8:
         assert "model.embed_tokens.weight_scale_inv" not in wmap
         assert "lm_head.weight_scale_inv" not in wmap
         assert "model.layers.0.input_layernorm.weight_scale_inv" not in wmap
+
+
+class TestWeightMapINT8:
+    """Tests for INT8 weight_scale entries in weight maps."""
+
+    def test_no_scales_without_quantization(self) -> None:
+        """Without quantization, no weight_scale entries."""
+        config = _make_config("qwen3")
+        wmap = get_weight_map(config, quantization=None)
+        scale_keys = [k for k in wmap if k.endswith("weight_scale")]
+        assert scale_keys == []
+
+    def test_scales_with_int8_quantization(self) -> None:
+        """With int8 quantization, each linear layer gets weight_scale."""
+        config = _make_config("qwen3", num_layers=2)
+        wmap = get_weight_map(config, quantization="int8")
+        scale_keys = sorted(k for k in wmap if k.endswith("weight_scale"))
+
+        # 7 linear layers per block (q/k/v/o + gate/up/down) x 2 layers = 14.
+        assert len(scale_keys) == 14
+
+        # Spot-check a few entries.
+        assert "model.layers.0.self_attn.q_proj.weight_scale" in wmap
+        assert wmap["model.layers.0.self_attn.q_proj.weight_scale"] == (
+            "layers.0.self_attn.q_proj.weight_scale"
+        )
+        assert "model.layers.1.mlp.down_proj.weight_scale" in wmap
+        assert wmap["model.layers.1.mlp.down_proj.weight_scale"] == (
+            "layers.1.mlp.down_proj.weight_scale"
+        )
+
+    def test_llama_int8_scales(self) -> None:
+        """Llama architecture also gets INT8 scale entries."""
+        config = _make_config("llama", num_layers=1)
+        wmap = get_weight_map(config, quantization="int8")
+        scale_keys = [k for k in wmap if k.endswith("weight_scale")]
+        assert len(scale_keys) == 7
+
+    def test_gemma3_int8_scales(self) -> None:
+        """Gemma 3 architecture also gets INT8 scale entries."""
+        config = _make_config("gemma3_text", num_layers=1)
+        wmap = get_weight_map(config, quantization="int8")
+        scale_keys = [k for k in wmap if k.endswith("weight_scale")]
+        assert len(scale_keys) == 7
+
+    def test_int8_no_fp8_scales(self) -> None:
+        """INT8 quantization should NOT produce FP8 scale_inv entries."""
+        config = _make_config("qwen3", num_layers=1)
+        wmap = get_weight_map(config, quantization="int8")
+        fp8_keys = [k for k in wmap if "scale_inv" in k]
+        assert fp8_keys == []
+
+    def test_non_quantized_layers_excluded(self) -> None:
+        """embed_tokens, lm_head, and norms do NOT get INT8 scale entries."""
+        config = _make_config("qwen3", num_layers=1)
+        wmap = get_weight_map(config, quantization="int8")
+
+        assert "model.embed_tokens.weight_scale" not in wmap
+        assert "lm_head.weight_scale" not in wmap
+        assert "model.layers.0.input_layernorm.weight_scale" not in wmap
