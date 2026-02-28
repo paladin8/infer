@@ -32,7 +32,12 @@ class Engine:
 
     def __init__(self, config: EngineConfig) -> None:
         dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[config.dtype]
-        model, _model_config = load_model(config.model, dtype=dtype, device=config.device)
+        model, _model_config = load_model(
+            config.model,
+            dtype=dtype,
+            device=config.device,
+            quantization=config.quantization,
+        )
         tokenizer = Tokenizer(config.model)
         self._init_components(config, model, tokenizer)
 

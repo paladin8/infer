@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +54,9 @@ class ModelConfig:
 
     # Embeddings
     tie_word_embeddings: bool = False
+
+    # Quantization (from checkpoint metadata)
+    quantization_config: dict[str, Any] | None = field(default=None, repr=False)
 
     @property
     def computed_head_dim(self) -> int:

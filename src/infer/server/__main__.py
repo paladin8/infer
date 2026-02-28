@@ -77,6 +77,12 @@ def main() -> None:
         help="enable CUDA graph capture for decode (requires --kv-cache-backend paged). "
         "Not recommended: Triton kernels replay slower inside CUDA graphs than eagerly.",
     )
+    parser.add_argument(
+        "--quantization",
+        default=None,
+        choices=["fp8"],
+        help="weight quantization format (default: auto-detect from checkpoint)",
+    )
     args = parser.parse_args()
 
     config = EngineConfig(
@@ -97,6 +103,7 @@ def main() -> None:
         max_prefill_chunks_per_step=args.max_prefill_chunks_per_step,
         use_prefix_caching=args.prefix_caching,
         use_cuda_graphs=args.cuda_graphs,
+        quantization=args.quantization,
     )
 
     app = create_app(config)

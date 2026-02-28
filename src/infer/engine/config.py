@@ -8,6 +8,7 @@ _VALID_BATCHING_MODES = {"static", "continuous"}
 _VALID_SCHEDULER_POLICIES = {"fcfs"}
 _VALID_KV_CACHE_BACKENDS = {"contiguous", "paged"}
 _VALID_DTYPES = {"bfloat16", "float16"}
+_VALID_QUANTIZATIONS = {"fp8"}
 
 
 @dataclass
@@ -63,6 +64,9 @@ class EngineConfig:
 
     # CUDA graphs (Phase 9).
     use_cuda_graphs: bool = False
+
+    # Quantization (Phase 10).
+    quantization: str | None = None
 
     # Paged backend configuration.
     block_size: int = 16  # tokens per KV cache block (paged backend only)
@@ -130,3 +134,8 @@ class EngineConfig:
                 raise ValueError("CUDA graphs require kv_cache_backend='paged'")
             if self.batching_mode != "continuous":
                 raise ValueError("CUDA graphs require batching_mode='continuous'")
+        if self.quantization is not None and self.quantization not in _VALID_QUANTIZATIONS:
+            raise ValueError(
+                f"Unsupported quantization: {self.quantization!r}. "
+                f"Choose from {sorted(_VALID_QUANTIZATIONS)}"
+            )

@@ -11,6 +11,26 @@ from __future__ import annotations
 
 from infer.loader.config import ModelConfig
 
+# Linear projections that get weight_scale_inv entries for FP8 quantization.
+_ATTN_PROJS = ("q_proj", "k_proj", "v_proj", "o_proj")
+_MLP_PROJS = ("gate_proj", "up_proj", "down_proj")
+
+
+def _add_fp8_scales(
+    mapping: dict[str, str],
+    num_layers: int,
+) -> None:
+    """Add ``weight_scale_inv`` entries for all quantized linear layers."""
+    for i in range(num_layers):
+        hf = f"model.layers.{i}"
+        internal = f"layers.{i}"
+        for proj in _ATTN_PROJS:
+            mapping[f"{hf}.self_attn.{proj}.weight_scale_inv"] = (
+                f"{internal}.self_attn.{proj}.weight_scale_inv"
+            )
+        for proj in _MLP_PROJS:
+            mapping[f"{hf}.mlp.{proj}.weight_scale_inv"] = f"{internal}.mlp.{proj}.weight_scale_inv"
+
 
 def llama_weight_map(num_layers: int) -> dict[str, str]:
     """Map HF tensor names to internal names for Llama 3.
@@ -33,11 +53,11 @@ def llama_weight_map(num_layers: int) -> dict[str, str]:
         internal = f"layers.{i}"
 
         # Attention projections
-        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        for proj in _ATTN_PROJS:
             mapping[f"{hf}.self_attn.{proj}.weight"] = f"{internal}.self_attn.{proj}.weight"
 
         # MLP projections
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in _MLP_PROJS:
             mapping[f"{hf}.mlp.{proj}.weight"] = f"{internal}.mlp.{proj}.weight"
 
         # Layer norms (2 per layer)
@@ -97,7 +117,7 @@ def gemma3_weight_map(num_layers: int) -> dict[str, str]:
         internal = f"layers.{i}"
 
         # Attention projections
-        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        for proj in _ATTN_PROJS:
             mapping[f"{hf}.self_attn.{proj}.weight"] = f"{internal}.self_attn.{proj}.weight"
 
         # QK-norm
@@ -105,7 +125,7 @@ def gemma3_weight_map(num_layers: int) -> dict[str, str]:
             mapping[f"{hf}.self_attn.{norm}.weight"] = f"{internal}.self_attn.{norm}.weight"
 
         # MLP projections
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in _MLP_PROJS:
             mapping[f"{hf}.mlp.{proj}.weight"] = f"{internal}.mlp.{proj}.weight"
 
         # Layer norms (4 per layer — sandwich norm)
@@ -123,11 +143,17 @@ def gemma3_weight_map(num_layers: int) -> dict[str, str]:
     return mapping
 
 
-def get_weight_map(config: ModelConfig) -> dict[str, str]:
+def get_weight_map(
+    config: ModelConfig,
+    quantization: str | None = None,
+) -> dict[str, str]:
     """Select the right weight map based on model_type.
 
     Args:
         config: A loaded ModelConfig instance.
+        quantization: Quantization format (``None`` or ``"fp8"``).
+            When ``"fp8"``, adds ``weight_scale_inv`` entries for each
+            quantized linear layer.
 
     Returns:
         Mapping from HF checkpoint names to internal parameter names.
@@ -146,4 +172,9 @@ def get_weight_map(config: ModelConfig) -> dict[str, str]:
             f"No weight map for model_type: {config.model_type!r}. "
             f"Supported types: {sorted(dispatchers.keys())}"
         )
-    return fn(config.num_hidden_layers)
+    mapping = fn(config.num_hidden_layers)
+
+    if quantization == "fp8":
+        _add_fp8_scales(mapping, config.num_hidden_layers)
+
+    return mapping
