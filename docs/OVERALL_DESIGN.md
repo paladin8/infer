@@ -510,7 +510,7 @@ Deliverables:
 
 - Quantization-aware weight loader: detect quantization format from `quantization_config` in config.json. Support both FP8 (`quant_method: "fp8"`) and INT8 (`quant_method: "compressed-tensors"` with int weights).
 - `FP8Linear` module for block-wise FP8: stores float8_e4m3fn weight and per-block float32 scale tensor (`weight_scale_inv`). Forward pass dequantizes to bf16 and computes matmul.
-- `INT8Linear` module for per-channel INT8: stores int8 weight and per-channel bf16 scale tensor (`weight_scale`). Forward pass dequantizes to bf16 and computes matmul.
+- `INT8Linear` module for per-channel INT8: stores int8 weight and per-channel float32 scale tensor (`weight_scale`). Forward pass dequantizes to bf16 and computes matmul.
 - Model surgery functions: `replace_linear_with_fp8` and `replace_linear_with_int8` to swap `nn.Linear` modules with quantized versions.
 - Per-architecture support: quantize all linear layers in attention (Q/K/V/O projections) and MLP (gate/up/down projections). Norms, embeddings, and LM head stay in bf16.
 - `quantization: str | None` config field in `EngineConfig` (`None`, `"fp8"`, `"int8"`). Auto-detected from checkpoint when `None`.

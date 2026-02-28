@@ -119,9 +119,9 @@ def load_model(
         model_path: Path to a local directory containing config.json and
             safetensors weights, or a HuggingFace Hub model ID
             (e.g. ``"meta-llama/Llama-3.2-1B-Instruct"``).
-        dtype: Target dtype for model parameters (non-FP8).
+        dtype: Target dtype for model parameters (non-quantized).
         device: Target device.
-        quantization: Quantization format (``None`` or ``"fp8"``).
+        quantization: Quantization format (``None``, ``"fp8"``, or ``"int8"``).
             When ``None``, auto-detected from checkpoint metadata.
 
     Returns:

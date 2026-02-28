@@ -317,3 +317,40 @@ class TestDetectQuantizationINT8:
             quantization_config={"quant_method": "fp8", "fmt": "e4m3"},
         )
         assert _detect_quantization(config) == "fp8"
+
+
+# ---------------------------------------------------------------------------
+# _selective_to tests for INT8
+# ---------------------------------------------------------------------------
+
+
+class TestSelectiveToINT8:
+    """Tests for _selective_to preserving INT8 dtypes."""
+
+    def test_preserves_int8_weights_and_float32_scales(self) -> None:
+        """_selective_to preserves int8 weight and float32 scale dtypes."""
+        from infer.loader.model_loader import _selective_to
+
+        model = nn.Module()
+        layer = INT8Linear(64, 32)
+        model.add_module("proj", layer)
+
+        _selective_to(model, "cpu", torch.bfloat16)
+
+        assert layer.weight.dtype == torch.int8
+        assert layer.weight_scale.dtype == torch.float32
+
+    def test_converts_non_quantized_params(self) -> None:
+        """_selective_to converts non-quantized params to target dtype."""
+        from infer.loader.model_loader import _selective_to
+
+        model = nn.Module()
+        model.add_module("proj", INT8Linear(64, 32))
+        model.add_module("norm", nn.Linear(64, 64, bias=False))
+        # Set norm weight to float32 to verify it gets converted
+        model.norm.weight = nn.Parameter(torch.randn(64, 64, dtype=torch.float32))
+
+        _selective_to(model, "cpu", torch.bfloat16)
+
+        assert model.proj.weight.dtype == torch.int8
+        assert model.norm.weight.dtype == torch.bfloat16
