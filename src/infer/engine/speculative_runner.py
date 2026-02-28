@@ -499,7 +499,12 @@ class SpeculativeRunner:
         if not spec_requests:
             return outputs
 
-        # Record start positions for rollback.
+        # Lazy draft prefill (before recording start positions).
+        needs_prefill = [r for r in spec_requests if r.request_id not in self._draft_prefilled]
+        if needs_prefill:
+            self._draft_prefill(needs_prefill)
+
+        # Record start positions for rollback (after lazy prefill).
         draft_start_positions: dict[str, int] = {}
         target_start_positions: dict[str, int] = {}
         for req in spec_requests:
@@ -599,10 +604,8 @@ class SpeculativeRunner:
         device = self.config.device
         max_k = max(effective_spec[r.request_id] for r in requests)
 
-        # Lazy draft prefill: populate draft KV cache for new requests.
-        needs_prefill = [r for r in requests if r.request_id not in self._draft_prefilled]
-        if needs_prefill:
-            self._draft_prefill(needs_prefill)
+        # Note: lazy draft prefill is handled by _speculative_decode before
+        # calling this method, so all requests are already draft-prefilled.
 
         draft_tokens: dict[str, list[int]] = {r.request_id: [] for r in requests}
         draft_log_probs: dict[str, list[Tensor]] = {r.request_id: [] for r in requests}
@@ -1009,12 +1012,14 @@ class SpeculativeRunner:
             # = num_accepted_draft + 1 new entries from this round.
             new_valid = num_accepted_draft + 1
 
-            # Draft cache: was at draft_start, advanced by K.
+            # Draft cache: was at draft_start, advanced by K steps.
+            # Draft model only ran K forward passes (not K+1), so cap at K.
             draft_slot = self._draft_slots[req.slot_idx]
-            draft_target_len = draft_start_positions[req.request_id] + new_valid
+            draft_new_valid = min(new_valid, k)
+            draft_target_len = draft_start_positions[req.request_id] + draft_new_valid
             self.draft_cache_pool.truncate_to(draft_slot, draft_target_len)
 
-            # Target cache: was at target_start, advanced by K+1.
+            # Target cache: was at target_start, advanced by K+1 (verification pass).
             target_target_len = target_start_positions[req.request_id] + new_valid
             self.target_cache_pool.truncate_to(req.slot_idx, target_target_len)
 
