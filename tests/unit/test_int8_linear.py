@@ -344,13 +344,15 @@ class TestSelectiveToINT8:
         """_selective_to converts non-quantized params to target dtype."""
         from infer.loader.model_loader import _selective_to
 
+        proj = INT8Linear(64, 32)
+        norm = nn.Linear(64, 64, bias=False)
+        norm.weight = nn.Parameter(torch.randn(64, 64, dtype=torch.float32))
+
         model = nn.Module()
-        model.add_module("proj", INT8Linear(64, 32))
-        model.add_module("norm", nn.Linear(64, 64, bias=False))
-        # Set norm weight to float32 to verify it gets converted
-        model.norm.weight = nn.Parameter(torch.randn(64, 64, dtype=torch.float32))
+        model.add_module("proj", proj)
+        model.add_module("norm", norm)
 
         _selective_to(model, "cpu", torch.bfloat16)
 
-        assert model.proj.weight.dtype == torch.int8
-        assert model.norm.weight.dtype == torch.bfloat16
+        assert proj.weight.dtype == torch.int8
+        assert norm.weight.dtype == torch.bfloat16
