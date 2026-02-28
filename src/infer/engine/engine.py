@@ -14,6 +14,7 @@ from infer.engine.request import Request, RequestState, StepOutput
 from infer.engine.runner import ModelRunner
 from infer.engine.sampler import SamplingParams
 from infer.engine.scheduler import ContinuousScheduler, StaticScheduler
+from infer.engine.speculative_runner import SpeculativeRunner
 from infer.loader.model_loader import load_model
 from infer.loader.tokenizer import Tokenizer
 
@@ -39,7 +40,31 @@ class Engine:
             quantization=config.quantization,
         )
         tokenizer = Tokenizer(config.model)
-        self._init_components(config, model, tokenizer)
+
+        # Load draft model for speculative decoding (Phase 11).
+        draft_model: torch.nn.Module | None = None
+        if config.use_speculative_decoding:
+            assert config.draft_model is not None
+            draft_model, _draft_config = load_model(
+                config.draft_model,
+                dtype=dtype,
+                device=config.device,
+                quantization=None,  # auto-detect from checkpoint
+            )
+            # Verify tokenizer compatibility.
+            draft_tokenizer = Tokenizer(config.draft_model)
+            if tokenizer.vocab_size != draft_tokenizer.vocab_size:
+                raise ValueError(
+                    f"Tokenizer vocab size mismatch: target={tokenizer.vocab_size}, "
+                    f"draft={draft_tokenizer.vocab_size}"
+                )
+            if tokenizer.eos_token_ids != draft_tokenizer.eos_token_ids:
+                raise ValueError(
+                    f"Tokenizer EOS token mismatch: target={tokenizer.eos_token_ids}, "
+                    f"draft={draft_tokenizer.eos_token_ids}"
+                )
+
+        self._init_components(config, model, tokenizer, draft_model=draft_model)
 
     @classmethod
     def from_components(
@@ -47,10 +72,12 @@ class Engine:
         config: EngineConfig,
         model: torch.nn.Module,
         tokenizer: object,
+        *,
+        draft_model: torch.nn.Module | None = None,
     ) -> Self:
         """Create an engine from pre-built components (for testing)."""
         engine = object.__new__(cls)
-        engine._init_components(config, model, tokenizer)  # type: ignore[arg-type]
+        engine._init_components(config, model, tokenizer, draft_model=draft_model)  # type: ignore[arg-type]
         return engine
 
     def _init_components(
@@ -58,6 +85,8 @@ class Engine:
         config: EngineConfig,
         model: torch.nn.Module,
         tokenizer: Tokenizer,
+        *,
+        draft_model: torch.nn.Module | None = None,
     ) -> None:
         """Initialize engine components based on batching mode."""
         self.config = config
@@ -66,7 +95,12 @@ class Engine:
 
         if config.batching_mode == "continuous":
             self.scheduler: StaticScheduler | ContinuousScheduler = ContinuousScheduler(config)
-            self.runner: ModelRunner | ContinuousRunner = ContinuousRunner(model, tokenizer, config)
+            if config.use_speculative_decoding and draft_model is not None:
+                self.runner: ModelRunner | ContinuousRunner | SpeculativeRunner = SpeculativeRunner(
+                    model, draft_model, tokenizer, config
+                )
+            else:
+                self.runner = ContinuousRunner(model, tokenizer, config)
         else:
             self.scheduler = StaticScheduler(config)
             self.runner = ModelRunner(model, tokenizer, config)
@@ -170,7 +204,7 @@ class Engine:
     def _step_continuous(self) -> None:
         """Engine step for continuous batching (contiguous and paged backends)."""
         assert isinstance(self.scheduler, ContinuousScheduler)
-        assert isinstance(self.runner, ContinuousRunner)
+        assert isinstance(self.runner, (ContinuousRunner, SpeculativeRunner))
 
         # Phase 1: Retire finished requests.
         retired = self.scheduler.retire()

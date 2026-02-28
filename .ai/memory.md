@@ -10,9 +10,9 @@
 - Phase 10: INT8 per-channel quantization support
 
 ## Phase 11 Deliverables
-1. D8: EngineConfig + CLI updates (foundation)
-2. D6: KV cache truncate_to (foundation)
-3. D9: Acceptance rate metrics (foundation)
-4. D1+D3+D4+D5: SpeculativeRunner (core)
-5. D7: Engine integration
-6. D10: Tests
+1. D8: EngineConfig + CLI updates (foundation) -- DONE
+2. D6: KV cache truncate_to (foundation) -- DONE
+3. D9: Acceptance rate metrics (foundation) -- DONE
+4. D1+D3+D4+D5: SpeculativeRunner (core) -- DONE
+5. D7: Engine integration -- DONE
+6. D10: Tests -- in progress
