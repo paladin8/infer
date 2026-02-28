@@ -967,7 +967,6 @@ class SpeculativeRunner:
 
         # All K accepted: sample bonus token from position K.
         context = req.prompt_token_ids + req.generated_token_ids + accepted
-        target_adjusted = _apply_sampling_transforms(target_logits[k], context, params)
         bonus = sample_token(target_logits[k], context, params, req.generator)
         accepted.append(bonus)
         return accepted

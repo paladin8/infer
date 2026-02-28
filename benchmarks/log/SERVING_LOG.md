@@ -633,3 +633,108 @@ The Triton paged attention kernel is actually *faster* than SDPA when run eagerl
 **Why Qwen3 is hit hardest:** With batch=16 and 1024 blocks, Qwen3 is already VRAM-constrained. The additional memory from CUDA graph capture (graph intermediates + 6 captured graphs with shared pool) compounds the issue, and the smaller max concurrency means the per-step overhead is amortized across fewer sequences.
 
 **Path forward:** The Triton-in-CUDA-graph performance gap must be resolved before graph capture provides a net benefit. Options: (1) investigate Triton graph capture compatibility (warmup autotuning, kernel caching, stream interactions); (2) replace Triton attention with a native CUDA kernel (e.g. Flash Attention via `flash_attn`) that is known to work well with CUDA graphs; (3) use `torch.compile` with CUDA graph backend instead of manual capture.
+
+---
+
+## Phase 11 — Speculative Decoding
+
+Server launched with `--batching-mode continuous --kv-cache-backend contiguous --speculative-decoding --draft-model meta-llama/Llama-3.2-1B-Instruct --spec-length 5`. Same hardware, seed=42. Speculative decoding uses a small draft model (Llama-3.2-1B) to propose 5 candidate tokens per step, verified in a single forward pass of the target model (Llama-3.2-3B). Accepted tokens are emitted in bursts of 1 to 6 per step.
+
+Both models are loaded on the same GPU. Contiguous KV cache backend with batch_size=8 (no paged attention or prefix caching — speculative decoding is incompatible with CUDA graphs, compatible with paged/chunked but benchmarked with contiguous for the simplest configuration).
+
+| Model    | Target             | Draft              | VRAM est. |
+|----------|--------------------|--------------------|-----------|
+| Llama    | 3.2-3B (~6 GB)     | 3.2-1B (~2 GB)     | ~12 GB    |
+
+### baseline — Sequential Single Requests
+
+| Metric             | Llama |
+|--------------------|------:|
+| Throughput (tok/s) |  71.9 |
+| TTFT P50 (ms)      |    74 |
+| TTFT P99 (ms)      |    78 |
+| ITL P50 (ms)       |     0 |
+| ITL P99 (ms)       |    44 |
+| Latency P50 (s)    | 3.518 |
+
+### continuous_batching — Staggered Arrivals
+
+| Metric             | Llama |
+|--------------------|------:|
+| Throughput (tok/s) | 266.5 |
+| TTFT P50 (ms)      |  2642 |
+| TTFT P99 (ms)      |  6492 |
+| ITL P50 (ms)       |     0 |
+| ITL P99 (ms)       |   107 |
+| Latency P50 (s)    | 6.889 |
+| Errors             |     0 |
+
+### paged_attention — Single Burst, Moderate Lengths
+
+| Metric             |  Llama |
+|--------------------|-------:|
+| Throughput (tok/s) |  304.0 |
+| TTFT P50 (ms)      |  11828 |
+| TTFT P99 (ms)      |  25592 |
+| ITL P50 (ms)       |      0 |
+| ITL P99 (ms)       |    104 |
+| Latency P50 (s)    | 16.639 |
+| Errors             |      0 |
+
+### chunked_prefill — Long Prompts, Poisson Arrivals
+
+| Metric             |  Llama |
+|--------------------|-------:|
+| Throughput (tok/s) |  180.7 |
+| TTFT P50 (ms)      |  14954 |
+| TTFT P99 (ms)      |  28192 |
+| ITL P50 (ms)       |      0 |
+| ITL P99 (ms)       |   210 |
+| Latency P50 (s)    | 20.127 |
+| Errors             |      0 |
+
+### prefix_caching — Shared System Prompt
+
+| Metric             |  Llama |
+|--------------------|-------:|
+| Throughput (tok/s) |  237.3 |
+| TTFT P50 (ms)      |  17013 |
+| TTFT P99 (ms)      |  38428 |
+| ITL P50 (ms)       |      0 |
+| ITL P99 (ms)       |   164 |
+| Latency P50 (s)    | 24.764 |
+| Errors             |      0 |
+
+### Phase 11 vs Phase 5 — Comparison
+
+The fair comparison is Phase 5 (continuous + contiguous, batch=8) since Phase 11 uses the same backend. Phase 8 (paged + chunked + prefix) is also shown as the "best prior" reference.
+
+**Throughput comparison (tok/s, Llama only):**
+
+| Workload            | Phase 5 (cont.) | Phase 8 (paged) | Phase 11 (spec.) | P11 vs P5   |
+|---------------------|:----------------:|:---------------:|:----------------:|:-----------:|
+| baseline            |             87.1 |            86.4 |             71.9 |    **-17%** |
+| continuous_batching |            316.9 |           348.7 |            266.5 |    **-16%** |
+| paged_attention     |            338.2 |           476.7 |            304.0 |    **-10%** |
+| chunked_prefill     |            197.4 |           220.7 |            180.7 |     **-8%** |
+| prefix_caching      |            256.4 |           331.3 |            237.3 |     **-7%** |
+
+**ITL P50 comparison (ms):**
+
+| Workload            | Phase 5 | Phase 8 | Phase 11 | Notes                              |
+|---------------------|--------:|--------:|---------:|:-----------------------------------|
+| baseline            |      11 |      12 |        0 | Bursty: multi-token emission       |
+| continuous_batching |      21 |      34 |        0 | Same — bursts mask inter-token gap |
+| paged_attention     |      21 |      44 |        0 |                                    |
+| chunked_prefill     |      36 |      90 |        0 |                                    |
+| prefix_caching      |      29 |      68 |        0 |                                    |
+
+**Why speculative decoding regresses throughput on this model pair:**
+
+1. **Draft model overhead is proportionally large.** The Llama-3.2-1B draft model is only 3x smaller than the Llama-3.2-3B target. Each speculative decode step runs K=5 draft forward passes plus 1 target verification pass — roughly 5 × (1/3) + 1 = 2.7x the compute of a single target decode step. To break even, speculative decoding would need to produce 2.7 tokens per step on average, requiring ~34% acceptance (1 + 5 × 0.34 = 2.7). Measured acceptance rates of 38–57% yield 2.9–3.9 tokens per step, which is above theoretical break-even but not enough to overcome the additional fixed overhead (dual KV cache management, lazy draft prefill, rollback logic).
+
+2. **Dual KV cache doubles memory pressure.** Both models maintain independent KV caches. With contiguous backend and batch=8, the target cache uses ~3.5 GB and the draft cache ~1 GB, totaling ~4.5 GB vs ~3.5 GB without speculation. This leaves less headroom for activations.
+
+3. **ITL P50 = 0 is misleading.** Speculative decoding emits tokens in bursts — when K tokens are accepted, they arrive simultaneously (ITL = 0 between them). The next burst arrives after the full draft + verify cycle. ITL P99 (44–210ms) better reflects the actual per-step latency, which is higher than Phase 5's ITL P99 (13–95ms) due to the extra draft overhead.
+
+**When speculative decoding wins:** Speculative decoding is designed for large target models (70B+) with small drafts (1B–7B), where the draft overhead is negligible (<5% of target compute) and even modest acceptance rates yield large speedups. The 1B/3B pair used here is worst-case: the draft is 1/3 the size of the target, making draft overhead a dominant cost. A 1B draft for a 70B target (1/70 overhead ratio) with 50% acceptance would produce ~3.5 tokens per step at ~1.07x the compute cost — a ~3.3x effective speedup.
