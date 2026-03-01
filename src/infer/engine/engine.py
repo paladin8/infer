@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any, Self
 
 import torch
+from outlines_core import Vocabulary
 
 from infer.engine.config import EngineConfig
 from infer.engine.continuous_runner import ContinuousRunner
@@ -17,6 +19,8 @@ from infer.engine.scheduler import ContinuousScheduler, StaticScheduler
 from infer.engine.speculative_runner import SpeculativeRunner
 from infer.loader.model_loader import load_model
 from infer.loader.tokenizer import Tokenizer
+from infer.structured.guide import build_vocabulary, compile_guide
+from infer.structured.logit_mask import StructuredOutputState
 
 
 class Engine:
@@ -92,6 +96,7 @@ class Engine:
         self.config = config
         self.model_id = config.model
         self.tokenizer = tokenizer
+        self._oc_vocabulary: Vocabulary | None = None
 
         if config.batching_mode == "continuous":
             self.scheduler: StaticScheduler | ContinuousScheduler = ContinuousScheduler(config)
@@ -144,7 +149,7 @@ class Engine:
         generator: torch.Generator | None = None
         seed = sampling_params.seed if sampling_params.seed is not None else self.config.seed
         if seed is not None:
-            generator = torch.Generator(device="cpu")
+            generator = torch.Generator(device=self.config.device)
             generator.manual_seed(seed)
 
         # Structured output (Phase 12): compile FSM if response_format is set.
@@ -163,10 +168,10 @@ class Engine:
         )
         return self.scheduler.add_request(request)
 
-    def _compile_structured_output(self, response_format: dict[str, Any]) -> Any:
+    def _compile_structured_output(self, response_format: dict[str, Any]) -> StructuredOutputState:
         """Compile a response_format spec into a StructuredOutputState.
 
-        Builds (and caches) the TokenVocabularyIndex and TokenFSM.
+        Builds (and caches) the outlines-core Vocabulary and TokenGuide.
 
         Args:
             response_format: Format spec with 'type' and 'schema'/'pattern'.
@@ -174,15 +179,12 @@ class Engine:
         Returns:
             A StructuredOutputState ready for constrained generation.
         """
-        import json
-
-        from infer.structured.logit_mask import StructuredOutputState
-        from infer.structured.token_fsm import TokenVocabularyIndex, compile_token_fsm
-
-        # Build or reuse vocabulary index.
-        if not hasattr(self, "_vocab_index"):
-            vocab = self.tokenizer._tokenizer.get_vocab()  # type: ignore[union-attr]
-            self._vocab_index = TokenVocabularyIndex(vocab)
+        # Build or reuse outlines-core Vocabulary.
+        if self._oc_vocabulary is None:
+            vocab = self.tokenizer.get_vocab()
+            eos_ids = self.tokenizer.eos_token_ids
+            eos_id = next(iter(eos_ids)) if eos_ids else 0
+            self._oc_vocabulary = build_vocabulary(vocab, eos_id)
 
         fmt_type = response_format["type"]
         if fmt_type == "json_schema":
@@ -190,16 +192,16 @@ class Engine:
             if schema is None:
                 raise ValueError("json_schema response_format requires a 'schema' field")
             pattern_str = json.dumps(schema, sort_keys=True)
-            fsm = compile_token_fsm(pattern_str, self._vocab_index, mode="json_schema")
+            guide = compile_guide(pattern_str, self._oc_vocabulary, mode="json_schema")
         elif fmt_type == "regex":
             pattern = response_format.get("pattern")
             if pattern is None:
                 raise ValueError("regex response_format requires a 'pattern' field")
-            fsm = compile_token_fsm(pattern, self._vocab_index, mode="regex")
+            guide = compile_guide(pattern, self._oc_vocabulary, mode="regex")
         else:
             raise ValueError(f"Unsupported response_format type: {fmt_type!r}")
 
-        return StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        return StructuredOutputState(guide=guide, current_state=guide.initial_state)
 
     def step(self) -> None:
         """Run one engine step: schedule and execute forward pass(es)."""

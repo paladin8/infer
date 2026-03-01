@@ -16,6 +16,7 @@ dependencies = [
     "orjson>=3.11",
     "jinja2>=3.1",
     "triton>=3.6,<4; platform_system == 'Linux'",
+    "outlines-core>=0.2.14",
 ]
 
 [dependency-groups]

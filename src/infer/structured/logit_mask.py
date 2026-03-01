@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from infer.structured.token_fsm import TokenFSM
+from infer.structured.guide import TokenGuide
 
 
 @dataclass
@@ -20,15 +20,15 @@ class StructuredOutputState:
     """Per-request state for structured output generation.
 
     Each request with a ``response_format`` carries one of these.
-    It tracks the current DFA state and provides convenience methods
+    It tracks the current FSM state and provides convenience methods
     for advancing state and checking terminal conditions.
 
     Attributes:
-        fsm: The compiled TokenFSM for this request's schema/pattern.
-        current_state: Current DFA state.
+        guide: The compiled TokenGuide for this request's schema/pattern.
+        current_state: Current FSM state.
     """
 
-    fsm: TokenFSM
+    guide: TokenGuide
     current_state: int
 
     def advance(self, token_id: int) -> None:
@@ -37,7 +37,7 @@ class StructuredOutputState:
         Args:
             token_id: The token ID that was sampled.
         """
-        self.current_state = self.fsm.next_state(self.current_state, token_id)
+        self.current_state = self.guide.next_state(self.current_state, token_id)
 
     def is_terminal(self) -> bool:
         """Whether the current state is a valid completion point.
@@ -45,7 +45,7 @@ class StructuredOutputState:
         Returns:
             True if generation can validly stop at the current state.
         """
-        return self.fsm.is_terminal(self.current_state)
+        return self.guide.is_terminal(self.current_state)
 
     def allowed_tokens(self) -> set[int]:
         """Return valid token IDs from the current state.
@@ -53,7 +53,7 @@ class StructuredOutputState:
         Returns:
             Set of token IDs that are allowed by the grammar.
         """
-        return self.fsm.allowed_tokens(self.current_state)
+        return self.guide.allowed_tokens(self.current_state)
 
 
 def apply_structured_output_mask(
@@ -74,13 +74,17 @@ def apply_structured_output_mask(
     """
     allowed = state.allowed_tokens()
 
-    if not allowed:
+    # Filter to valid indices within the logits tensor size.
+    vocab_size = logits.shape[0]
+    valid_allowed = [t for t in allowed if t < vocab_size]
+
+    if not valid_allowed:
         # No tokens allowed — return all -inf (edge case).
         return torch.full_like(logits, float("-inf"))
 
     # Create mask: True for allowed tokens.
-    mask = torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device)
-    allowed_indices = torch.tensor(list(allowed), dtype=torch.long, device=logits.device)
+    mask = torch.zeros(vocab_size, dtype=torch.bool, device=logits.device)
+    allowed_indices = torch.tensor(valid_allowed, dtype=torch.long, device=logits.device)
     mask[allowed_indices] = True
 
     # Apply mask: set disallowed tokens to -inf.

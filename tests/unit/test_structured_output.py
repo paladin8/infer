@@ -7,55 +7,41 @@ import typing
 
 import pytest
 import torch
+from outlines_core import Vocabulary
 
 from infer.engine.request import Request
 from infer.engine.sampler import SamplingParams, sample_token
+from infer.structured.guide import compile_guide
 from infer.structured.logit_mask import StructuredOutputState, apply_structured_output_mask
-from infer.structured.token_fsm import TokenVocabularyIndex, compile_token_fsm
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_vocab() -> TokenVocabularyIndex:
-    """A vocabulary with JSON-relevant tokens."""
-    tokens: dict[str, int] = {
-        "{": 0,
-        "}": 1,
-        '"': 2,
-        ":": 3,
-        ",": 4,
-        " ": 5,
-        "t": 6,
-        "r": 7,
-        "u": 8,
-        "e": 9,
-        "f": 10,
-        "a": 11,
-        "l": 12,
-        "s": 13,
-        "n": 14,
-        "true": 15,
-        "false": 16,
-        "null": 17,
-        "0": 18,
-        "1": 19,
-        "2": 20,
-        "3": 21,
-        "4": 22,
-        "5": 23,
-        "6": 24,
-        "7": 25,
-        "8": 26,
-        "9": 27,
-        "[": 28,
-        "]": 29,
-        ".": 30,
-        "-": 31,
-        "\\": 32,
-    }
-    return TokenVocabularyIndex(tokens)
+def _make_bool_vocab() -> Vocabulary:
+    """Vocabulary with all characters needed for (true|false)."""
+    return Vocabulary(
+        99,
+        {
+            "t": [0],
+            "r": [1],
+            "u": [2],
+            "e": [3],
+            "f": [4],
+            "a": [5],
+            "l": [6],
+            "s": [7],
+            "true": [8],
+            "false": [9],
+            "tr": [10],
+            "fal": [11],
+            "se": [12],
+        },
+    )
+
+
+BOOL_VOCAB_SIZE = 13
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +98,9 @@ class TestNoResponseFormatZeroOverhead:
 class TestStructuredStateOnRequest:
     def test_request_carries_state(self) -> None:
         """Request should carry FSM state when structured output is configured."""
-        vocab = _make_vocab()
-        fsm = compile_token_fsm("(true|false)", vocab)
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        vocab = _make_bool_vocab()
+        guide = compile_guide("(true|false)", vocab)
+        state = StructuredOutputState(guide=guide, current_state=guide.initial_state)
 
         req = Request(
             request_id="test",
@@ -124,7 +110,7 @@ class TestStructuredStateOnRequest:
             structured_output_state=state,
         )
         assert req.structured_output_state is not None
-        assert req.structured_output_state.fsm is fsm
+        assert req.structured_output_state.guide is guide
 
 
 # ---------------------------------------------------------------------------
@@ -135,54 +121,78 @@ class TestStructuredStateOnRequest:
 class TestEndToEndRegexSimple:
     def test_regex_produces_matching_output(self) -> None:
         """Full pipeline with regex pattern produces matching output."""
-        # Use simple vocabulary.
-        vocab = _make_vocab()
+        vocab = _make_bool_vocab()
         pattern = "(true|false)"
-        fsm = compile_token_fsm(pattern, vocab)
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        guide = compile_guide(pattern, vocab)
+        state = StructuredOutputState(guide=guide, current_state=guide.initial_state)
 
-        # Simulate generation.
-        vocab_size = 33
+        id_to_str = {
+            0: "t",
+            1: "r",
+            2: "u",
+            3: "e",
+            4: "f",
+            5: "a",
+            6: "l",
+            7: "s",
+            8: "true",
+            9: "false",
+            10: "tr",
+            11: "fal",
+            12: "se",
+        }
+
         generated: list[int] = []
-        for _ in range(20):  # safety limit
-            if state.is_terminal() and not state.allowed_tokens():
+        for _ in range(20):
+            if state.is_terminal():
                 break
-            logits = torch.randn(vocab_size)
+            logits = torch.randn(BOOL_VOCAB_SIZE)
             masked = apply_structured_output_mask(logits, state)
             params = SamplingParams(temperature=0.0)
             token = sample_token(masked, [], params)
             generated.append(token)
             state.advance(token)
 
-        # Build result string.
-        token_strings = vocab.token_strings
-        result = "".join(token_strings[t] for t in generated)
+        result = "".join(id_to_str[t] for t in generated)
         assert result in ("true", "false"), f"Got {result!r}"
 
 
 class TestEndToEndJsonSchemaSimple:
     def test_json_schema_produces_valid_json(self) -> None:
         """Full pipeline with JSON schema produces valid JSON."""
-        vocab = _make_vocab()
+        vocab = _make_bool_vocab()
         schema_str = json.dumps({"type": "boolean"})
-        fsm = compile_token_fsm(schema_str, vocab, mode="json_schema")
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        guide = compile_guide(schema_str, vocab, mode="json_schema")
+        state = StructuredOutputState(guide=guide, current_state=guide.initial_state)
 
-        # Simulate generation.
-        vocab_size = 33
+        id_to_str = {
+            0: "t",
+            1: "r",
+            2: "u",
+            3: "e",
+            4: "f",
+            5: "a",
+            6: "l",
+            7: "s",
+            8: "true",
+            9: "false",
+            10: "tr",
+            11: "fal",
+            12: "se",
+        }
+
         generated: list[int] = []
         for _ in range(20):
-            if state.is_terminal() and not state.allowed_tokens():
+            if state.is_terminal():
                 break
-            logits = torch.randn(vocab_size)
+            logits = torch.randn(BOOL_VOCAB_SIZE)
             masked = apply_structured_output_mask(logits, state)
             params = SamplingParams(temperature=0.0)
             token = sample_token(masked, [], params)
             generated.append(token)
             state.advance(token)
 
-        token_strings = vocab.token_strings
-        result = "".join(token_strings[t] for t in generated)
+        result = "".join(id_to_str[t] for t in generated)
         assert result in ("true", "false"), f"Got {result!r}"
 
 
@@ -194,13 +204,12 @@ class TestEndToEndJsonSchemaSimple:
 class TestSampleTokenWithStructuredState:
     def test_structured_state_passed_to_sample(self) -> None:
         """sample_token should use structured_state when provided."""
-        vocab = _make_vocab()
-        fsm = compile_token_fsm("(true|false)", vocab)
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        vocab = _make_bool_vocab()
+        guide = compile_guide("(true|false)", vocab)
+        state = StructuredOutputState(guide=guide, current_state=guide.initial_state)
 
-        logits = torch.randn(33)
+        logits = torch.randn(BOOL_VOCAB_SIZE)
         params = SamplingParams(temperature=0.0)
-        # The structured state should constrain sampling.
         token = sample_token(logits, [], params, structured_state=state)
         assert token in state.allowed_tokens()
 
@@ -218,16 +227,18 @@ class TestSampleTokenWithStructuredState:
 
 
 class TestCheckStopWithStructuredOutput:
+    def _make_vocab_for_ab(self) -> Vocabulary:
+        return Vocabulary(99, {"a": [11], "b": [12]})
+
     def test_eos_at_terminal(self) -> None:
         """EOS should stop generation when FSM is at terminal state."""
         from infer.engine.runner_helpers import check_stop
 
-        vocab = _make_vocab()
-        fsm = compile_token_fsm("a", vocab)
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        vocab = self._make_vocab_for_ab()
+        guide = compile_guide("a", vocab)
+        state = StructuredOutputState(guide=guide, current_state=guide.initial_state)
         state.advance(11)  # 'a' -> terminal
 
-        # Create a mock tokenizer that reports token 99 as EOS.
         class MockTokenizer:
             eos_token_ids: typing.ClassVar[set[int]] = {99}
 
@@ -238,7 +249,7 @@ class TestCheckStopWithStructuredOutput:
             arrival_time_s=0.0,
             structured_output_state=state,
         )
-        req.generated_token_ids = [11]  # 'a'
+        req.generated_token_ids = [11]
         finished, reason = check_stop(req, 99, MockTokenizer())  # type: ignore[arg-type]
         assert finished
         assert reason == "eos"
@@ -247,9 +258,9 @@ class TestCheckStopWithStructuredOutput:
         """EOS should NOT stop generation when FSM is NOT at terminal state."""
         from infer.engine.runner_helpers import check_stop
 
-        vocab = _make_vocab()
-        fsm = compile_token_fsm("ab", vocab)
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        vocab = self._make_vocab_for_ab()
+        guide = compile_guide("ab", vocab)
+        state = StructuredOutputState(guide=guide, current_state=guide.initial_state)
         state.advance(11)  # 'a' -> not terminal yet
 
         class MockTokenizer:
@@ -262,21 +273,22 @@ class TestCheckStopWithStructuredOutput:
             arrival_time_s=0.0,
             structured_output_state=state,
         )
-        req.generated_token_ids = [11]  # 'a'
+        req.generated_token_ids = [11]
         finished, _reason = check_stop(req, 99, MockTokenizer())  # type: ignore[arg-type]
         assert not finished
 
     def test_fsm_exhausted_stops(self) -> None:
-        """When FSM is at terminal with no more allowed tokens, generation should stop."""
+        """When FSM is at terminal with only EOS in allowed tokens, generation should stop."""
         from infer.engine.runner_helpers import check_stop
 
-        vocab = _make_vocab()
-        fsm = compile_token_fsm("a", vocab)
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
-        state.advance(11)  # 'a' -> terminal, no more tokens allowed
+        vocab = self._make_vocab_for_ab()
+        guide = compile_guide("a", vocab)
+        state = StructuredOutputState(guide=guide, current_state=guide.initial_state)
+        state.advance(11)  # 'a' -> terminal
 
+        # Mock tokenizer knows about EOS token 99 (same as vocab's eos_token_id).
         class MockTokenizer:
-            eos_token_ids: typing.ClassVar[set[int]] = set()  # no EOS tokens
+            eos_token_ids: typing.ClassVar[set[int]] = {99}
 
         req = Request(
             request_id="test",

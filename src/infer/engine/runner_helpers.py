@@ -18,13 +18,13 @@ def check_stop(req: Request, token: int, tokenizer: Tokenizer) -> tuple[bool, st
     ):
         return True, "eos"
 
-    # Structured output: stop if FSM is in terminal state and has no more valid tokens.
-    if (
-        req.structured_output_state is not None
-        and req.structured_output_state.is_terminal()
-        and not req.structured_output_state.allowed_tokens()
-    ):
-        return True, "eos"
+    # Structured output: stop if FSM is in a terminal state and no non-EOS
+    # tokens remain (outlines-core always includes EOS in terminal states).
+    if req.structured_output_state is not None and req.structured_output_state.is_terminal():
+        allowed = req.structured_output_state.allowed_tokens()
+        non_eos = allowed - tokenizer.eos_token_ids
+        if not non_eos:
+            return True, "eos"
 
     # Stop strings.
     if req.sampling_params.stop:

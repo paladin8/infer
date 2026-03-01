@@ -12,6 +12,8 @@ from torch import Tensor
 if TYPE_CHECKING:
     from infer.structured.logit_mask import StructuredOutputState
 
+from infer.structured.logit_mask import apply_structured_output_mask
+
 
 @dataclass
 class SamplingParams:
@@ -183,8 +185,6 @@ def sample_token(
     """
     # Apply structured output mask first (Phase 12).
     if structured_state is not None:
-        from infer.structured.logit_mask import apply_structured_output_mask
-
         logits = apply_structured_output_mask(logits, structured_state)
 
     # Greedy: skip all transforms and return argmax.

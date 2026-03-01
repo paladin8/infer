@@ -93,3 +93,11 @@ class Tokenizer:
     def vocab_size(self) -> int:
         """Vocabulary size (number of tokens the model can produce)."""
         return self._tokenizer.vocab_size
+
+    def get_vocab(self) -> dict[str, int]:
+        """Return the full vocabulary as a mapping from token string to token ID.
+
+        Used by the structured output module (Phase 12) to build the
+        token-to-string index for FSM-based constrained generation.
+        """
+        return self._tokenizer.get_vocab()

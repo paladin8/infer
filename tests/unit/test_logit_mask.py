@@ -3,39 +3,67 @@
 from __future__ import annotations
 
 import torch
+from outlines_core import Vocabulary
 
 from infer.engine.sampler import SamplingParams, sample_token
+from infer.structured.guide import compile_guide
 from infer.structured.logit_mask import StructuredOutputState, apply_structured_output_mask
-from infer.structured.token_fsm import TokenVocabularyIndex, compile_token_fsm
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_simple_vocab() -> TokenVocabularyIndex:
-    """A small vocabulary for testing."""
-    return TokenVocabularyIndex(
+def _make_bool_vocab() -> Vocabulary:
+    """Vocabulary with all characters needed for (true|false)."""
+    return Vocabulary(
+        99,
         {
-            "a": 0,
-            "b": 1,
-            "c": 2,
-            "ab": 3,
-            "bc": 4,
-            "abc": 5,
-            "d": 6,
-            "1": 7,
-            "2": 8,
-        }
+            "t": [0],
+            "r": [1],
+            "u": [2],
+            "e": [3],
+            "f": [4],
+            "a": [5],
+            "l": [6],
+            "s": [7],
+            "true": [8],
+            "false": [9],
+            "tr": [10],
+            "fal": [11],
+            "se": [12],
+        },
     )
 
 
-def _make_state(pattern: str, vocab: TokenVocabularyIndex | None = None) -> StructuredOutputState:
+def _make_abc_vocab() -> Vocabulary:
+    """Vocabulary with characters for simple patterns."""
+    return Vocabulary(
+        99,
+        {
+            "a": [0],
+            "b": [1],
+            "c": [2],
+            "ab": [3],
+            "bc": [4],
+            "abc": [5],
+            "d": [6],
+        },
+    )
+
+
+BOOL_VOCAB_SIZE = 13  # tokens 0-12
+ABC_VOCAB_SIZE = 7  # tokens 0-6
+
+
+def _make_state(
+    pattern: str, vocab: Vocabulary | None = None, vocab_size: int | None = None
+) -> StructuredOutputState:
     """Create a StructuredOutputState from a regex pattern."""
     if vocab is None:
-        vocab = _make_simple_vocab()
-    fsm = compile_token_fsm(pattern, vocab)
-    return StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+        vocab = _make_abc_vocab()
+    guide = compile_guide(pattern, vocab)
+    return StructuredOutputState(guide=guide, current_state=guide.initial_state)
 
 
 # ---------------------------------------------------------------------------
@@ -47,12 +75,10 @@ class TestMaskDisallowsTokens:
     def test_disallowed_tokens_get_neg_inf(self) -> None:
         """Tokens not in the allowed set should have -inf logits."""
         state = _make_state("abc")
-        logits = torch.ones(9)  # vocab size 9
+        logits = torch.ones(ABC_VOCAB_SIZE)
         masked = apply_structured_output_mask(logits, state)
-        # At initial state of 'abc', only tokens starting with 'a' are valid:
-        # 'a' (0), 'ab' (3), 'abc' (5)
         allowed = state.allowed_tokens()
-        for i in range(9):
+        for i in range(ABC_VOCAB_SIZE):
             if i in allowed:
                 assert masked[i].item() == 1.0, f"Token {i} should be allowed"
             else:
@@ -62,8 +88,9 @@ class TestMaskDisallowsTokens:
 class TestMaskPreservesAllowed:
     def test_allowed_tokens_keep_original(self) -> None:
         """Allowed tokens should keep their original logit values."""
-        state = _make_state("a|b")
-        logits = torch.tensor([5.0, 3.0, 1.0, 2.0, 4.0, 6.0, 0.5, 0.1, 0.2])
+        vocab = _make_bool_vocab()
+        state = _make_state("(true|false)", vocab)
+        logits = torch.tensor([5.0, 3.0, 1.0, 2.0, 4.0, 6.0, 0.5, 0.1, 0.2, 3.5, 1.5, 2.5, 0.8])
         masked = apply_structured_output_mask(logits, state)
         allowed = state.allowed_tokens()
         for i in allowed:
@@ -71,16 +98,18 @@ class TestMaskPreservesAllowed:
 
 
 class TestMaskEmptyAllowedSet:
-    def test_all_tokens_masked(self) -> None:
-        """When no tokens are allowed, all should be -inf."""
-        vocab = _make_simple_vocab()
-        fsm = compile_token_fsm("abc", vocab)
-        # Move to terminal state (after 'abc').
-        state = StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
+    def test_all_tokens_masked_when_no_valid_in_range(self) -> None:
+        """When no allowed tokens are within vocab range, all should be -inf.
+
+        outlines-core includes the EOS token at terminal states, but if the
+        EOS token ID is outside the logits tensor range, all logits get masked.
+        """
+        state = _make_state("abc")
+        # Move to terminal state by consuming 'abc'
         state.advance(5)  # 'abc' -> terminal
         assert state.is_terminal()
-        # No more tokens should be allowed.
-        logits = torch.ones(9)
+        # The only allowed token is EOS (id=99), which is outside vocab range.
+        logits = torch.ones(ABC_VOCAB_SIZE)
         masked = apply_structured_output_mask(logits, state)
         assert (masked == float("-inf")).all()
 
@@ -134,7 +163,7 @@ class TestIntegrationWithSampleToken:
     def test_masked_logits_produce_valid_token(self) -> None:
         """Sampling from masked logits should produce a valid token."""
         state = _make_state("abc")
-        logits = torch.randn(9)
+        logits = torch.randn(ABC_VOCAB_SIZE)
         masked = apply_structured_output_mask(logits, state)
 
         params = SamplingParams(temperature=0.0)
@@ -145,12 +174,12 @@ class TestIntegrationWithSampleToken:
         """Simulate a full generation loop using logit masking."""
         state = _make_state("abc")
         generated: list[int] = []
-        vocab_strings = _make_simple_vocab().token_strings
+        id_to_str = {0: "a", 1: "b", 2: "c", 3: "ab", 4: "bc", 5: "abc", 6: "d"}
 
         for _ in range(10):  # safety limit
-            if state.is_terminal() and not state.allowed_tokens():
+            if state.is_terminal():
                 break
-            logits = torch.randn(9)
+            logits = torch.randn(ABC_VOCAB_SIZE)
             masked = apply_structured_output_mask(logits, state)
             params = SamplingParams(temperature=0.0)
             token = sample_token(masked, [], params)
@@ -160,7 +189,7 @@ class TestIntegrationWithSampleToken:
         # Verify we reached terminal state.
         assert state.is_terminal()
         # Verify generated string matches pattern.
-        text = "".join(vocab_strings[t] for t in generated)
+        text = "".join(id_to_str[t] for t in generated)
         assert text == "abc"
 
 
