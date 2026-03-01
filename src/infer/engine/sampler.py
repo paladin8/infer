@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from infer.structured.logit_mask import StructuredOutputState
 
 
 @dataclass
@@ -156,20 +160,33 @@ def sample_token(
     context_token_ids: list[int],
     params: SamplingParams,
     generator: torch.Generator | None = None,
+    structured_state: StructuredOutputState | None = None,
 ) -> int:
     """Sample a single token from logits using the full sampling pipeline.
 
-    Transform order: repetition penalty -> temperature -> top-k -> top-p -> sample.
+    Transform order: structured output mask -> repetition penalty ->
+    temperature -> top-k -> top-p -> sample.
+
+    When ``structured_state`` is provided, applies FSM-based logit masking
+    before all other transforms. This ensures only grammar-valid tokens
+    can be sampled.
 
     Args:
         logits: Raw logits for a single position, shape ``[vocab_size]``.
         context_token_ids: All token IDs seen so far (prompt + generated).
         params: Sampling parameters.
         generator: Optional RNG for reproducible sampling.
+        structured_state: Optional structured output state for constrained generation.
 
     Returns:
         The sampled token ID.
     """
+    # Apply structured output mask first (Phase 12).
+    if structured_state is not None:
+        from infer.structured.logit_mask import apply_structured_output_mask
+
+        logits = apply_structured_output_mask(logits, structured_state)
+
     # Greedy: skip all transforms and return argmax.
     if params.temperature == 0.0:
         logits = apply_repetition_penalty(logits, context_token_ids, params.repetition_penalty)

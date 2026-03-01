@@ -20,6 +20,28 @@ from infer.engine.request import StepOutput
 from infer.engine.sampler import SamplingParams
 
 
+class ResponseFormat(BaseModel):
+    """Structured output format specification.
+
+    Either ``json_schema`` or ``regex`` type must be provided.
+    For ``json_schema``, provide the ``schema`` field.
+    For ``regex``, provide the ``pattern`` field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str  # "json_schema" or "regex"
+    schema_: dict[str, Any] | None = None
+    pattern: str | None = None
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, v: str) -> str:
+        if v not in ("json_schema", "regex"):
+            raise ValueError(f"type must be 'json_schema' or 'regex', got {v!r}")
+        return v
+
+
 class CompletionRequest(BaseModel):
     """Request body for the completions endpoint."""
 
@@ -35,6 +57,7 @@ class CompletionRequest(BaseModel):
     stream: bool = True
     stop: str | list[str] | None = None
     seed: int | None = None
+    response_format: ResponseFormat | None = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -106,8 +129,23 @@ def _build_completions_endpoint(app: FastAPI, engine: Engine) -> None:
         request_id = str(uuid.uuid4())
         output_queue: asyncio.Queue[StepOutput] = asyncio.Queue()
 
+        # Build response_format dict for engine.
+        response_format: dict[str, Any] | None = None
+        if body.response_format is not None:
+            response_format = {"type": body.response_format.type}
+            if body.response_format.schema_ is not None:
+                response_format["schema"] = body.response_format.schema_
+            if body.response_format.pattern is not None:
+                response_format["pattern"] = body.response_format.pattern
+
         try:
-            accepted = engine.add_request(request_id, body.prompt, params, output_queue)
+            accepted = engine.add_request(
+                request_id,
+                body.prompt,
+                params,
+                output_queue,
+                response_format=response_format,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
 

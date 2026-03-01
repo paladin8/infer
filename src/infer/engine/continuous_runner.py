@@ -155,8 +155,16 @@ class ContinuousRunner:
         # Sample first token.
         next_logits = logits[0, -1, :]
         context = req.prompt_token_ids
-        token = sample_token(next_logits, context, req.sampling_params, req.generator)
+        token = sample_token(
+            next_logits,
+            context,
+            req.sampling_params,
+            req.generator,
+            structured_state=req.structured_output_state,
+        )
         req.generated_token_ids.append(token)
+        if req.structured_output_state is not None:
+            req.structured_output_state.advance(token)
         req.state = RequestState.DECODE
 
         # Initialize text tracking.
@@ -216,8 +224,16 @@ class ContinuousRunner:
         for i, req in enumerate(requests):
             next_logits = logits[i, prompt_lens[i] - 1, :]
             context = req.prompt_token_ids
-            token = sample_token(next_logits, context, req.sampling_params, req.generator)
+            token = sample_token(
+                next_logits,
+                context,
+                req.sampling_params,
+                req.generator,
+                structured_state=req.structured_output_state,
+            )
             req.generated_token_ids.append(token)
+            if req.structured_output_state is not None:
+                req.structured_output_state.advance(token)
             req.state = RequestState.DECODE
 
             # Initialize text tracking.
@@ -359,8 +375,16 @@ class ContinuousRunner:
             last_pos = chunk_lens[j] - 1
             next_logits = logits[j, last_pos, :]
             context = req.prompt_token_ids
-            token = sample_token(next_logits, context, req.sampling_params, req.generator)
+            token = sample_token(
+                next_logits,
+                context,
+                req.sampling_params,
+                req.generator,
+                structured_state=req.structured_output_state,
+            )
             req.generated_token_ids.append(token)
+            if req.structured_output_state is not None:
+                req.structured_output_state.advance(token)
             req.state = RequestState.DECODE
 
             # Initialize text tracking.
@@ -419,8 +443,16 @@ class ContinuousRunner:
         # Sample first token.
         next_logits = logits[0, -1, :]
         context = req.prompt_token_ids
-        token = sample_token(next_logits, context, req.sampling_params, req.generator)
+        token = sample_token(
+            next_logits,
+            context,
+            req.sampling_params,
+            req.generator,
+            structured_state=req.structured_output_state,
+        )
         req.generated_token_ids.append(token)
+        if req.structured_output_state is not None:
+            req.structured_output_state.advance(token)
         req.state = RequestState.DECODE
 
         # Initialize text tracking.
@@ -489,8 +521,16 @@ class ContinuousRunner:
         outputs: list[StepOutput] = []
         for i, req in enumerate(requests):
             context = req.prompt_token_ids + req.generated_token_ids
-            token = sample_token(logits[i, -1, :], context, req.sampling_params, req.generator)
+            token = sample_token(
+                logits[i, -1, :],
+                context,
+                req.sampling_params,
+                req.generator,
+                structured_state=req.structured_output_state,
+            )
             req.generated_token_ids.append(token)
+            if req.structured_output_state is not None:
+                req.structured_output_state.advance(token)
 
             # Compute text_delta.
             text = self.tokenizer.decode(req.generated_token_ids, skip_special_tokens=True)

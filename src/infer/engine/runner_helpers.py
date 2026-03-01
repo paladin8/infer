@@ -11,8 +11,19 @@ def check_stop(req: Request, token: int, tokenizer: Tokenizer) -> tuple[bool, st
 
     Returns ``(finished, finish_reason)``.
     """
-    # EOS takes priority.
-    if token in tokenizer.eos_token_ids:
+    # EOS takes priority — but for structured output, only stop at EOS
+    # if the FSM is in a terminal state (valid completion point).
+    if token in tokenizer.eos_token_ids and (
+        req.structured_output_state is None or req.structured_output_state.is_terminal()
+    ):
+        return True, "eos"
+
+    # Structured output: stop if FSM is in terminal state and has no more valid tokens.
+    if (
+        req.structured_output_state is not None
+        and req.structured_output_state.is_terminal()
+        and not req.structured_output_state.allowed_tokens()
+    ):
         return True, "eos"
 
     # Stop strings.

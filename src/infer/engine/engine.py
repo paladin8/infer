@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Self
+from typing import Any, Self
 
 import torch
 
@@ -115,11 +115,22 @@ class Engine:
         prompt: str | list[int],
         sampling_params: SamplingParams,
         output_queue: asyncio.Queue[StepOutput],
+        *,
+        response_format: dict[str, Any] | None = None,
     ) -> bool:
         """Enqueue a new completion request.
 
         Returns ``False`` if the waiting queue is full (caller should 503).
         Raises ``ValueError`` if the prompt + max_new_tokens exceeds max_seq_len.
+
+        Args:
+            request_id: Unique request identifier.
+            prompt: Text string or pre-tokenized token IDs.
+            sampling_params: Sampling parameters.
+            output_queue: Queue for streaming outputs.
+            response_format: Optional structured output format specification.
+                ``{"type": "json_schema", "schema": {...}}`` or
+                ``{"type": "regex", "pattern": "..."}``.
         """
         prompt_token_ids = self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
 
@@ -136,6 +147,11 @@ class Engine:
             generator = torch.Generator(device="cpu")
             generator.manual_seed(seed)
 
+        # Structured output (Phase 12): compile FSM if response_format is set.
+        structured_output_state = None
+        if response_format is not None:
+            structured_output_state = self._compile_structured_output(response_format)
+
         request = Request(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -143,8 +159,47 @@ class Engine:
             arrival_time_s=time.perf_counter(),
             generator=generator,
             output_queue=output_queue,
+            structured_output_state=structured_output_state,
         )
         return self.scheduler.add_request(request)
+
+    def _compile_structured_output(self, response_format: dict[str, Any]) -> Any:
+        """Compile a response_format spec into a StructuredOutputState.
+
+        Builds (and caches) the TokenVocabularyIndex and TokenFSM.
+
+        Args:
+            response_format: Format spec with 'type' and 'schema'/'pattern'.
+
+        Returns:
+            A StructuredOutputState ready for constrained generation.
+        """
+        import json
+
+        from infer.structured.logit_mask import StructuredOutputState
+        from infer.structured.token_fsm import TokenVocabularyIndex, compile_token_fsm
+
+        # Build or reuse vocabulary index.
+        if not hasattr(self, "_vocab_index"):
+            vocab = self.tokenizer._tokenizer.get_vocab()  # type: ignore[union-attr]
+            self._vocab_index = TokenVocabularyIndex(vocab)
+
+        fmt_type = response_format["type"]
+        if fmt_type == "json_schema":
+            schema = response_format.get("schema")
+            if schema is None:
+                raise ValueError("json_schema response_format requires a 'schema' field")
+            pattern_str = json.dumps(schema, sort_keys=True)
+            fsm = compile_token_fsm(pattern_str, self._vocab_index, mode="json_schema")
+        elif fmt_type == "regex":
+            pattern = response_format.get("pattern")
+            if pattern is None:
+                raise ValueError("regex response_format requires a 'pattern' field")
+            fsm = compile_token_fsm(pattern, self._vocab_index, mode="regex")
+        else:
+            raise ValueError(f"Unsupported response_format type: {fmt_type!r}")
+
+        return StructuredOutputState(fsm=fsm, current_state=fsm.initial_state)
 
     def step(self) -> None:
         """Run one engine step: schedule and execute forward pass(es)."""

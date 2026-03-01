@@ -115,8 +115,16 @@ class ModelRunner:
         outputs: list[StepOutput] = []
         for i, req in enumerate(requests):
             context = req.prompt_token_ids
-            token = sample_token(next_logits[i], context, req.sampling_params, req.generator)
+            token = sample_token(
+                next_logits[i],
+                context,
+                req.sampling_params,
+                req.generator,
+                structured_state=req.structured_output_state,
+            )
             req.generated_token_ids.append(token)
+            if req.structured_output_state is not None:
+                req.structured_output_state.advance(token)
             req.state = RequestState.DECODE
 
             # Mark the generated token's position as valid in the padding mask.
@@ -171,8 +179,16 @@ class ModelRunner:
                 continue
 
             context = req.prompt_token_ids + req.generated_token_ids
-            token = sample_token(logits[i, -1, :], context, req.sampling_params, req.generator)
+            token = sample_token(
+                logits[i, -1, :],
+                context,
+                req.sampling_params,
+                req.generator,
+                structured_state=req.structured_output_state,
+            )
             req.generated_token_ids.append(token)
+            if req.structured_output_state is not None:
+                req.structured_output_state.advance(token)
 
             # Mark this decode position as valid in padding mask.
             current_pos = self._max_prompt_len + len(req.generated_token_ids) - 1

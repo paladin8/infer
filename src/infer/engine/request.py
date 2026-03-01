@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 
 from infer.engine.sampler import SamplingParams
+
+if TYPE_CHECKING:
+    from infer.structured.logit_mask import StructuredOutputState
 
 
 class RequestState(Enum):
@@ -85,6 +89,10 @@ class Request:
     # Speculative decoding: per-round acceptance rates (num_accepted / spec_length).
     # Populated by SpeculativeRunner after each speculation round.
     speculation_acceptance_rates: list[float] = field(default_factory=list, repr=False)
+
+    # Structured output state — FSM state for constrained generation (Phase 12).
+    # None when no response_format is requested.
+    structured_output_state: StructuredOutputState | None = field(default=None, repr=False)
 
     # Output channel — set by the server when the request is enqueued.
     output_queue: asyncio.Queue[StepOutput] | None = field(default=None, repr=False)
